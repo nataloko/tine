@@ -1,6 +1,14 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { classifyNativeCallError, DirectSaveFailureError, SaveConflictError } from "./backend";
+import {
+  classifyNativeCallError,
+  diagnosticFailureReason,
+  DirectSaveFailureError,
+  OperationCancelledError,
+  QueryNotReadyError,
+  QueryUnavailableError,
+  SaveConflictError,
+} from "./backend";
 import { isRetryableSaveFailure, isSaveConflictFailure } from "./persistence";
 
 // Every native rejection is classified once at the frontend funnel. Direct
@@ -43,6 +51,32 @@ describe("native call error funnel", () => {
     expect(classifyNativeCallError("conflict:7 suffix")).toBe("conflict:7 suffix");
   });
 
+  it("names the failed platform call and OS error in the save-failure message (GH #538)", () => {
+    const failure = classifyNativeCallError(JSON.stringify({
+      kind: "direct-save-failure",
+      reason_code: "unknown",
+      detail: {
+        io_error_kind: "InvalidInput",
+        os_error: 22,
+        operation: "renameat2(RENAME_NOREPLACE) publishing the projection",
+      },
+    }));
+    expect(failure).toBeInstanceOf(DirectSaveFailureError);
+    expect((failure as DirectSaveFailureError).message).toBe(
+      "Direct Files could not save (reason code: unknown; "
+        + "renameat2(RENAME_NOREPLACE) publishing the projection, os error 22).",
+    );
+    // An operation outside the backend's fixed vocabulary is dropped, never shown.
+    const smuggled = classifyNativeCallError(JSON.stringify({
+      kind: "direct-save-failure",
+      reason_code: "unknown",
+      detail: { io_error_kind: "InvalidInput", os_error: 5, operation: "open /home/me/pages/Secret.md" },
+    }));
+    expect((smuggled as DirectSaveFailureError).message).toBe(
+      "Direct Files could not save (reason code: unknown; os error 5).",
+    );
+  });
+
   it("routes a page-title collision by the producer code rather than conflict prose", () => {
     const failure = classifyNativeCallError(JSON.stringify({
       kind: "direct-save-failure",
@@ -75,7 +109,17 @@ describe("native call error funnel", () => {
     expect(callStart).toBeGreaterThan(0);
     const callEnd = source.indexOf("\n  }\n", callStart);
     const call = source.slice(callStart, callEnd);
-    expect(call).toContain("throw classifyNativeCallError(error);");
+    expect(call).toContain("const classified = classifyNativeCallError(error);");
+    expect(call).toContain("throw classified;");
+    // GH #543 (re-audit A2-N3): the diagnostic is reported FROM the classified
+    // value. Reporting first recorded every native failure as `other`, because
+    // `invoke` rejects with the wire payload and `diagnosticFailureReason`
+    // recognises only error instances.
+    expect(call.indexOf("classifyNativeCallError(error)")).toBeLessThan(
+      call.indexOf("reportPhase(\"failed\"")
+    );
+    expect(call).toContain("diagnosticFailureReason(classified)");
+    expect(call).not.toContain("diagnosticFailureReason(error)");
 
     const production = source.slice(0, source.indexOf("export function classifyNativeCallError"));
     const rest = source.slice(callEnd);
@@ -83,5 +127,64 @@ describe("native call error funnel", () => {
       expect(chunk).not.toContain("classifySaveConflictWire(");
       expect(chunk).not.toContain("classifyNativeCallError(");
     }
+  });
+});
+
+// GH #543: a reporter's diagnostic recorded 7,520 failed `run_query` calls
+// with no reason, so nobody could tell a retryable wait for the index from a
+// terminally unavailable projection. The classification must be a short fixed
+// code, and it must never be the thrown value's own text — an arbitrary
+// message can carry a path or graph content into a published report.
+describe("diagnostic failure reason", () => {
+  it("names which waiting state a refused query was in", () => {
+    expect(diagnosticFailureReason(new QueryNotReadyError("indexing"))).toBe(
+      "not-ready:indexing"
+    );
+    expect(diagnosticFailureReason(new QueryNotReadyError("recovering"))).toBe(
+      "not-ready:recovering"
+    );
+  });
+
+  it("separates a terminal failure and a cancellation from a wait", () => {
+    expect(
+      diagnosticFailureReason(new QueryUnavailableError("worker-stopped", "gone"))
+    ).toBe("unavailable:worker-stopped");
+    expect(diagnosticFailureReason(new OperationCancelledError())).toBe("cancelled");
+  });
+
+  it("names the wire rejection a native call actually produces", () => {
+    // What `invoke` actually rejects with: `CommandError` serializes with
+    // `serialize_str`, so every tagged failure arrives as a JSON STRING, never
+    // as a frontend error instance. `diagnosticFailureReason` recognises only
+    // instances, so reporting before classifying recorded all of these as
+    // `other` — erasing the one distinction the record exists to draw.
+    const wire = (payload: Record<string, unknown>) => JSON.stringify(payload);
+    const cases: Array<[Record<string, unknown>, string]> = [
+      [{ kind: "query-not-ready", reason_code: "indexing" }, "not-ready:indexing"],
+      [{ kind: "query-not-ready", reason_code: "recovering" }, "not-ready:recovering"],
+      [{ kind: "query-not-ready", reason_code: "pending_edits" }, "not-ready:pending_edits"],
+      [
+        {
+          kind: "query-unavailable",
+          reason_code: "projection_unavailable",
+          detail: { message: "The query index is unavailable." },
+        },
+        "unavailable:projection_unavailable",
+      ],
+      [{ kind: "operation-cancelled" }, "cancelled"],
+    ];
+    for (const [payload, expected] of cases) {
+      expect(diagnosticFailureReason(wire(payload))).toBe("other");
+      expect(diagnosticFailureReason(classifyNativeCallError(wire(payload)))).toBe(
+        expected
+      );
+    }
+  });
+
+  it("never reports a thrown value's own text", () => {
+    const leaky = new Error("/home/someone/graph/pages/Private Page.md is missing");
+    expect(diagnosticFailureReason(leaky)).toBe("other");
+    expect(diagnosticFailureReason("/home/someone/graph")).toBe("other");
+    expect(diagnosticFailureReason({ message: "secret" })).toBe("other");
   });
 });

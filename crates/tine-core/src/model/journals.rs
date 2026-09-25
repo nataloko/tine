@@ -57,7 +57,11 @@ impl Graph {
     /// least one block with a non-empty, non-property line. Drives the calendar
     /// picker's empty/non-empty day marking. Served from the cache.
     pub fn journal_content_days(&self) -> Vec<i64> {
-        self.with_pages(|pages| {
+        let fallback = match self.indexed_or_fallback(|| self.indexed_journal_content_days()) {
+            Ok(days) => return days,
+            Err(fallback) => fallback,
+        };
+        fallback.with_pages(self, |pages| {
             pages
                 .iter()
                 .filter(|(e, _)| e.kind == PageKind::Journal)
@@ -124,23 +128,117 @@ impl Graph {
     }
 
     pub fn migrate_journal_filenames_checked(&self) -> io::Result<usize> {
+        // GH #543 (sixth audit A6-N4): every other page-set mutation holds the
+        // identity gate across its whole transaction; this one took it only
+        // inside each individual move primitive and released it again. So the
+        // window between the last move and the publication below was open: a
+        // save could land in it, publish its rows, and then be replaced by the
+        // bytes this function had already read — stale text carrying the newer
+        // generation. Hold the gate for the whole migration, as `merge_pages`,
+        // `rename_file_to_page` and the save path do. The gate is reentrant per
+        // thread, so the per-move acquisitions underneath still work.
+        let _identity = self.lock_graph_text_identity_mutation()?;
         let write = self.admit_graph_text_writer()?;
-        let entries = self.configured_text_entries(&write, false)?;
-        let mut n = 0;
-        for entry in entries
-            .into_iter()
-            .filter(|entry| entry.kind == PageKind::Journal)
-        {
-            let p = entry.path;
-            if let Some(target) = self.journal_filename_migration_target(&p) {
-                if self.graph_text_exists(&write, &target)? {
-                    continue;
-                }
-                if self.graph_text_move_noreplace(&write, &p, &target).is_ok() {
-                    n += 1;
+        let mut moved: Vec<(PathBuf, Option<PageEntry>, PathBuf)> = Vec::new();
+        // GH #543 (seventh audit A7-N3): the enumeration and the moves are
+        // fallible, and every one of their error exits used to `?` straight
+        // past the publication below — leaving files this function had ALREADY
+        // moved described in the index at paths that no longer exist, with
+        // nothing queued. A committed filesystem move does not un-happen
+        // because a later file failed, so the outcome is captured here and the
+        // moves made before it are published either way.
+        let outcome = (|| -> io::Result<()> {
+            let entries = self.configured_text_entries(&write, false)?;
+            for entry in entries
+                .into_iter()
+                .filter(|entry| entry.kind == PageKind::Journal)
+            {
+                let p = entry.path;
+                if let Some(target) = self.journal_filename_migration_target(&p) {
+                    if self.graph_text_exists(&write, &target)? {
+                        continue;
+                    }
+                    // Retained for the projection before the move takes the path away.
+                    let retired = self.entry_for_path(&p);
+                    let attempt = self.graph_text_move_noreplace(&write, &p, &target);
+                    // Ask the filesystem what happened, not the Result: the
+                    // move renames FIRST and then does fallible durability and
+                    // identity work, so an `Err` here can mean "the file moved
+                    // and a later step failed" — which used to be reported as
+                    // nothing having migrated (A7-N3).
+                    let landed = attempt.is_ok()
+                        || (self.graph_text_exists(&write, &target).unwrap_or(false)
+                            && !self.graph_text_exists(&write, &p).unwrap_or(true));
+                    if landed {
+                        moved.push((p.clone(), retired, target));
+                    }
+                    attempt?;
                 }
             }
+            Ok(())
+        })();
+        let n = moved.len();
+        if n > 0 {
+            // GH #543 (fifth audit A5-N1): this migration MOVES files and told
+            // nothing. The logical page and its text are unchanged, so search
+            // kept answering — from rows keyed to paths that no longer exist,
+            // with nothing queued to correct them. The next ordinary save of a
+            // migrated page then published its NEW path beside the retired
+            // one's surviving row, so one file answered twice.
+            let moved = moved
+                .into_iter()
+                .map(|(source, retired, target)| {
+                    let replacement = self
+                        .graph_text_read_to_string(&write, &target)
+                        .ok()
+                        .and_then(|content| {
+                            let provisional = self.graph_inventory_entry(&target).ok().flatten()?;
+                            parse_exact_page(self, &provisional, &content).ok()
+                        });
+                    // The old path owns nothing now, and the moved journal is
+                    // as readable as it was: recorded by path before the
+                    // discard moves the generation (audit R15-02).
+                    self.note_graph_text_state(&source, true);
+                    self.note_graph_text_state(&target, replacement.is_some());
+                    (source, retired, target, replacement)
+                })
+                .collect::<Vec<_>>();
+            let coming = self.index_delta_coming();
+            let touched = moved
+                .iter()
+                .flat_map(|(source, _, target, _)| [source.clone(), target.clone()])
+                .collect();
+            self.discard_parsed_cache(touched, graph_drift::IndexEffect::Sent(&coming));
+            let mut page_set = Vec::new();
+            for (_, retired, _, replacement) in moved {
+                if let Some(entry) = retired {
+                    page_set.push(crate::direct_projection::PageSetChange::Delete { entry });
+                }
+                // Stale beats absent: without the replacement the retired rows
+                // are the only evidence this journal exists, so leave them and
+                // let a later warm reconcile (`rename_file_to_page` reasons the
+                // same way).
+                match replacement {
+                    Some((entry, document, revision)) => {
+                        page_set.push(crate::direct_projection::PageSetChange::Replace {
+                            entry,
+                            document: Arc::new(document),
+                            revision,
+                        })
+                    }
+                    None => {
+                        page_set.pop();
+                    }
+                }
+            }
+            self.direct_projection_publish_page_set(
+                self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
+                page_set,
+            );
         }
+        // Reported only after the moves that DID happen are published, so a
+        // caller seeing the error still sees an index that matches the disk.
+        outcome?;
         Ok(n)
     }
 
@@ -178,7 +276,18 @@ impl Graph {
         }
         let trash = typed_trash_dir(&self.root, TrashEntryKind::Journal);
         let dest = trash.join(format!("{}__{name}", trash_stamp()));
+        // Retained for the projection before the move takes the path away.
+        let retired = self.entry_for_path(&src);
         self.graph_text_move_to_trash(&write, &src, &dest, &trash)?;
+        // GH #543 (fifth audit A5-N1): this published nothing at all — no cache
+        // removal, no generation advance, no delta — so search went on offering
+        // the trashed file's text from an index that called itself complete.
+        // `cache_remove_path` is the blessed one-page retirement: it drops the
+        // page from the parsed cache and every index derived from it, advances
+        // the generation, and queues the projection's delete.
+        if let Some(entry) = retired {
+            self.cache_remove_path(&entry);
+        }
         Ok(())
     }
 }

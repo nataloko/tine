@@ -56,24 +56,24 @@ impl Graph {
         #[cfg(test)]
         GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
         let identity = canonical_projection_file_resource_id(&file)?;
-        let text = String::from_utf8(bytes).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "graph text file is not valid UTF-8",
-            )
-        })?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| page_content_rejected("graph text file is not valid UTF-8"))?;
         Ok(Some((text, identity)))
     }
 
     /// One-open coherent snapshot for a conflict authority decision. Unlike an
-    /// ordinary read, this also performs the hard-refusal admission checks that
-    /// must never mint override authority (portable alias and multiple links).
+    /// ordinary read, this also performs the hard-refusal admission check that
+    /// must never mint override authority: the portable alias. The link count
+    /// is no longer one of them — a hard-linked page is an ordinary page
+    /// (GH #571), and only page creation can name a true in-graph alias.
     pub(super) fn graph_text_read_optional_editor_conflict_snapshot(
         &self,
         permit: &GraphTextWritePermit,
         path: &Path,
     ) -> io::Result<Option<(String, ContentDigest)>> {
-        let graph_text_path = GraphTextPath::parse(self.rel_path(path)).map_err(|error| {
+        // Parsed for its refusal, not its value: a non-portable target must not
+        // mint override authority.
+        GraphTextPath::parse(self.rel_path(path)).map_err(|error| {
             DirectSaveError::into_io(
                 DirectSaveFailureCode::PrecheckNotPortable,
                 io::Error::new(
@@ -94,16 +94,11 @@ impl Graph {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error),
             };
-        validate_graph_text_single_link(&file, graph_text_path.as_str())?;
         #[cfg(test)]
         GRAPH_TEXT_CONTENT_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
         let identity = canonical_projection_file_resource_id(&file)?;
-        let text = String::from_utf8(bytes).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "graph text file is not valid UTF-8",
-            )
-        })?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| page_content_rejected("graph text file is not valid UTF-8"))?;
         Ok(Some((text, identity)))
     }
 
@@ -166,7 +161,8 @@ impl Graph {
         expected_identity: ContentDigest,
     ) -> io::Result<()> {
         let target = self.graph_text_target(permit, path, false)?;
-        let graph_text_path = GraphTextPath::parse(self.rel_path(path)).map_err(|error| {
+        // Parsed for its refusal, not its value (see above).
+        GraphTextPath::parse(self.rel_path(path)).map_err(|error| {
             DirectSaveError::into_io(
                 DirectSaveFailureCode::PrecheckNotPortable,
                 io::Error::new(
@@ -175,18 +171,13 @@ impl Graph {
                 ),
             )
         })?;
-        self.validate_existing_graph_text_target_exact(
-            &target,
-            &graph_text_path,
-            Some(expected_identity),
-        )?;
+        self.validate_existing_graph_text_target_exact(&target, Some(expected_identity))?;
         Ok(())
     }
 
     pub(super) fn validate_existing_graph_text_target_exact(
         &self,
         target: &GraphTextTarget,
-        graph_text_path: &GraphTextPath,
         expected_identity: Option<ContentDigest>,
     ) -> io::Result<ContentDigest> {
         projection_optional_regular_metadata(target.parent(), &target.filename)?;
@@ -198,7 +189,6 @@ impl Graph {
                 "graph text target changed at the local identity validation boundary",
             ));
         }
-        validate_graph_text_single_link(&file, graph_text_path.as_str())?;
         Ok(identity)
     }
 
@@ -243,31 +233,85 @@ impl Graph {
             let mut next = Vec::new();
 
             for prefix in prefixes {
-                for entry in prefix.directory.entries()? {
-                    all_entries = all_entries
-                        .checked_add(1)
-                        .ok_or_else(|| graph_text_inventory_limit_error("all directory entries"))?;
-                    if all_entries > limits.all_entries {
-                        return Err(graph_text_inventory_limit_error("all directory entries"));
+                // GH #406: inside a multi-file transaction the directory was
+                // listed once, indexed by portable identity, so only the
+                // entries sharing the requested component's identity are
+                // visited. Outside one, every entry is streamed as before.
+                let batched = portable_listing_batch_get(&prefix.directory, &prefix.relative)?;
+                let entries: Box<
+                    dyn Iterator<Item = io::Result<(Option<String>, PortableEntryType)>>,
+                > = match &batched {
+                    Some(listing) => {
+                        all_entries =
+                            all_entries.checked_add(listing.entries).ok_or_else(|| {
+                                graph_text_inventory_limit_error("all directory entries")
+                            })?;
+                        if all_entries > limits.all_entries {
+                            return Err(graph_text_inventory_limit_error("all directory entries"));
+                        }
+                        path_bytes = path_bytes
+                            .checked_add(listing.path_bytes_under(&prefix.relative)?)
+                            .ok_or_else(|| {
+                                graph_text_inventory_limit_error("aggregate path bytes")
+                            })?;
+                        if path_bytes > limits.path_bytes {
+                            return Err(graph_text_inventory_limit_error("aggregate path bytes"));
+                        }
+                        Box::new(listing.sharing_identity_with(requested_component).map(
+                            |(name, file_type)| {
+                                Ok((
+                                    Some(name.clone()),
+                                    PortableEntryType::Known(file_type.clone()),
+                                ))
+                            },
+                        ))
                     }
-                    let entry = entry?;
-                    let name = entry.file_name();
-                    let Some(name) = name.to_str() else {
+                    None => {
+                        #[cfg(test)]
+                        GRAPH_TEXT_PORTABLE_DIRECTORY_LISTINGS
+                            .with(|count| count.set(count.get().saturating_add(1)));
+                        Box::new(prefix.directory.entries()?.map(|entry| {
+                            entry.map(|entry| {
+                                (
+                                    entry.file_name().into_string().ok(),
+                                    PortableEntryType::Live(entry),
+                                )
+                            })
+                        }))
+                    }
+                };
+                for listed in entries {
+                    if batched.is_none() {
+                        all_entries = all_entries.checked_add(1).ok_or_else(|| {
+                            graph_text_inventory_limit_error("all directory entries")
+                        })?;
+                        if all_entries > limits.all_entries {
+                            return Err(graph_text_inventory_limit_error("all directory entries"));
+                        }
+                    }
+                    let (name, entry) = listed?;
+                    let Some(name) = name.as_deref() else {
                         // GraphTextPath is UTF-8 by contract, so this entry cannot
                         // share the requested portable component identity.
                         continue;
                     };
-                    let relative_len = prefix
-                        .relative
-                        .len()
-                        .checked_add(usize::from(!prefix.relative.is_empty()))
-                        .and_then(|length| length.checked_add(name.len()))
-                        .ok_or_else(|| graph_text_inventory_limit_error("aggregate path bytes"))?;
-                    path_bytes = path_bytes
-                        .checked_add(usize_to_u64(relative_len)?)
-                        .ok_or_else(|| graph_text_inventory_limit_error("aggregate path bytes"))?;
-                    if path_bytes > limits.path_bytes {
-                        return Err(graph_text_inventory_limit_error("aggregate path bytes"));
+                    if batched.is_none() {
+                        let relative_len = prefix
+                            .relative
+                            .len()
+                            .checked_add(usize::from(!prefix.relative.is_empty()))
+                            .and_then(|length| length.checked_add(name.len()))
+                            .ok_or_else(|| {
+                                graph_text_inventory_limit_error("aggregate path bytes")
+                            })?;
+                        path_bytes = path_bytes
+                            .checked_add(usize_to_u64(relative_len)?)
+                            .ok_or_else(|| {
+                                graph_text_inventory_limit_error("aggregate path bytes")
+                            })?;
+                        if path_bytes > limits.path_bytes {
+                            return Err(graph_text_inventory_limit_error("aggregate path bytes"));
+                        }
                     }
                     if !PortablePathKey::graph_text_component_matches(
                         name,
@@ -361,6 +405,49 @@ impl Graph {
         Ok(())
     }
 
+    /// Refuse only the alias Tine can actually name: another GRAPH-TEXT path
+    /// already holding this exact physical resource.
+    ///
+    /// **Threat scenario** (the refusal-table rule): two graph paths on one
+    /// inode. Every publication here is temp + no-clobber rename, so a save
+    /// through one name installs a NEW inode at that name and the other page
+    /// silently keeps the old bytes while Tine reports the save as done —
+    /// honest in-graph divergence the user never asked for, reachable through
+    /// an ordinary sync-delivered or user-made duplicate.
+    ///
+    /// A link whose other name is NOT a graph-text path is deliberately not
+    /// this function's business (GH #571, GH #555): git-annex's `annex.thin`
+    /// mode links every page into `.git/annex/objects/...`, which graph-text
+    /// scope never descends into. The old rule refused on the raw link count
+    /// and so could not tell those two cases apart, which made Tine unusable
+    /// on an annexed graph.
+    pub(super) fn validate_graph_text_resource_alias(
+        index: &CompleteGraphTextAdmissionIndex,
+        target_relative: &str,
+        identity: ContentDigest,
+    ) -> io::Result<()> {
+        let Some(sibling) = index
+            .paths_by_file_resource
+            .get(&identity)
+            .and_then(|members| {
+                members
+                    .iter()
+                    .find(|member| member.as_str() != target_relative)
+            })
+        else {
+            return Ok(());
+        };
+        Err(DirectSaveError::into_io(
+            DirectSaveFailureCode::PrecheckResourceAlias,
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "graph text files alias one physical resource: {sibling} and {target_relative}"
+                ),
+            ),
+        ))
+    }
+
     /// Apply strict current graph-scope collision policy to editor/name-only
     /// mutation. Portable aliases remain readable, but an editor mutation
     /// cannot choose one without authenticated exact logical authority.
@@ -398,34 +485,16 @@ impl Graph {
             ));
         }
         if let Some(identity) = target_identity {
-            if let Some(sibling) = index
-                .paths_by_file_resource
-                .get(&identity)
-                .and_then(|members| {
-                    members
-                        .iter()
-                        .find(|member| member.as_str() != target_relative)
-                })
-            {
-                return Err(DirectSaveError::into_io(
-                    DirectSaveFailureCode::PrecheckResourceAlias,
-                    io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!(
-                            "graph text files alias one physical resource: {} and {target_relative}",
-                            sibling
-                        ),
-                    ),
-                ));
-            }
+            Self::validate_graph_text_resource_alias(&index, &target_relative, identity)?;
         }
         Ok(index)
     }
 
-    /// Read the parsed ownership evidence once. A clean missing page cache is
-    /// repairable; failure-bearing cold evidence and partial or incoherent warm
-    /// publication remain hard refusals rather than authority to rebuild around
-    /// an unexplained gap.
+    /// Read the parsed ownership evidence once. A missing page cache is
+    /// repairable; partial or incoherent warm publication remains a hard
+    /// refusal rather than authority to rebuild around an unexplained gap.
+    /// Recorded failures travel with the evidence: whether one could own the
+    /// requested name is the creation's question, not the evidence's.
     pub(super) fn direct_creation_evidence(&self) -> io::Result<DirectCreationEvidence> {
         if self.graph_text_external_observation_pending() {
             return Err(io::Error::new(
@@ -436,19 +505,6 @@ impl Graph {
         let cache = self.cache.read().unwrap();
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         let Some(_pages) = cache.as_ref() else {
-            let published_failures = !self.page_index_failures.read().unwrap().is_empty();
-            let retained_failures = self
-                .effective_identity_index
-                .read()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|index| !index.failures.is_empty());
-            if published_failures || retained_failures {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "failure-bearing cold identity evidence cannot authorize name-only creation",
-                ));
-            }
             return Ok(DirectCreationEvidence::Cold);
         };
         let identity_index = self
@@ -469,18 +525,40 @@ impl Graph {
                 "parsed identity evidence is not one coherent generation",
             ));
         }
-        if !identity_index.failures.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "effective page identity is incomplete for name-only creation: {} unreadable or unparseable graph document(s)",
-                    identity_index.failures.len()
-                ),
-            ));
-        }
         Ok(DirectCreationEvidence::Warm {
             generation,
             identity_index,
+        })
+    }
+
+    /// GH #543 (IT-02): name-ownership evidence from the ready index, which
+    /// holds every page's effective (`title::`-aware) name at a validated
+    /// generation. Without it a graph that was never parsed -- every clean
+    /// reopen -- ran a whole-graph parse for its first creation, ahead of the
+    /// launch check when one was running. Like any graph-wide read this waits
+    /// for a launch check in flight. `None` when no ready index answers; the
+    /// caller then falls back to the parsed evidence. The recorded failures
+    /// travel with it, as with the parsed evidence.
+    fn indexed_creation_evidence(&self) -> Option<DirectCreationEvidence> {
+        let (generation, entries) = self.exact_read(|| self.direct_projection_page_inventory())?;
+        let failures = self.page_index_failures.read().unwrap().to_vec();
+        let mut owners = std::collections::HashMap::with_capacity(entries.len());
+        let mut physical_paths = std::collections::HashSet::with_capacity(entries.len());
+        for entry in entries {
+            physical_paths.insert(entry.path.clone());
+            owners
+                .entry(page_cache_key(entry.kind, &entry.name))
+                .or_insert_with(Vec::new)
+                .push(entry);
+        }
+        Some(DirectCreationEvidence::Warm {
+            generation,
+            identity_index: Arc::new(EffectiveIdentityIndex {
+                generation: std::sync::atomic::AtomicU64::new(generation),
+                owners,
+                physical_paths,
+                failures,
+            }),
         })
     }
 
@@ -504,11 +582,21 @@ impl Graph {
                 identity_index,
             },
             DirectCreationEvidence::Cold => {
-                let outcome = self.repair_page_cache_once(permit);
-                if !outcome.installed() {
-                    return Err(outcome.creation_error());
+                match self.indexed_or_fallback(|| self.indexed_creation_evidence()) {
+                    Ok(evidence) => evidence,
+                    // Asking the index waited for the launch survey, which may
+                    // have installed parsed evidence since (GH #543).
+                    Err(_) => match self.direct_creation_evidence()? {
+                        DirectCreationEvidence::Cold => {
+                            let outcome = self.repair_page_cache_once(permit);
+                            if !outcome.installed() {
+                                return Err(outcome.creation_error());
+                            }
+                            self.direct_creation_evidence()?
+                        }
+                        warm => warm,
+                    },
                 }
-                self.direct_creation_evidence()?
             }
         };
         let DirectCreationEvidence::Warm {
@@ -525,6 +613,16 @@ impl Graph {
                 format!("guarded graph-text target is not portable: {error}"),
             )
         })?;
+        let owners_unknown = self.failures_that_could_own(permit, &identity_index.failures, name);
+        if !owners_unknown.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "cannot create {name:?}: Tine could not read {}, which may already be that page",
+                    owners_unknown.join(", ")
+                ),
+            ));
+        }
         if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -541,120 +639,75 @@ impl Graph {
         ))
     }
 
-    fn current_effective_identity_index(&self) -> io::Result<Arc<EffectiveIdentityIndex>> {
-        loop {
-            let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-            if let Some(index) = self.effective_identity_index.read().unwrap().as_ref() {
-                if index.generation() == generation {
-                    return Ok(Arc::clone(index));
-                }
-            }
-            let pages = self
-                .cache
-                .read()
-                .unwrap()
-                .as_ref()
-                .map(Arc::clone)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "effective page identities are not warm for name-only creation",
-                    )
-                })?;
-            let failures = self.page_index_failures.read().unwrap().clone();
-            let built = Arc::new(build_effective_identity_index(
-                generation,
-                pages.as_slice(),
-                failures,
-            ));
-            if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
-                continue;
-            }
-            *self.effective_identity_index.write().unwrap() = Some(Arc::clone(&built));
-            return Ok(built);
-        }
-    }
-
-    pub(super) fn validate_name_only_effective_identity(
+    /// The recorded failures that could be a page named `name`. A page Tine
+    /// could not read or parse has an unknown effective name. It can have
+    /// that name only through its file name or a title written in its text,
+    /// so a failed file whose file name is another page's and whose text,
+    /// folded as page names are, never contains the name is not that page.
+    /// A failure that names no single page file (the graph-text scope, a
+    /// directory, a listing skip), or a file that cannot be read now, could
+    /// be any page. One unparseable page used to refuse every name-only
+    /// creation for the session.
+    ///
+    /// Refusal scenario `DIRECT-REF-CREATE-UNREADABLE-OWNER`
+    /// (`docs/storage-sync-contract.md` §3.1).
+    fn failures_that_could_own(
         &self,
-        current_entries: &[PageEntry],
-        kind: PageKind,
+        permit: &GraphTextWritePermit,
+        failures: &[String],
         name: &str,
-    ) -> io::Result<bool> {
-        let index = if self.cache.read().unwrap().is_none() {
-            let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-            let failures = self.page_index_failures.read().unwrap().clone();
-            let retained = self
-                .effective_identity_index
-                .read()
-                .unwrap()
-                .as_ref()
-                .map(Arc::clone);
-            if let Some(index) = retained {
-                if index.generation() == generation {
-                    index
-                } else if !current_entries.is_empty() || !failures.is_empty() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "cold graph has stale effective identities; name-only creation requires warm evidence",
-                    ));
-                } else {
-                    let index = Arc::new(EffectiveIdentityIndex {
-                        generation: std::sync::atomic::AtomicU64::new(generation),
-                        owners: std::collections::HashMap::new(),
-                        physical_paths: std::collections::HashSet::new(),
-                        failures: Vec::new(),
-                    });
-                    *self.effective_identity_index.write().unwrap() = Some(Arc::clone(&index));
-                    index
-                }
-            } else if !current_entries.is_empty() || !failures.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "cold graph has unknown effective identities; name-only creation requires warm evidence",
-                ));
-            } else {
-                let index = Arc::new(EffectiveIdentityIndex {
-                    generation: std::sync::atomic::AtomicU64::new(generation),
-                    owners: std::collections::HashMap::new(),
-                    physical_paths: std::collections::HashSet::new(),
-                    failures: Vec::new(),
-                });
-                *self.effective_identity_index.write().unwrap() = Some(Arc::clone(&index));
-                index
-            }
-        } else {
-            self.current_effective_identity_index()?
+    ) -> Vec<String> {
+        let key = crate::refs::page_key(name);
+        // A journal's name is its date, written in any format the journal
+        // format accepts: `title:: 2026-09-23` owns "Sep 23rd, 2026", which
+        // no substring of the bytes shows (audit R15-06).
+        let date = self
+            .journal_format
+            .parse(name)
+            .map(|date| date.ordinal_key());
+        let names_date = |text: &str| {
+            date.is_some_and(|date| {
+                self.journal_format
+                    .parse(text.trim())
+                    .map(|d| d.ordinal_key())
+                    == Some(date)
+            })
         };
-        if !index.failures.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "effective page identity is incomplete for name-only creation: {} unreadable or unparseable graph document(s)",
-                    index.failures.len()
-                ),
-            ));
-        }
-        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != index.generation() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "effective page identity evidence changed during name-only creation",
-            ));
-        }
-        let current_paths = current_entries
+        failures
             .iter()
-            .map(|entry| entry.path.clone())
-            .collect::<std::collections::HashSet<_>>();
-        if current_paths != index.physical_paths {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "effective page identity evidence is stale or incomplete for name-only creation",
-            ));
-        }
-        Ok(index
-            .owners
-            .get(&page_cache_key(kind, name))
-            .is_some_and(|owners| !owners.is_empty()))
+            .filter(|failure| {
+                // A FIFO, socket or device is never graph text, so it is no
+                // page and owns no name (audit R15-05).
+                if failure.ends_with(super::graph_text_inventory::NOT_A_REGULAR_FILE_SKIP) {
+                    return false;
+                }
+                let path = self.root.join(failure.as_str());
+                let Some(entry) = self
+                    .entry_for_path(&path)
+                    .filter(|_| !failure.starts_with(super::page_cache::GRAPH_TEXT_SCOPE_FAILURE))
+                else {
+                    return true;
+                };
+                if crate::refs::page_key(&entry.name) == key || names_date(&entry.name) {
+                    return true;
+                }
+                // Bytes, not text: a title written as UTF-8 survives a lossy
+                // decoding of a file that is not UTF-8 throughout.
+                match self.graph_text_read_optional(permit, &path) {
+                    Ok(None) => false,
+                    Ok(Some(bytes)) => {
+                        let text = String::from_utf8_lossy(&bytes);
+                        crate::refs::page_key(&text).contains(&key)
+                            || (date.is_some()
+                                && text.lines().any(|line| {
+                                    title_value(line).is_some_and(|value| names_date(value))
+                                }))
+                    }
+                    Err(_) => true,
+                }
+            })
+            .cloned()
+            .collect()
     }
 
     pub(super) fn advance_effective_identity_after_upsert(
@@ -687,25 +740,32 @@ impl Graph {
         *guard = Some(Arc::new(next));
     }
 
-    pub(super) fn record_watcher_identity_failure(&self, path: &Path) {
+    /// The watcher could not reconcile `path`: its state changed without a
+    /// publication. A file that is gone (`gone`) owns nothing and leaves the
+    /// record; recording it as unreadable announced a page that never
+    /// existed and refused its name (audit R15-04).
+    pub(super) fn record_watcher_identity_failure(&self, path: &Path, gone: bool) {
         let failure = self.rel_path(path);
+        let projection = self.direct_projection.get();
         let cache = self.cache.write().unwrap();
         let mut failures_guard = self.page_index_failures.write().unwrap();
         let mut failures = failures_guard.clone();
-        if !failures.iter().any(|candidate| candidate == &failure) {
-            failures.push(failure);
-            failures.sort();
-            failures.dedup();
+        failures.retire(&failure);
+        if !gone {
+            failures.record(failure);
         }
-        let generation = self
-            .cache_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Release)
-            + 1;
+        let generation = self.move_cache_generation(
+            &cache,
+            Some(graph_drift::StructuralChange::Reread(vec![
+                path.to_path_buf()
+            ])),
+            graph_drift::IndexEffect::Unchanged(projection.as_ref()),
+        );
         let next = match cache.as_ref() {
             Some(pages) => Some(Arc::new(build_effective_identity_index(
                 generation,
                 pages,
-                failures.clone(),
+                failures.to_vec(),
             ))),
             None => {
                 let retained = self.effective_identity_index.read().unwrap().clone();
@@ -714,14 +774,14 @@ impl Graph {
                         generation: std::sync::atomic::AtomicU64::new(generation),
                         owners: std::collections::HashMap::new(),
                         physical_paths: std::iter::once(path.to_path_buf()).collect(),
-                        failures: failures.clone(),
+                        failures: failures.to_vec(),
                     },
                     |current| {
                         let mut next = (*current).clone();
                         next.generation
                             .store(generation, std::sync::atomic::Ordering::Release);
                         next.physical_paths.insert(path.to_path_buf());
-                        next.failures = failures.clone();
+                        next.failures = failures.to_vec();
                         next
                     },
                 )))
@@ -737,25 +797,25 @@ impl Graph {
     }
 
     pub(super) fn clear_watcher_identity_failure_after_reconciliation(&self, entry: &PageEntry) {
+        let projection = self.direct_projection.get();
         let cache = self.cache.write().unwrap();
         let mut failures_guard = self.page_index_failures.write().unwrap();
-        if !failures_guard
-            .iter()
-            .any(|failure| failure == &entry.rel_path)
-        {
+        let mut failures = failures_guard.clone();
+        if !failures.retire(&entry.rel_path) {
             return;
         }
-        let mut failures = failures_guard.clone();
-        failures.retain(|failure| failure != &entry.rel_path);
-        let generation = self
-            .cache_gen
-            .fetch_add(1, std::sync::atomic::Ordering::Release)
-            + 1;
+        let generation = self.move_cache_generation(
+            &cache,
+            Some(graph_drift::StructuralChange::Reread(vec![entry
+                .path
+                .clone()])),
+            graph_drift::IndexEffect::Unchanged(projection.as_ref()),
+        );
         let next = match cache.as_ref() {
             Some(pages) => Arc::new(build_effective_identity_index(
                 generation,
                 pages,
-                failures.clone(),
+                failures.to_vec(),
             )),
             None => {
                 let retained = self.effective_identity_index.read().unwrap().clone();
@@ -780,7 +840,7 @@ impl Graph {
                     .entry(page_cache_key(entry.kind, &entry.name))
                     .or_default()
                     .push(entry.clone());
-                next.failures = failures.clone();
+                next.failures = failures.to_vec();
                 Arc::new(next)
             }
         };
@@ -819,32 +879,10 @@ impl Graph {
                 creation_proof: Some(creation_proof),
             });
         }
-        let index = self.validate_current_graph_text_collision_strict(permit, target, None)?;
-        let requested_identity_elsewhere = match (loaded_target.as_ref(), requested_identity) {
-            (None, Some((kind, name))) => {
-                let retained_collision = index
-                    .paths_by_semantic_key
-                    .get(&(
-                        match kind {
-                            PageKind::Page => 0,
-                            PageKind::Journal => 1,
-                        },
-                        crate::refs::page_key(name),
-                    ))
-                    .is_some_and(|members| !members.is_empty());
-                let entries = index
-                    .files_by_exact_path
-                    .iter()
-                    .map(|(_, record)| record.semantic.clone())
-                    .collect::<Vec<_>>();
-                retained_collision
-                    || self.validate_name_only_effective_identity(&entries, kind, name)?
-            }
-            _ => false,
-        };
+        self.validate_current_graph_text_collision_strict(permit, target, None)?;
         Ok(ExactGraphValidation {
-            target: loaded_target,
-            requested_identity_elsewhere,
+            target: None,
+            requested_identity_elsewhere: false,
             creation_proof: None,
         })
     }
@@ -969,4 +1007,176 @@ impl Graph {
             }
         }
     }
+}
+
+/// One directory as the portable-alias check sees it, listed once and indexed
+/// by portable (case/NFC) identity. Built only inside a
+/// [`PortableListingBatch`].
+pub(super) struct PortableListing {
+    /// Every entry, UTF-8 or not: the same count the streaming path charges.
+    entries: usize,
+    /// UTF-8 entries and the sum of their name bytes, to charge the same
+    /// aggregate path bytes the streaming path does without re-walking.
+    utf8_entries: usize,
+    utf8_name_bytes: usize,
+    by_identity: std::collections::HashMap<PortablePathKey, Vec<(String, cap_std::fs::FileType)>>,
+}
+
+impl PortableListing {
+    fn read(directory: &Dir) -> io::Result<Self> {
+        #[cfg(test)]
+        GRAPH_TEXT_PORTABLE_DIRECTORY_LISTINGS
+            .with(|count| count.set(count.get().saturating_add(1)));
+        let mut listing = Self {
+            entries: 0,
+            utf8_entries: 0,
+            utf8_name_bytes: 0,
+            by_identity: std::collections::HashMap::new(),
+        };
+        for entry in directory.entries()? {
+            listing.entries = listing
+                .entries
+                .checked_add(1)
+                .ok_or_else(|| graph_text_inventory_limit_error("all directory entries"))?;
+            let entry = entry?;
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            listing.utf8_entries += 1;
+            listing.utf8_name_bytes = listing
+                .utf8_name_bytes
+                .checked_add(name.len())
+                .ok_or_else(|| graph_text_inventory_limit_error("aggregate path bytes"))?;
+            let file_type = entry.file_type()?;
+            listing
+                .by_identity
+                .entry(PortablePathKey::from_graph_text_path(&name))
+                .or_default()
+                .push((name, file_type));
+        }
+        Ok(listing)
+    }
+
+    /// Exactly the aggregate path bytes the streaming path charges for this
+    /// directory: `relative/name` for every UTF-8 entry.
+    fn path_bytes_under(&self, relative: &str) -> io::Result<u64> {
+        let per_entry_prefix = relative.len() + usize::from(!relative.is_empty());
+        per_entry_prefix
+            .checked_mul(self.utf8_entries)
+            .and_then(|prefixes| prefixes.checked_add(self.utf8_name_bytes))
+            .ok_or_else(|| graph_text_inventory_limit_error("aggregate path bytes"))
+            .and_then(usize_to_u64)
+    }
+
+    fn sharing_identity_with<'a>(
+        &'a self,
+        component: &str,
+    ) -> impl Iterator<Item = &'a (String, cap_std::fs::FileType)> + use<'a> {
+        self.by_identity
+            .get(&PortablePathKey::from_graph_text_path(component))
+            .into_iter()
+            .flatten()
+    }
+}
+
+pub(super) enum PortableEntryType {
+    Live(cap_std::fs::DirEntry),
+    Known(cap_std::fs::FileType),
+}
+
+impl PortableEntryType {
+    fn file_type(&self) -> io::Result<cap_std::fs::FileType> {
+        match self {
+            Self::Live(entry) => entry.file_type(),
+            Self::Known(file_type) => Ok(file_type.clone()),
+        }
+    }
+}
+
+thread_local! {
+    static PORTABLE_LISTING_BATCH: std::cell::RefCell<
+        Option<std::collections::HashMap<String, std::rc::Rc<PortableListing>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Share directory listings across the portable-alias checks of ONE
+/// multi-file transaction on this thread (GH #406).
+///
+/// Without it a page rename that rewrites k files of a folder holding N
+/// entries lists that folder k times — k x N work, 80% of an 800-referrer
+/// rename on an 8,000-page `pages/`.
+///
+/// A batched listing is older than the per-file listing it replaces, which
+/// widens the check's existing race window (listing -> write) from one file
+/// to the transaction's write phase. That is acceptable only for in-place
+/// rewrites of existing files, where a missed twin means the rewrite lands
+/// exactly as it would have in the old window. A CREATION publishes a new
+/// name and runs through [`PortableListingBatch::suspended`], so its check
+/// stays live. Do not add a post-write re-validation instead: a refusal there
+/// cannot always roll back, because restoring a file next to its new twin is
+/// itself refused, and a half-rolled-back rename is worse than either outcome.
+/// The guard is thread-local, so a save on another thread never sees it.
+pub(super) struct PortableListingBatch {
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
+
+impl PortableListingBatch {
+    pub(super) fn begin() -> Self {
+        PORTABLE_LISTING_BATCH.with(|batch| {
+            let mut batch = batch.borrow_mut();
+            debug_assert!(batch.is_none(), "portable listing batches do not nest");
+            *batch = Some(std::collections::HashMap::new());
+        });
+        Self {
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+
+    /// Run `f` with the batch set aside, so its checks list directories live.
+    /// A file CREATION must use this: its check is the last line of defence
+    /// before a new name is published, and a published twin cannot always be
+    /// withdrawn again on rollback (the withdrawal itself refuses the twin).
+    pub(super) fn suspended<T>(&self, f: impl FnOnce() -> T) -> T {
+        let listings = PORTABLE_LISTING_BATCH.with(|batch| batch.borrow_mut().take());
+        let result = f();
+        PORTABLE_LISTING_BATCH.with(|batch| *batch.borrow_mut() = listings);
+        result
+    }
+}
+
+impl Drop for PortableListingBatch {
+    fn drop(&mut self) {
+        PORTABLE_LISTING_BATCH.with(|batch| *batch.borrow_mut() = None);
+    }
+}
+
+/// The batched listing of `directory` (named `relative` under the graph root),
+/// listing it on first use; `None` outside a batch.
+fn portable_listing_batch_get(
+    directory: &Dir,
+    relative: &str,
+) -> io::Result<Option<std::rc::Rc<PortableListing>>> {
+    PORTABLE_LISTING_BATCH.with(|batch| {
+        let mut batch = batch.borrow_mut();
+        let Some(listings) = batch.as_mut() else {
+            return Ok(None);
+        };
+        if let Some(listing) = listings.get(relative) {
+            return Ok(Some(listing.clone()));
+        }
+        let listing = std::rc::Rc::new(PortableListing::read(directory)?);
+        listings.insert(relative.to_owned(), listing.clone());
+        Ok(Some(listing))
+    })
+}
+
+/// The value of a `title::` property or an Org `#+title:` line, if `line`
+/// is one.
+fn title_value(line: &str) -> Option<&str> {
+    let line = line.trim_start().trim_start_matches(['-', '*', ' ', '\t']);
+    ["title::", "#+title:"].iter().find_map(|prefix| {
+        line.get(..prefix.len())
+            .filter(|head| head.eq_ignore_ascii_case(prefix))
+            .map(|_| &line[prefix.len()..])
+    })
 }

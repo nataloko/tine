@@ -12,7 +12,7 @@ impl Graph {
     /// ([`Graph::query_property_registry_current`]) and has no other.
     #[cfg(test)]
     pub(crate) fn property_registry(&self) -> Arc<crate::query::registry::Registry> {
-        let config = self.config.parse_config();
+        let config = self.config().parse_config();
         let (rows, pages) = self
             .direct_projection_property_owner_rows()
             .unwrap_or_else(|| crate::query::property_owner_rows(self));
@@ -52,10 +52,10 @@ impl Graph {
         _source_generation: u64,
     ) -> Result<Arc<crate::query::registry::Registry>, crate::query::QueryExecutionError> {
         self.dispatch_direct_query(|request| {
-            self.direct_projection_query_job(
+            self.direct_projection_read_job(
                 request,
                 crate::direct_projection::RegistrySensitivity::Required,
-                |job, _| self.query_property_registry_at(job),
+                |job| self.query_property_registry_at(job),
             )
         })
     }
@@ -90,6 +90,23 @@ impl Graph {
         Ok(self
             .derived_memo_entry_fallible(key, || {
                 compute().map(|computed| DerivedEntry::plain(bounded_ref_groups(computed)))
+            })?
+            .result)
+    }
+
+    fn derived_memo_bounded_fallible_if_eligible<E>(
+        &self,
+        key: String,
+        compute: impl FnOnce() -> Result<(crate::query::BoundedGroups, bool), E>,
+    ) -> Result<BoundedRefGroups, E> {
+        Ok(self
+            .derived_memo_entry_fallible_if_eligible(key, || {
+                compute().map(|(computed, memo_eligible)| {
+                    (
+                        DerivedEntry::plain(bounded_ref_groups(computed)),
+                        memo_eligible,
+                    )
+                })
             })?
             .result)
     }
@@ -146,14 +163,35 @@ impl Graph {
         key: String,
         compute: impl FnOnce() -> Result<DerivedEntry, E>,
     ) -> Result<DerivedEntry, E> {
+        self.derived_memo_entry_fallible_if_eligible(key, || compute().map(|result| (result, true)))
+    }
+
+    /// The existing memo boundary with result-derived admission. A successful
+    /// answer may still be ineligible when it came from a transient fallback;
+    /// decide that from the source the query actually used, after the read,
+    /// rather than from a racy readiness observation before it.
+    fn derived_memo_entry_fallible_if_eligible<E>(
+        &self,
+        key: String,
+        compute: impl FnOnce() -> Result<(DerivedEntry, bool), E>,
+    ) -> Result<DerivedEntry, E> {
         use std::sync::atomic::Ordering;
-        let gen = self.cache_gen.load(Ordering::Acquire);
+        let generation = self.cache_gen.load(Ordering::Acquire);
         let today = crate::date::JournalDate::today().ordinal_key();
-        let config_digest = self.config.parse_config().digest();
+        let config_digest = {
+            let config = self.config();
+            (
+                config.parse_config().digest(),
+                config.answer_settings_digest(),
+            )
+        };
         {
             let mut g = self.derived_cache.write().unwrap();
             if let Some(dc) = g.as_mut() {
-                if dc.gen == gen && dc.today == today && dc.config_digest == config_digest {
+                if dc.generation == generation
+                    && dc.today == today
+                    && dc.config_digest == config_digest
+                {
                     if let Some((r, _)) = dc.results.get(&key) {
                         let result = r.clone();
                         touch_lru(&mut dc.lru, &key);
@@ -162,7 +200,10 @@ impl Graph {
                 }
             }
         }
-        let result = compute()?;
+        let (result, memo_eligible) = compute()?;
+        if !memo_eligible || !self.answer_is_complete() {
+            return Ok(result);
+        }
         let result_bytes = ref_groups_estimated_bytes(result.result.groups.as_slice())
             .saturating_add(result_cache_key_estimated_bytes(&key));
         if result_bytes > DERIVED_CACHE_MAX_ENTRY_BYTES {
@@ -170,7 +211,11 @@ impl Graph {
         }
         let mut g = self.derived_cache.write().unwrap();
         match g.as_mut() {
-            Some(dc) if dc.gen == gen && dc.today == today && dc.config_digest == config_digest => {
+            Some(dc)
+                if dc.generation == generation
+                    && dc.today == today
+                    && dc.config_digest == config_digest =>
+            {
                 if let Some((_, old_bytes)) = dc
                     .results
                     .insert(key.clone(), (result.clone(), result_bytes))
@@ -185,7 +230,7 @@ impl Graph {
                 let mut results = std::collections::HashMap::new();
                 results.insert(key.clone(), (result.clone(), result_bytes));
                 *g = Some(DerivedCache {
-                    gen,
+                    generation,
                     today,
                     config_digest,
                     results,
@@ -421,9 +466,14 @@ impl Graph {
         max_bytes: usize,
     ) -> Result<BoundedRefGroups, crate::query::QueryExecutionError> {
         let normalized = crate::refs::normalize(target);
-        self.derived_memo_bounded_fallible(
-            format!("U\0{max_rows}\0{max_bytes}\0{normalized}"),
-            || crate::query::unlinked_refs_bounded_indexed(self, target, max_rows, max_bytes),
+        self.derived_memo_bounded_fallible_if_eligible(
+            format!("UI\0{max_rows}\0{max_bytes}\0{normalized}"),
+            || {
+                crate::query::unlinked_refs_bounded_indexed_with_source(
+                    self, target, max_rows, max_bytes,
+                )
+                .map(|answer| (answer.groups, answer.memo_eligible))
+            },
         )
     }
 
@@ -456,7 +506,7 @@ impl Graph {
     ) -> Result<T, crate::publish::PrintPreparationError> {
         use crate::query::rank::PageRecencyPrograms;
         use crate::query::read_execute::{SnapshotQueryInputs, SnapshotQueryReader};
-        use crate::query::results::{RecencyPage, ResultIdentity};
+        use crate::query::results::RecencyPage;
         let render = std::cell::RefCell::new(Some(render));
         let today = crate::date::JournalDate::today();
         self.dispatch_direct_query(|request| {
@@ -465,10 +515,7 @@ impl Graph {
                 crate::direct_projection::RegistrySensitivity::Required,
                 |job| {
                     let registry = self.direct_lowering_registry(true, job)?;
-                    let identity = ResultIdentity {
-                        session_pages: Arc::clone(&job.session_pages),
-                        all_session: false,
-                    };
+                    let identity = job.identity.clone();
                     let recency = |page: RecencyPage<'_>| {
                         crate::query::page_recency_secs_for(
                             page.journal_day,

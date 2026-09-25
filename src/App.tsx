@@ -1,8 +1,10 @@
 import { Match, Show, Suspense, Switch, createEffect, createSignal, lazy, on, onCleanup, onMount, type JSX } from "solid-js";
+import { listenHere } from "./windowEvents";
 import { Sidebar } from "./components/Sidebar";
-import { isPublishedExport } from "./publishedBackend";
+import { isPublishedExport, loadPublishedSnapshot } from "./publishedBackend";
 import { PageView, reloadJournalsFeedFromStart, toLoadablePage, type JournalsFeedOwner } from "./components/Page";
 import { QueryWorkspace } from "./components/QueryWorkspace";
+import { ConflictOverview } from "./components/ConflictOverview";
 import { QuickSwitcher } from "./components/QuickSwitcher";
 // pdf.js (~hundreds of KB) is heavy and most sessions never open a PDF — load
 // the viewer only when one is opened.
@@ -14,8 +16,10 @@ import { WorkspaceSwitcher } from "./components/WorkspaceSwitcher";
 import { TopbarOverflowMenu } from "./components/TopbarOverflowMenu";
 import { ContextMenu } from "./components/ContextMenu";
 import { Toasts, Lightbox } from "./components/Toasts";
+import { unreadablePagesMessage } from "./lib/unreadablePages";
 import { AudioOverlay } from "./components/AudioOverlay";
 import { CalendarJump } from "./components/CalendarJump";
+import { IndexingProgressBar } from "./components/IndexingProgressBar";
 import { RightSidebar } from "./components/RightSidebar";
 // Settings pulls in the plugin/theme catalogues, backup controls, and every
 // settings tab. Most launches never open it, so keep that work out of the
@@ -42,12 +46,12 @@ import { InPageFind } from "./components/InPageFind";
 import { installKeybindings } from "./keybindings";
 import { installFileDrop } from "./filedrop";
 import { installBlockSelectionDrag } from "./blockDrag";
-import { applyGraphConfigChange, loadGraphPath, persistedGraphPath, refreshAliases, refreshPageIdentities, switchGraph } from "./graph";
+import { applyGraphConfigChange, applyGraphReopened, loadGraphPath, persistedGraphPath, refreshAliases, refreshPageIdentities, switchGraph } from "./graph";
 import { applyObservedAssetChanges } from "./assetRefresh";
 import { favoritesPageChanged } from "./favoritesStore";
 import { checkForUpdate } from "./update";
 import { WelcomeLayer } from "./components/Welcome";
-import { goBack, goForward, canGoBack, canGoForward, flushSession, openJournals, sameRoute, type PaneRouter, type PdfRoute, type QueryRoute } from "./router";
+import { goBack, goForward, canGoBack, canGoForward, flushSession, openJournals, sameRoute, type PaneRouter, type PdfRoute, type QueryRoute, type Route } from "./router";
 import {
   theme,
   toggleTheme,
@@ -76,6 +80,7 @@ import {
   bumpDataRev,
   pageInventoryRev,
   bumpPageInventoryRev,
+  correctLaunchAnswers,
   installPaneTracker,
   isConflicted,
   pushToast,
@@ -186,6 +191,11 @@ import { hlsPageName } from "./pdf";
 import { createStartupRecoveryController } from "./startupRecovery";
 import { writeClipboardTextResilient } from "./clipboard";
 import { FailureBoundary } from "./components/FailureBoundary";
+import {
+  openPublishedPermalink,
+  publishedPermalinkForWorkspace,
+  replacePublishedPermalink,
+} from "./publishedPermalink";
 
 /** The single persistence transaction used by both desktop close and Android
  * root Back.  Callers choose only the final platform action. */
@@ -212,6 +222,10 @@ export const safeClose = createSafeCloseCoordinator({
     if (!discard) openUnsavedRecovery();
     return discard;
   },
+  recordDiscard: (reason) => backend().diagnosticFrontendEvent(
+    "close_discarded_unsaved", undefined, undefined, undefined, undefined, undefined,
+    reason, unsavedRecoveryPages().length,
+  ),
   flushSession,
   setTransition: setGraphTransitioning,
   notifyPdfFailure: () => {
@@ -595,12 +609,14 @@ function PaneTabSplitPreview(props: { paneId: string }): JSX.Element {
 
 function PaneContent(props: { router: PaneRouter }): JSX.Element {
   return (
-    <Show
-      when={props.router.route().kind === "query"}
-      fallback={<PageView />}
-    >
-      <QueryWorkspace route={props.router.route() as QueryRoute} router={props.router} focusSource={focusedPaneId() === props.router.paneId} />
-    </Show>
+    <Switch fallback={<PageView />}>
+      <Match when={props.router.route().kind === "query"}>
+        <QueryWorkspace route={props.router.route() as QueryRoute} router={props.router} focusSource={focusedPaneId() === props.router.paneId} />
+      </Match>
+      <Match when={props.router.route().kind === "conflicts"}>
+        <ConflictOverview router={props.router} />
+      </Match>
+    </Switch>
   );
 }
 
@@ -869,6 +885,46 @@ export async function installMobileExternalLinkHandler(): Promise<() => void> {
 }
 
 export function App(): JSX.Element {
+  const published = isPublishedExport();
+  const initialPublishedHash = published ? window.location.hash : "";
+  const [publishedPermalinkReady, setPublishedPermalinkReady] = createSignal(!published);
+  let initialPublishedPermalinkHandled = false;
+  let revealedPublishedBlock: { route: Route; block: string } | null = null;
+
+  const syncPublishedPermalink = () => {
+    if (!published || !publishedPermalinkReady()) return;
+    const paneIds = layoutPaneIds();
+    const router = paneRouter(paneIds[0] ?? focusedPaneId());
+    const current = router.route();
+    if (revealedPublishedBlock && revealedPublishedBlock.route !== current) {
+      revealedPublishedBlock = null;
+    }
+    const target = publishedPermalinkForWorkspace(
+      paneIds.length,
+      router.tabs().length,
+      current,
+      revealedPublishedBlock?.block,
+    );
+    if (target !== undefined) replacePublishedPermalink(target);
+  };
+
+  const applyPublishedHash = async (hash: string) => {
+    const result = openPublishedPermalink(
+      await loadPublishedSnapshot(),
+      hash,
+      paneRouter(focusedPaneId()),
+    );
+    revealedPublishedBlock = result.status === "opened" && result.target.kind === "block"
+      ? { route: result.route, block: result.target.block }
+      : null;
+    if (result.status === "invalid") {
+      pushToast("This published link isn't valid.", "error");
+    } else if (result.status === "missing") {
+      pushToast("This published link no longer exists in this export.", "error");
+    }
+    return result.status;
+  };
+
   let openCalendarJump = () => {};
   const topbarActions = {
     calendar: () => openCalendarJump(),
@@ -886,7 +942,27 @@ export function App(): JSX.Element {
     pickGraph: switchGraph,
     copyText: writeClipboardTextResilient,
     notify: (message, kind) => pushToast(message, kind, kind === "error" ? { sticky: true } : undefined),
-    completeFirstLoad: () => setFirstLoadDone(true),
+    completeFirstLoad: () => {
+      if (!published || initialPublishedPermalinkHandled) {
+        setFirstLoadDone(true);
+        return;
+      }
+      initialPublishedPermalinkHandled = true;
+      void applyPublishedHash(initialPublishedHash).finally(() => {
+        setPublishedPermalinkReady(true);
+        setFirstLoadDone(true);
+      });
+    },
+  });
+  createEffect(syncPublishedPermalink);
+  onMount(() => {
+    if (!published) return;
+    const onHashChange = () => {
+      if (!publishedPermalinkReady()) return;
+      void applyPublishedHash(window.location.hash).finally(syncPublishedPermalink);
+    };
+    window.addEventListener("hashchange", onHashChange);
+    onCleanup(() => window.removeEventListener("hashchange", onHashChange));
   });
   // Startup debug trace (TINE_DEBUG=1 / --debug): forward UI milestones + errors
   // into the backend log so a remote "bad startup" is diagnosable in one file.
@@ -1088,11 +1164,29 @@ export function App(): JSX.Element {
     onCleanup(() => unsub());
   });
   onMount(() => {
+    let unsub = () => {};
+    void backend().onGraphReopened(applyGraphReopened).then((u) => (unsub = u));
+    onCleanup(() => unsub());
+  });
+  onMount(() => {
     let disposed = false;
     let unsub = () => {};
     void backend().onQueryProjectionChanged(bumpDataRev).then((u) => {
       if (disposed) u();
       else unsub = u;
+    });
+    onCleanup(() => { disposed = true; unsub(); });
+  });
+  // Answers shown during the launch check may come from the index as the last
+  // session left it; once the check lands, every surface asks again (GH #550).
+  onMount(() => {
+    let disposed = false;
+    let unsub = () => {};
+    void listenHere("warm-cache-done", () => correctLaunchAnswers()).then((u) => {
+      if (disposed) u();
+      else unsub = u;
+    }).catch(() => {
+      // A published export has no native events; nothing is ever corrected there.
     });
     onCleanup(() => { disposed = true; unsub(); });
   });
@@ -1106,6 +1200,15 @@ export function App(): JSX.Element {
       .onGraphWatchError(() =>
         pushToast("Tine couldn't finish checking the graph folder for outside changes. It will keep retrying.", "error"),
       )
+      .then((u) => (unsub = u));
+    onCleanup(() => unsub());
+  });
+  // A page Tine could not read or parse. The rest of the graph is indexed
+  // around it and the file is left as it is, so say which page and what to do.
+  onMount(() => {
+    let unsub = () => {};
+    void backend()
+      .onGraphUnreadablePages((paths) => pushToast(unreadablePagesMessage(paths), "error"))
       .then((u) => (unsub = u));
     onCleanup(() => unsub());
   });
@@ -1555,6 +1658,7 @@ export function App(): JSX.Element {
             </Show>
           </Show>
           <div class="topbar-right">
+            <IndexingProgressBar />
             <CalendarJump triggerClass="topbar-optional-action" onOpenReady={(open) => { openCalendarJump = open; }} />
             <button class="icon-btn topbar-optional-action" title="Journals" data-pane-focus-neutral onClick={topbarActions.journals}>
               <svg viewBox="0 0 24 24" class="nav-icon">

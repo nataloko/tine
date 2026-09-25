@@ -2,6 +2,7 @@
 //! to a page, page paths, and create-if-absent for pages and assets.
 
 use super::*;
+use crate::direct_projection::PageSetChange;
 
 impl Graph {
     /// Reconcile a duplicate-day pair: append every block of `src_rel` to the end of
@@ -96,9 +97,12 @@ impl Graph {
         // failure aborts the merge cleanly before any write — and if the dst write
         // then fails we roll the move back, so neither the merge nor the source is
         // lost. On success src sits in the recoverable trash.
+        // Retained for the projection: once the merge commits, this page's file
+        // is in the trash and its rows must go with it.
+        let src_entry = self.entry_for_path(&src);
         let trash = typed_trash_dir(
             &self.root,
-            match self.entry_for_path(&src).map(|e| e.kind) {
+            match src_entry.as_ref().map(|e| e.kind) {
                 Some(PageKind::Journal) => TrashEntryKind::Journal,
                 _ => TrashEntryKind::Page,
             },
@@ -113,6 +117,17 @@ impl Graph {
                 io::ErrorKind::AlreadyExists,
                 "source changed during merge",
             ));
+        }
+        // Retire the source the moment its FILE leaves the graph, before the
+        // destination is rewritten — not after. Published the other way round,
+        // the destination's own `cache_upsert` can be drained on its own and the
+        // worker announces a complete, ready index that still contains a page
+        // whose file is already in the trash (fifth audit A5-N4). This order has
+        // no such state: every image published between these two points is one
+        // that actually existed on disk — the source gone, the destination not
+        // yet merged.
+        if let Some(entry) = src_entry.clone() {
+            self.cache_remove_path(&entry);
         }
         // The page lock excludes other Tine writers, but not Logseq/Syncthing.
         // Recheck the baseline at commit so an external edit arriving after our
@@ -130,8 +145,62 @@ impl Graph {
         ) {
             let _ = graph_text_write_during_rollback_hook();
             let _ = self.graph_text_move_noreplace(&write, &staged, &src);
+            // The rollback puts the source file back, so its retirement has to
+            // come back with it — otherwise a failed merge leaves the index
+            // missing a page that exists, with nothing queued to notice.
+            // Republished from the exact bytes verified on disk above, so this
+            // compensation needs no read that could fail in turn.
+            //
+            // What goes back into the index is what is ON DISK at that path
+            // now — not what we believe the restore did, and not the bytes we
+            // read before the merge (seventh audit A7-N1). Two things make the
+            // belief wrong in opposite directions: `move_noreplace` renames
+            // FIRST and then does fallible durability and identity work, so an
+            // `Err` can mean "restored, then a later step failed"; and it
+            // refuses a path something else now owns, where the occupant is
+            // the honest current content of that path and needs indexing just
+            // as much. Reading once answers both, and keeps the rule the fifth
+            // and sixth audits arrived at: every published image is one that
+            // actually existed on disk.
+            if let Some(entry) = src_entry {
+                match self.graph_text_read_optional_text(&write, &src) {
+                    Ok(Some(current)) => {
+                        if let Ok((entry, document, revision)) =
+                            parse_exact_page(self, &entry, &current)
+                        {
+                            self.cache_upsert(entry, document, revision);
+                        }
+                    }
+                    // Genuinely gone: the retirement already published is the
+                    // truth, and standing is where it belongs.
+                    Ok(None) => {}
+                    // The state cannot be established. Leaving the retirement
+                    // standing publishes "absent", which is wrong only if the
+                    // file is there — and this merge is returning an error to
+                    // the user either way; a later reconcile owns it.
+                    Err(_) => {}
+                }
+            }
             return Err(e);
         }
+        // GH #543: the merged destination publishes itself through `write_page`,
+        // but nothing retired the source — so search kept returning BOTH pages,
+        // with the index `ready` and claiming to be complete, while the source's
+        // file sat in the trash. A successful answer never reaches the repair a
+        // refusal would start, so the ghost never went away (fourth audit A4-N1).
+        //
+        // Deleting the source's ROWS is not enough, and the first fix here did
+        // only that (fifth audit A5-N3). Unlike every other page-set mutation in
+        // this file, a merge does NOT invalidate the parsed whole-graph cache —
+        // it publishes one destination through `cache_upsert` — so the source
+        // stayed in that cache. The parsed cache is an authoritative snapshot
+        // producer: a query read failure makes the repair path reset the index
+        // and republish it at the CURRENT generation, walking the merged-away
+        // page straight back into search, past the older-generation guard, which
+        // has nothing to object to. `cache_remove_path` is the blessed one-page
+        // retirement — parsed cache, revisions, every derived index, the session
+        // ids and the projection delete, in one generation. It runs above,
+        // before the destination write, for the reason A5-N4 gives there.
         Ok(())
     }
 
@@ -213,7 +282,7 @@ impl Graph {
                 ),
             ));
         }
-        let enc = encode_page_name(name, self.config.file_name_format);
+        let enc = encode_page_name(name, self.config().file_name_format);
         for target in configured_text_variant_paths(&dir, &enc) {
             if self.graph_text_exists(&write, &target)? {
                 return Err(DirectSaveError::into_io(
@@ -227,36 +296,75 @@ impl Graph {
         }
         self.graph_text_create_dir_all(&write, &dir)?;
         let dst = dir.join(format!("{enc}.{ext}"));
+        // Retained for the projection before the move takes the path away.
+        let src_entry = self.entry_for_path(&src);
         self.graph_text_move_noreplace(&write, &src, &dst)?;
         // Reopen only the committed destination, not the graph: this binds the
         // inventory entry to the exact bytes that now own the new name even if an
         // external editor changed the retained source inode during the move.
-        let updated_page_inventory =
-            page_inventory_snapshot.and_then(|(mut inventory, mut failures)| {
-                let content = self.graph_text_read_to_string(&write, &dst).ok()?;
+        let effective = self
+            .graph_text_read_to_string(&write, &dst)
+            .ok()
+            .and_then(|content| {
                 let provisional = self.graph_inventory_entry(&dst).ok().flatten()?;
-                let effective = parse_exact_page(self, &provisional, &content)
+                parse_exact_page(self, &provisional, &content)
                     .ok()
-                    .map(|(entry, _, _)| entry);
-                let src_rel = self.rel_path(&src);
-                let dst_rel = self.rel_path(&dst);
-                inventory.retain(|entry| entry.path != src);
-                failures.retain(|failure| failure != &src_rel && failure != &dst_rel);
-                if let Some(entry) = effective {
-                    inventory.push(entry);
-                } else {
-                    failures.push(dst_rel);
-                }
-                Some((inventory, failures))
+                    .map(|(entry, _, _)| entry)
             });
+        // The old path owns nothing now, and the moved file is as readable as
+        // it was: recorded by path before the discard moves the generation.
+        self.note_graph_text_state(&src, true);
+        self.note_graph_text_state(&dst, effective.is_some());
+        let updated_page_inventory = page_inventory_snapshot.map(|mut inventory| {
+            inventory.retain(|entry| entry.path != src);
+            inventory.extend(effective);
+            inventory
+        });
         // The parsed snapshot is invalidated because this rescue changes the
         // physical kind/path. Preserve the separately updated list memo when its
         // pre-transaction generation was current.
         *self.find_entry_cache.write().unwrap() = None;
-        self.invalidate_cache_after_tine_mutation();
-        if let Some((inventory, failures)) = updated_page_inventory {
-            self.publish_page_inventory_snapshot(inventory, failures);
+        let coming = self.index_delta_coming();
+        self.discard_parsed_cache(
+            vec![src.clone(), dst.clone()],
+            graph_drift::IndexEffect::Sent(&coming),
+        );
+        if let Some(inventory) = updated_page_inventory {
+            self.publish_page_inventory_snapshot(inventory);
         }
+        // GH #543: the rescue moved a page's file and told the index only that
+        // something had changed. Nothing was queued, so search went on offering
+        // the page under its OLD path and never found the rescued one — and
+        // because those answers SUCCEEDED, no repair was ever started (fourth
+        // audit A4-N1). Retire the old path and publish the new one together:
+        // published separately, the queue can empty between them and readiness
+        // is announced over a graph missing the page (A4-N2).
+        let mut page_set = Vec::new();
+        if let Some(entry) = src_entry {
+            page_set.push(PageSetChange::Delete { entry });
+        }
+        let replacement = self
+            .graph_text_read_to_string(&write, &dst)
+            .ok()
+            .and_then(|content| {
+                let provisional = self.graph_inventory_entry(&dst).ok().flatten()?;
+                parse_exact_page(self, &provisional, &content).ok()
+            });
+        match replacement {
+            Some((entry, document, revision)) => page_set.push(PageSetChange::Replace {
+                entry,
+                document: Arc::new(document),
+                revision,
+            }),
+            // Stale beats absent: without the replacement the old rows are the
+            // only evidence this page exists, so leave them and let a later warm
+            // reconcile. `page_index_failures` already names it.
+            None => page_set.clear(),
+        }
+        self.direct_projection_publish_page_set(
+            self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
+            page_set,
+        );
         Ok(())
     }
 
@@ -288,7 +396,7 @@ impl Graph {
                 // place rather than creating a second file in the other extension;
                 // a brand-new page is created in the graph's preferred format.
                 // Cheap `exists()` probes (the common hit needs one), no dir scan.
-                let enc = encode_page_name(name, self.config.file_name_format);
+                let enc = encode_page_name(name, self.config().file_name_format);
                 let dir = self.pages_path();
                 let primary = dir.join(format!("{enc}.{}", pref.ext()));
                 if primary.exists() {
@@ -322,7 +430,7 @@ impl Graph {
         }
         let path = self.pages_path().join(format!(
             "{}.md",
-            encode_page_name(name, self.config.file_name_format)
+            encode_page_name(name, self.config().file_name_format)
         ));
         let filename_name = self
             .graph_entry_for_relative_path(&self.rel_path(&path))?
@@ -366,7 +474,7 @@ impl Graph {
         guide_twin_race_hook(&path)?;
         let alt = self.pages_path().join(format!(
             "{}.org",
-            encode_page_name(name, self.config.file_name_format)
+            encode_page_name(name, self.config().file_name_format)
         ));
         if self.graph_text_exists(&write, &alt)? {
             // An Org twin appeared during publication. Withdraw only the exact

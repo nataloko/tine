@@ -13,7 +13,6 @@ fn inputs<'a>(registry: &'a Registry) -> LoweringInputs<'a> {
         registry,
         cutoff: None,
         compiled: &NO_COMPILED_LEAVES,
-        fts_ready: true,
         result_set_rule: RESULT_SET_RULE,
         relation_rule: RELATION_RULE,
     }
@@ -21,20 +20,19 @@ fn inputs<'a>(registry: &'a Registry) -> LoweringInputs<'a> {
 
 /// The lowering of one filter, with the shared Match parse the walk would
 /// build for it — never a second parse (I-12).
-fn lower_with(filter: Filter, anchor: Anchor, fts_ready: bool) -> SqlQuery {
+fn lower_with(filter: Filter, anchor: Anchor) -> SqlQuery {
     let registry = Registry::none().clone();
     let compiled = CompiledLeaves::for_query(&filter);
     let query = Query::new(anchor, filter, Source::Builder);
     let inputs = LoweringInputs {
         compiled: &compiled,
-        fts_ready,
         ..inputs(&registry)
     };
     lower_query(&query, &inputs)
 }
 
 fn lower(filter: Filter, anchor: Anchor) -> SqlQuery {
-    lower_with(filter, anchor, true)
+    lower_with(filter, anchor)
 }
 
 fn og(source: &str) -> (Query, ViewSettings) {
@@ -71,7 +69,7 @@ fn two_property_conjuncts_lower_to_two_undecomposed_subqueries() {
     for fragment in statement.sql.split("FROM property_atoms").skip(1) {
         let head = fragment.split(')').next().unwrap_or_default();
         assert!(
-            head.contains(".normalized_name = ") && head.contains(".atom_key = "),
+            head.contains(".key = ") && head.contains(".atom_key = "),
             "a property subquery carries key and value together: {head}"
         );
     }
@@ -378,8 +376,8 @@ fn content_match(text: &str) -> Filter {
     Filter::attr(Attr::Content, CmpOp::Match, Value::text(text))
 }
 
-fn match_sql(text: &str, fts_ready: bool) -> SqlQuery {
-    lower_with(content_match(text), Anchor::Block, fts_ready)
+fn match_sql(text: &str) -> SqlQuery {
+    lower_with(content_match(text), Anchor::Block)
 }
 
 /// The one rule that decides this packet: the exact `instr` predicates are
@@ -388,24 +386,25 @@ fn match_sql(text: &str, fts_ready: bool) -> SqlQuery {
 /// "different results, faster".
 #[test]
 fn the_candidate_bound_narrows_and_never_replaces_the_exact_predicate() {
-    let bounded = match_sql("alpha", true);
+    let bounded = match_sql("alpha");
     assert!(
-        bounded.sql.contains("search_substring_fts")
+        bounded.sql.contains("search_fts")
             && bounded.sql.contains("MATCH ?")
-            && bounded.sql.contains("instr(b.query_visible_folded, ?"),
+            && bounded.sql.contains("tine_query_rank"),
         "{}",
         bounded.sql
     );
     assert!(bounded.positively_bounded);
     assert_eq!(bounded.content_plans, vec![ContentPlan::Fts]);
-    // The needle is the FTS phrase literal, and the exact needle is the
-    // parser's own folded term — two different bound values.
-    assert!(bounded
-        .params
-        .contains(&PhysicalQueryValue::Text("\"alpha\"".to_string())));
-    assert!(bounded
-        .params
-        .contains(&PhysicalQueryValue::Text("alpha".to_string())));
+    // The complete scalar-trigram expression is the only text bound value;
+    // exact membership lives in the operation-owned rank program.
+    assert!(bounded.params.iter().any(|value| matches!(
+        value,
+        PhysicalQueryValue::Text(expression)
+            if expression.contains("\"alp\"")
+                && expression.contains("\"lph\"")
+                && expression.contains("\"pha\"")
+    )));
 }
 
 /// §5.10's acceptance corollary, at the compiler: `foobar` is reachable by
@@ -414,14 +413,13 @@ fn the_candidate_bound_narrows_and_never_replaces_the_exact_predicate() {
 #[test]
 fn a_two_scalar_term_is_unbounded_rather_than_unanswered() {
     for needle in ["foo", "oob"] {
-        let statement = match_sql(needle, true);
-        assert!(statement.sql.contains("search_substring_fts"), "{needle}");
+        let statement = match_sql(needle);
+        assert!(statement.sql.contains("search_fts"), "{needle}");
         assert_eq!(statement.content_plans, vec![ContentPlan::Fts]);
     }
-    let short = match_sql("oo", true);
+    let short = match_sql("oo");
     assert!(
-        !short.sql.contains("search_substring_fts")
-            && short.sql.contains("instr(b.query_visible_folded, ?"),
+        !short.sql.contains("search_fts") && short.sql.contains("tine_query_rank"),
         "{}",
         short.sql
     );
@@ -429,17 +427,35 @@ fn a_two_scalar_term_is_unbounded_rather_than_unanswered() {
     assert_eq!(short.content_plans, vec![ContentPlan::ShortUnindexable]);
 }
 
+/// ADR 0069: a one- or two-character CJK term is bounded by the short-word
+/// index; a short term mixing CJK and Latin still is not.
+#[test]
+fn a_short_cjk_term_is_bounded_by_the_short_word_index() {
+    for needle in ["東京", "会"] {
+        let statement = match_sql(needle);
+        assert!(
+            statement.sql.contains("short_word_fts MATCH"),
+            "{}",
+            statement.sql
+        );
+        assert!(statement.positively_bounded, "{needle}");
+        assert_eq!(statement.content_plans, vec![ContentPlan::Fts]);
+    }
+    let mixed = match_sql("a会");
+    assert!(!mixed.sql.contains("short_word_fts") && !mixed.positively_bounded);
+    assert_eq!(mixed.content_plans, vec![ContentPlan::ShortUnindexable]);
+}
+
 /// One unbounded OR arm makes the LEAF unbounded, and that is not a defect
 /// to work around: the anchor is reached once per arm.
 #[test]
 fn one_unbounded_or_arm_unbounds_the_whole_leaf() {
-    let mixed = match_sql("oo OR alpha", true);
+    let mixed = match_sql("oo OR alpha");
     assert!(!mixed.positively_bounded);
     assert_eq!(mixed.content_plans, vec![ContentPlan::ShortUnindexable]);
-    // The bounded arm still gets its bound — bounds are per-arm. One
-    // occurrence, because §5.3's CTE spelling compiles the filter once.
-    assert_eq!(mixed.sql.matches("search_substring_fts").count(), 1);
-    assert!(match_sql("beta OR alpha", true).positively_bounded);
+    // Native FTS OR is used only when every arm is safely bounded.
+    assert_eq!(mixed.sql.matches("search_fts").count(), 0);
+    assert!(match_sql("beta OR alpha").positively_bounded);
 }
 
 /// §5.10: emptiness comes from the parsed `Term`, not from SQLite.
@@ -449,28 +465,15 @@ fn one_unbounded_or_arm_unbounds_the_whole_leaf() {
 fn an_empty_term_is_false_and_an_empty_negative_term_is_true() {
     // A whitespace-only quoted phrase is NOT empty: it is a real needle the
     // exact column can hold and the collapsed FTS text cannot.
-    let spaces = match_sql("\"   \"", true);
-    assert!(!spaces.matches_nothing && !spaces.sql.contains("search_substring_fts"));
-    assert!(spaces
-        .params
-        .contains(&PhysicalQueryValue::Text("   ".to_string())));
-    assert_eq!(spaces.content_plans, vec![ContentPlan::ShortUnindexable]);
+    let spaces = match_sql("\"   \"");
+    assert!(!spaces.matches_nothing && spaces.sql.contains("search_fts"));
+    assert_eq!(spaces.content_plans, vec![ContentPlan::Fts]);
 
     // The empty term itself, against `group_matches`' own answer. It is
     // constructed rather than parsed because `Matcher::parse` drops an
     // empty TOKEN — but the rule has to hold for the parsed value it does
     // produce, whatever a future fold makes empty, and SQLite's `instr`
     // answers the opposite of it.
-    let registry = Registry::none().clone();
-    let inputs = inputs(&registry);
-    let mut compiler = Compiler {
-        inputs: &inputs,
-        params: Vec::new(),
-        next_alias: 0,
-        probe: false,
-        regexes: Vec::new(),
-        needs_child_map: false,
-    };
     for negated in [false, true] {
         let term = Term {
             text: String::new(),
@@ -478,12 +481,6 @@ fn an_empty_term_is_false_and_an_empty_negative_term_is_true() {
             quoted: false,
         };
         let group = vec![term.clone()];
-        assert_eq!(
-            compiler.match_term(&term, "b"),
-            if negated { "1" } else { "0" },
-            "an empty {}term",
-            if negated { "negative " } else { "" }
-        );
         // And the walk agrees, on text that contains everything and nothing.
         for text in ["", "anything at all"] {
             let matcher = Matcher::Boolean(vec![group.clone()]);
@@ -494,7 +491,6 @@ fn an_empty_term_is_false_and_an_empty_negative_term_is_true() {
             );
         }
     }
-    assert!(compiler.params.is_empty(), "a constant binds nothing");
 }
 
 /// Exclusion-only input and an invalid regex are FALSE LEAVES (§5.10), so
@@ -509,38 +505,12 @@ fn exclusion_only_and_invalid_regex_lower_to_a_false_leaf_under_not_too() {
         // classes — it just needs no engine to answer false.
         ("/[unclosed/", &[ContentPlan::Regex][..]),
     ] {
-        let statement = match_sql(source, true);
+        let statement = match_sql(source);
         assert!(statement.matches_nothing, "{source}: {}", statement.sql);
         assert_eq!(statement.content_plans, plans, "{source}");
-        let negated = lower_with(Filter::not(content_match(source)), Anchor::Block, true);
+        let negated = lower_with(Filter::not(content_match(source)), Anchor::Block);
         assert!(!negated.matches_nothing, "{source}: {}", negated.sql);
         assert!(!negated.positively_bounded, "{source}");
-    }
-}
-
-/// The `fts-building` class (§5.10): the SAME exact predicates on the ready
-/// block columns, with no bound anywhere — never empty results, an error, a
-/// new walk route, or a rebuild request (I-13).
-#[test]
-fn a_building_index_omits_the_bounds_and_keeps_the_exact_predicates() {
-    let building = match_sql("alpha beta OR gamma", false);
-    assert!(
-        !building.sql.contains("search_substring_fts")
-            && !building.sql.contains("search_fts_owners")
-            && !building.sql.contains("MATCH"),
-        "{}",
-        building.sql
-    );
-    // Three terms, compiled once (§5.3's CTE spelling).
-    assert_eq!(building.sql.matches("instr(").count(), 3);
-    assert!(!building.positively_bounded);
-    assert_eq!(building.content_plans, vec![ContentPlan::FtsBuilding]);
-    // Same predicates, same bound needles, as the ready lowering: only the
-    // candidate bound differs.
-    let ready = match_sql("alpha beta OR gamma", true);
-    for term in ["alpha", "beta", "gamma"] {
-        let value = PhysicalQueryValue::Text(term.to_string());
-        assert!(building.params.contains(&value) && ready.params.contains(&value));
     }
 }
 
@@ -548,61 +518,27 @@ fn a_building_index_omits_the_bounds_and_keeps_the_exact_predicates() {
 /// it, so using it as a candidate would select exactly the rejected rows.
 #[test]
 fn a_negative_term_is_negated_and_never_becomes_the_candidate() {
-    let statement = match_sql("oo -draft", true);
+    let statement = match_sql("oo -draft");
     assert!(
-        statement
-            .sql
-            .contains("(NOT (instr(b.query_visible_folded, ?"),
-        "{}",
-        statement.sql
-    );
-    assert!(
-        !statement.sql.contains("search_substring_fts"),
+        !statement.sql.contains("search_fts"),
         "the only three-scalar run is the NEGATIVE term: {}",
         statement.sql
     );
-    assert!(!statement
-        .params
-        .contains(&PhysicalQueryValue::Text("\"draft\"".to_string())));
 }
 
-/// §5.10's needle rule, at the unit that owns it.
+/// Scalar trigrams cover every scalar of the complete literal fragment.
 #[test]
-fn the_candidate_needle_is_the_first_three_scalar_whitespace_free_run() {
-    let needle = |source: &str| {
-        let Matcher::Boolean(groups) = Matcher::parse(source) else {
-            panic!("{source} is not a boolean query");
-        };
-        fts_candidate_needle(&groups[0]).map(str::to_owned)
-    };
-    // Not the whole phrase: the run survives the producers' whitespace
-    // collapsing, the leading/repeated spaces need not.
-    assert_eq!(needle("\"  alpha  beta\""), Some("alpha".to_string()));
-    assert_eq!(needle("\"a b cde\""), Some("cde".to_string()));
-    // Terms are scanned in order, and a term with no long-enough run is
-    // skipped rather than ending the scan.
-    assert_eq!(needle("ab cd efgh"), Some("efgh".to_string()));
-    assert_eq!(needle("ab cd"), None);
-    assert_eq!(needle("-longenough ab"), None);
-    // Three SCALARS, not three bytes.
-    assert_eq!(needle("日本語"), Some("日本語".to_string()));
-    assert_eq!(needle("日本"), None);
-    // A NUL-bearing term supplies no bound at all.
-    let nul = vec![Term {
-        text: "abc\0def".to_string(),
-        negated: false,
-        quoted: false,
-    }];
-    assert_eq!(fts_candidate_needle(&nul), None);
-}
-
-/// The needle crosses the boundary as ONE FTS5 phrase literal, so `-`,
-/// `*`, `(` and a bare `OR` inside it are text and not query syntax.
-#[test]
-fn the_fts_needle_is_quoted_as_one_literal_with_doubled_quotes() {
-    assert_eq!(fts_phrase_literal("say\"hi"), "\"say\"\"hi\"");
-    assert_eq!(fts_phrase_literal("a OR b"), "\"a OR b\"");
-    assert_eq!(fts_phrase_literal("-x*"), "\"-x*\"");
+fn the_candidate_expression_contains_every_scalar_trigram() {
+    assert_eq!(
+        crate::query::candidate::scalar_trigram_expression("alpha").as_deref(),
+        Some("\"alp\" AND \"lph\" AND \"pha\"")
+    );
+    assert_eq!(
+        crate::query::candidate::scalar_trigram_expression("日本語").as_deref(),
+        Some("\"日本語\"")
+    );
+    assert!(crate::query::candidate::scalar_trigram_expression("日本").is_none());
+    assert!(crate::query::candidate::scalar_trigram_expression("abc\0def").is_none());
 }
 
 /// §4.3.2's regex predicate, at the compiler. A VALID pattern in EITHER
@@ -613,11 +549,10 @@ fn the_fts_needle_is_quoted_as_one_literal_with_doubled_quotes() {
 fn a_valid_regex_lowers_to_the_bound_predicate_over_the_exact_visible_text() {
     for source in ["content regexp '[a-z]+'", "content match '/[a-z]+/'"] {
         let (query, _) = tql(source);
-        let statement = lower_with(query.evaluable_filter(), Anchor::Block, true);
+        let statement = lower_with(query.evaluable_filter(), Anchor::Block);
         assert!(
             statement.sql.contains(
-                "tine_query_regex(?1, (SELECT bt1.query_visible FROM block_text bt1 \
-                     WHERE bt1.block_id = b.block_id))"
+                "tine_query_regex(?1, (SELECT CAST(length(CAST(bt1.content AS BLOB)) AS TEXT)"
             ),
             "{source}: {}",
             statement.sql
@@ -649,7 +584,6 @@ fn a_valid_regex_lowers_to_the_bound_predicate_over_the_exact_visible_text() {
     let invalid = lower_with(
         Filter::attr(Attr::Content, CmpOp::Regex, Value::text("[unclosed")),
         Anchor::Block,
-        true,
     );
     assert!(invalid.matches_nothing);
     assert_eq!(invalid.content_plans, vec![ContentPlan::Regex]);
@@ -672,12 +606,12 @@ fn manager_regex_syntaxes_with_equal_source_keep_distinct_programs() {
             Filter::attr(Attr::Content, CmpOp::Regex, Value::text("/needle/")),
         ]),
         Anchor::Block,
-        true,
     );
     assert_eq!(statement.regexes.bindings.len(), 2);
     let predicate = statement.regexes.predicate();
+    let framed = "6:needlex.md";
     let hits = (1..=2)
-        .map(|id| predicate(id, "needle").unwrap())
+        .map(|id| predicate(id, framed).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(hits.iter().filter(|hit| **hit).count(), 1);
 }
@@ -710,11 +644,12 @@ fn one_pattern_is_one_binding_however_many_times_it_is_compiled() {
         );
         // Every ID the statement names is one the program binds.
         let predicate = statement.regexes.predicate();
+        let framed = "10:alpha betax.md";
         for id in 1..=2u64 {
-            assert!(predicate(id, "alpha beta").is_ok(), "{rule:?} id {id}");
+            assert!(predicate(id, framed).is_ok(), "{rule:?} id {id}");
         }
         assert!(
-            predicate(3, "alpha").is_err(),
+            predicate(3, "5:alphax.md").is_err(),
             "{rule:?}: an unbound id fails"
         );
     }
@@ -727,8 +662,8 @@ fn one_pattern_is_one_binding_however_many_times_it_is_compiled() {
 fn the_regex_program_compares_by_pattern_and_never_prints_one() {
     let (query, _) = tql("content regexp 'secret-\\d+'");
     let filter = query.evaluable_filter();
-    let first = lower_with(filter.clone(), Anchor::Block, true);
-    let second = lower_with(filter, Anchor::Block, true);
+    let first = lower_with(filter.clone(), Anchor::Block);
+    let second = lower_with(filter, Anchor::Block);
     assert_eq!(first, second, "two lowerings of one filter are equal");
     assert_eq!(
         format!("{:?}", first.regexes),
@@ -740,8 +675,8 @@ fn the_regex_program_compares_by_pattern_and_never_prints_one() {
     );
     // And the program answers with the SAME program the walk runs.
     let predicate = first.regexes.predicate();
-    assert_eq!(predicate(1, "secret-42").unwrap(), true);
-    assert_eq!(predicate(1, "secret-").unwrap(), false);
+    assert_eq!(predicate(1, "9:secret-42x.md").unwrap(), true);
+    assert_eq!(predicate(1, "7:secret-x.md").unwrap(), false);
 }
 
 /// §3.2's nested-`refs` context, at the compiler: the set a nested row is
@@ -759,8 +694,10 @@ fn refs_inside_a_children_predicate_reads_the_anchors_ancestor_context() {
     let statement = lower_query(&query, &inputs(&registry));
     // The nested row contributes ONLY its own refs.
     assert!(
-        statement.sql.contains("block_own_refs or2")
-            && statement.sql.contains("or2.block_id = c1.block_id"),
+        statement.sql.contains("reference_postings or2")
+            && statement.sql.contains("or2.source_entity_id = c1.block_id")
+            && statement.sql.contains("or2.own = 1")
+            && statement.sql.contains("orn3.key = ?1"),
         "{}",
         statement.sql
     );
@@ -769,8 +706,9 @@ fn refs_inside_a_children_predicate_reads_the_anchors_ancestor_context() {
     assert!(
         statement.sql.contains(
             "(b.parent_block_id IS NOT NULL AND b.parent_block_id IN \
-                 (SELECT ar3.block_id FROM block_path_refs ar3 \
-                 WHERE (ar3.block_id = b.parent_block_id AND ar3.normalized_name = ?2)))"
+                 (SELECT ar4.block_id FROM block_path_refs ar4 \
+                 JOIN names arn5 ON arn5.name_id = ar4.name_id \
+                 WHERE (ar4.block_id = b.parent_block_id AND arn5.key = ?2)))"
         ),
         "{}",
         statement.sql
@@ -779,8 +717,9 @@ fn refs_inside_a_children_predicate_reads_the_anchors_ancestor_context() {
     // to carry it.
     assert!(
         statement.sql.contains(
-            "b.page_id IN (SELECT pr4.page_id FROM pages pr4 \
-             WHERE (pr4.page_id = b.page_id AND pr4.name_key <> '' AND pr4.name_key = ?3))"
+            "b.page_id IN (SELECT pr6.page_id FROM pages pr6 \
+             JOIN names prn7 ON prn7.name_id = pr6.name_id \
+             WHERE (pr6.page_id = b.page_id AND (prn7.key <> '' AND prn7.key = ?3)))"
         ),
         "{}",
         statement.sql
@@ -813,9 +752,9 @@ fn refs_inside_a_children_predicate_reads_the_anchors_ancestor_context() {
     );
     let statement = lower_query(&deep, &inputs(&registry));
     assert!(
-        statement.sql.contains("or3.block_id = c2.block_id")
-            && statement.sql.contains("ar4.block_id = b.parent_block_id")
-            && statement.sql.contains("pr5.page_id = b.page_id"),
+        statement.sql.contains("or3.source_entity_id = c2.block_id")
+            && statement.sql.contains("ar5.block_id = b.parent_block_id")
+            && statement.sql.contains("pr7.page_id = b.page_id"),
         "the grandchild's context is the anchor's, not its parent's: {}",
         statement.sql
     );
@@ -830,7 +769,7 @@ fn refs_inside_a_children_predicate_reads_the_anchors_ancestor_context() {
         statement.sql
     );
     assert!(
-        !statement.sql.contains("block_own_refs"),
+        !statement.sql.contains("reference_postings"),
         "the anchor needs no union: {}",
         statement.sql
     );
@@ -909,4 +848,24 @@ fn a_prefix_range_is_half_open_and_survives_the_last_scalar_value() {
 #[test]
 fn like_escape_protects_the_three_pattern_characters() {
     assert_eq!(like_escape("100%_a\\b"), "100\\%\\_a\\\\b");
+}
+
+/// R10-01's shape: an n-ary boolean join written as `join(" OR ")` is left-deep
+/// in SQLite, one expression level per operand, and a wide admitted query then
+/// fails as a read. Every such join goes through `join_balanced` (GH #543).
+#[test]
+fn every_boolean_join_in_the_compiler_is_balanced() {
+    let source = include_str!("sql.rs");
+    let flat: Vec<_> = source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("join(\" OR") || line.contains("join(\" AND"))
+        .map(|(number, line)| format!("sql.rs:{}: {}", number + 1, line.trim()))
+        .collect();
+    assert!(
+        flat.is_empty(),
+        "join n-ary AND/OR through `join_balanced` (sql.rs), never a flat \
+         `join(\" OR \")`: SQLite nests those one level per operand and refuses \
+         past 1000 (GH #543, audit R10-01): {flat:?}"
+    );
 }

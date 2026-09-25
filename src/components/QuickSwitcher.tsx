@@ -1,7 +1,7 @@
-import { For, Show, createSignal, createEffect, createMemo, onCleanup, type JSX } from "solid-js";
+import { For, Show, batch, createSignal, createEffect, createMemo, onCleanup, type JSX } from "solid-js";
 import { runQueryWhenReady, searchIndexPendingMessage } from "../queryReadiness";
 import { backend } from "../backend";
-import { switcherOpen, closeSwitcher, switcherMode, switcherEmbryo, switcherPluginBlock, recentPages, graphMeta, isFavorite, pushToast, bumpPageInventoryRev, openPageInSidebar, openBlockInSidebar, openPageContextMenu } from "../ui";
+import { switcherOpen, closeSwitcher, switcherMode, switcherEmbryo, switcherPluginBlock, recentPages, graphMeta, isFavorite, pushToast, bumpPageInventoryRev, openPageInSidebar, openBlockInSidebar, openPageContextMenu, indexCorrectionRev } from "../ui";
 import { openPage, openPageAtBlock, openPageInNewTab, openFile, openInNewTab, route } from "../router";
 import { paletteCommands } from "../keybindings";
 import { closePane, focusPane, focusedRouter, layoutPaneIds, openRouteInOtherPane, paneRouter } from "../panes";
@@ -19,6 +19,7 @@ import { createLongPress } from "../render/longPress";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { graphBinding } from "../persistence";
 import { captureGraphScope, landAsyncOrToast } from "../landAsync";
+import { pageIdentityKey } from "../pageIdentity";
 
 // One selectable result row.
 type Item =
@@ -96,12 +97,23 @@ export function QuickSwitcher(): JSX.Element {
   // Fetch OG's complete ranked pools once per query. Presentation paging below
   // changes only the rendered slice and therefore does not trigger another scan.
   const [graphResults, setGraphResults] = createSignal<Awaited<ReturnType<ReturnType<typeof backend>["runGraphSearch"]>>>();
+  // The query the shown graph results answer. While a newer query is being
+  // searched the previous answer stays on screen (GH #543: blanking the list
+  // on every keystroke made each search look slower than it was), and Enter
+  // on that stale list waits for the fresh answer instead of choosing a row
+  // of the old one.
+  const [answeredQuery, setAnsweredQuery] = createSignal<string | null>(null);
+  const resultsStale = () => graphResults() !== undefined && answeredQuery() !== query();
+  let deferredEnter: ((it: Item | undefined) => void) | null = null;
   const [searchPending, setSearchPending] = createSignal<string | null>(null);
   const [searchError, setSearchError] = createSignal<string | null>(null);
   const [searchRetry, setSearchRetry] = createSignal(0);
   let searchRequest = 0;
   createEffect(() => {
     searchRetry();
+    // Ask again once the launch index check lands: an answer before it may
+    // come from the index as the last session left it (GH #550).
+    indexCorrectionRev();
     const open = switcherOpen();
     const raw = query();
     const commands = commandsOnly();
@@ -116,10 +128,14 @@ export function QuickSwitcher(): JSX.Element {
     const mine = ++searchRequest;
     const controller = new AbortController();
     onCleanup(() => controller.abort());
-    setGraphResults(undefined);
     setSearchError(null);
     setSearchPending(null);
-    if (!open || commands || !raw.trim()) return;
+    if (!open || commands || !raw.trim()) {
+      setGraphResults(undefined);
+      setAnsweredQuery(null);
+      deferredEnter = null;
+      return;
+    }
     setSearchPending("Searching…");
     if (raw !== s.q) return;
     const isCurrent = () => mine === searchRequest && !controller.signal.aborted;
@@ -130,13 +146,32 @@ export function QuickSwitcher(): JSX.Element {
           s.scope ? "quick-switch:current-page" : "quick-switch",
           false,
           s.scope ?? undefined,
+          undefined,
+          "ctrl_k",
         ), {
       signal: controller.signal,
       isCurrent,
       onPending: (error) => setSearchPending(searchIndexPendingMessage(error)),
-    }).then((answer) => { if (isCurrent()) setGraphResults(answer); })
+    }).then((answer) => {
+      if (!isCurrent()) return;
+      batch(() => {
+        setGraphResults(answer);
+        setAnsweredQuery(s.q);
+      });
+      if (deferredEnter && !resultsStale()) {
+        const run = deferredEnter;
+        deferredEnter = null;
+        run(flat()[sel()]);
+      }
+    })
       .catch((error: unknown) => {
-        if (isCurrent()) setSearchError(error instanceof Error ? error.message : String(error));
+        if (!isCurrent()) return;
+        batch(() => {
+          setGraphResults(undefined);
+          setAnsweredQuery(null);
+        });
+        deferredEnter = null;
+        setSearchError(error instanceof Error ? error.message : String(error));
       });
   });
 
@@ -218,9 +253,15 @@ export function QuickSwitcher(): JSX.Element {
         truncated: graphResults()?.has_more?.pages ? "pages" : undefined,
       });
 
-    // Create page (when no exact match exists).
-    const exact = pageItems.some((p) => p.t === "page" && p.adaptiveClass === "exact");
-    if (!currentPageOnly() && !exact) out.push({ header: "Create", items: [{ t: "create", name: q }] });
+    // Create page only when the whole launcher query is not an existing page
+    // name or matched alias. Search Exact is deliberately broader under A6
+    // (for example `cafe` ranks `café` as Exact), so rank is not identity.
+    const queryIdentity = pageIdentityKey(q);
+    const existingIdentity = allPages.some((page) => page.t === "page" && (
+      pageIdentityKey(page.name) === queryIdentity
+      || (page.matchedAlias !== undefined && pageIdentityKey(page.matchedAlias) === queryIdentity)
+    ));
+    if (!currentPageOnly() && !existingIdentity) out.push({ header: "Create", items: [{ t: "create", name: q }] });
 
     // Commands matching the query.
     const cmds = embryoPane || currentPageOnly() ? [] : commandItems(q);
@@ -459,8 +500,8 @@ export function QuickSwitcher(): JSX.Element {
       move(-1);
     } else if (e.key === "Enter") {
       e.preventDefault();
-      const it = flat()[sel()];
-      if (it) {
+      const activate = (it: Item | undefined) => {
+        if (!it) return;
         // GH #463: the keyboard half of the same ladder the pointer already
         // implements below. Ctrl/Cmd+Enter was the one rung missing, so it fell
         // through to plain navigation and the modifier did nothing — while
@@ -473,7 +514,9 @@ export function QuickSwitcher(): JSX.Element {
         else if (cmdCtrlOnly && (it.t === "page" || it.t === "block")) openInBackground(it);
         else if (e.altKey && !switcherEmbryo()) void chooseOther(it);
         else choose(it);
-      }
+      };
+      if (resultsStale()) deferredEnter = activate;
+      else activate(flat()[sel()]);
     } else if (e.key === "Escape") {
       if (e.isComposing || e.keyCode === 229) return;
       if (dismissTopTransient("escape")) e.preventDefault();

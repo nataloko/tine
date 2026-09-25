@@ -14,7 +14,7 @@ import {
   fullWidthRefReplace,
   pageInsert,
   tagInsert,
-  orderAcItems,
+  orderAcItems, aliasOfLabel,
   COMMANDS,
   advancedBlockInsertion,
   filterAdvancedBlockCommands,
@@ -55,6 +55,7 @@ import {
   nextVisibleOrExtend,
   beginPageHeaderEdit,
   finishPageHeaderEdit,
+  reportInvalidPageHeaderOnExit,
   insertOutlineAfter,
   replaceEmptyBlockWithOutline,
   replaceTemplateTriggerWithOutline,
@@ -147,7 +148,7 @@ import { journalTitle, parseJournalTitle } from "../journal";
 import { calcSource, serializeCalcExitCommit, evalCalc } from "../editor/calc";
 import { codeBodyExitTrim, codeBodyJoin, codeBodyProjection, codeFenceOnly } from "../editor/codeFence";
 import { QueryMacro, EmbedMacro, youtubeTimestampMacroFor } from "./Macro";
-import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport, blockReferencesRequest, documentMode, docModeEnterForNewBlock } from "../ui";
+import { workflow, zoomInto, openContextMenu, openDatePicker, openBlockInSidebar, graphMeta, dataRev, setQueryBuilderAutoOpen, openPageProps, pushToast, dismissToast, autoPairing, typographyMode, timetrackingEnabled, logbookWithSecondSupport, blockReferencesRequest, documentMode, docModeEnterForNewBlock, resolveAlias } from "../ui";
 import { captureGraphScope, isScopeCurrent, type GraphScope } from "../landAsync";
 import { seedAssetBlob } from "../assetCache";
 import { openInNewTab, type Route } from "../router";
@@ -1640,10 +1641,10 @@ export function Editor(props: { id: string }): JSX.Element {
     const pages = await (cap ? cap.quickSwitch(t.query, 100) : backend().quickSwitch(t.query, 100));
     const cur = ac();
     if (!sameAcTrigger(cur, t)) return; // trigger changed while awaiting
-    const pageItem = (name: string): AcItem =>
-      t.kind === "page"
-        ? { label: name, insert: pageInsert(name) }
-        : { label: `#${name}`, insert: tagInsert(name) }; // tag context reads "#name"
+    const pageItem = (name: string): AcItem => ({
+      ...(t.kind === "page" ? { label: name, insert: pageInsert(name) } : { label: `#${name}`, insert: tagInsert(name) }), // tag context reads "#name"
+      sub: aliasOfLabel(name, resolveAlias(name)),
+    });
     const createItem: AcItem =
       t.kind === "page"
         ? { label: `Create "${q}"`, insert: pageInsert(q) }
@@ -3659,6 +3660,10 @@ export function Editor(props: { id: string }): JSX.Element {
     const calcExit = isCalc();
     commit(calcExit ? ref.value : normalizePlanning(ref.value, pageFmt()), calcExit ? { calc: true } : undefined);
     finishPageHeaderEdit(props.id);
+    // The editor is closing, so the user has finished writing these properties:
+    // this is the moment to say they are not valid, not every autosave while
+    // they were still typing them (GH #546).
+    reportInvalidPageHeaderOnExit(props.id);
     // Only clear if no other block grabbed editing focus.
     if (editingId() === props.id) endEdit("blur");
   };

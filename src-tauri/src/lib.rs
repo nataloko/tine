@@ -1,4 +1,4 @@
-//! Module map: debug startup logging; state graph lock; watcher external changes;
+//! Module map: debug startup logging; state graph slots; watcher external changes;
 //! graph open/create/warm cache; backup snapshots; settings/session prefs;
 //! spellcheck WebKit integration; platform OS bridges; commands thin IPC.
 
@@ -11,6 +11,8 @@ mod android_system_bars;
 #[cfg(test)]
 mod backend_command_parity;
 mod backup;
+#[cfg(desktop)]
+mod cli;
 mod command_error;
 mod command_surface;
 mod commands;
@@ -41,30 +43,30 @@ use backup::{get_backup_keep, list_backups, restore_backup, set_backup_keep};
 use commands::{
     activate_absent_editor, activate_editor, apply_journal_filename_migrations, asset_trash_stats,
     block_ref_counts, block_referrers, capture_live_save_conflict, capture_quick_switch,
-    close_graph_window, conflict_capsule_diff, conflict_queue, copy_guide_into_graph, delete_page,
-    detect_media_editor, duplicate_journal_diff, durable_live_save_conflict_diff,
+    close_graph_window, conflict_capsule_diff, conflict_inventory, copy_guide_into_graph,
+    delete_page, detect_media_editor, duplicate_journal_diff, durable_live_save_conflict_diff,
     edit_asset_external, empty_asset_trash, existing_page_names, export_query_subtrees,
     get_backlink_filter_context, get_backlinks, get_page, get_page_by_path, get_unlinked_refs,
     graph_source_files, guide_pages, import_asset, import_native_capture, journal_content_days,
     journal_feed_page, list_journal_conflicts, list_journal_filename_migrations,
-    list_orphan_assets, list_pages, list_sync_conflicts, list_templates, list_vcs_marker_conflicts,
-    live_save_conflict_diff, load_workspaces, merge_pages, open_asset, open_page_file, open_pdf,
-    page_aliases, page_icons, page_print_html, present_conflict_override, preview_block,
-    publish_html, publish_query, publish_query_plan, query_explain_empty, query_facets,
-    query_og_expressible, query_parse, query_print, query_registry, query_run, quick_switch,
-    read_asset, read_custom_css, read_highlights, read_journal_file, read_local_image,
-    read_text_file, referenced_page_names, rename_file_to_page, rename_page, rescan_graph_now,
-    resolve_block, resolve_blocks, resolve_conflict_capsule, resolve_duplicate_journal_day,
-    resolve_durable_live_save_conflict, resolve_live_save_conflict, resolve_sync_conflict,
-    resolve_vcs_marker_conflict, retire_editor_activation, rollback_pdf_area_image,
-    run_advanced_query, run_graph_search, run_query, save_asset, save_page, save_pdf_area_image,
-    save_workspaces, search, set_default_home, set_default_journal_template,
-    set_doc_mode_enter_for_new_block, set_favorites, set_favorites_page, set_guide_announced,
-    set_journal_title_format, set_logical_outdenting, set_preferred_format, set_preferred_workflow,
-    set_show_brackets, set_start_of_week, set_timetracking_enabled, stream_asset_path,
-    sync_conflict_diff, text_block_diff, text_block_diff3, tine_open_devtools, tine_quit,
-    trash_asset, trash_journal_file, trash_sync_conflict, vcs_marker_conflict_diff,
-    write_highlights, write_pdf_view_state,
+    list_orphan_assets, list_pages, list_templates, live_save_conflict_diff, load_workspaces,
+    merge_pages, open_asset, open_page_file, open_pdf, page_aliases, page_icons, page_print_html,
+    present_conflict_override, preview_block, publish_html, publish_query, publish_query_plan,
+    query_explain_empty, query_facets, query_og_expressible, query_parse, query_print,
+    query_registry, query_run, quick_switch, read_asset, read_custom_css, read_highlights,
+    read_journal_file, read_local_image, read_text_file, referenced_page_names,
+    rename_file_to_page, rename_page, rescan_graph_now, resolve_block, resolve_blocks,
+    resolve_conflict_capsule, resolve_duplicate_journal_day, resolve_durable_live_save_conflict,
+    resolve_live_save_conflict, resolve_sync_conflict, resolve_vcs_marker_conflict,
+    retire_editor_activation, rollback_pdf_area_image, run_advanced_query, run_graph_search,
+    run_query, save_asset, save_page, save_pdf_area_image, save_workspaces, search,
+    set_default_home, set_default_journal_template, set_doc_mode_enter_for_new_block,
+    set_favorites, set_favorites_page, set_guide_announced, set_journal_title_format,
+    set_logical_outdenting, set_preferred_format, set_preferred_workflow, set_show_brackets,
+    set_start_of_week, set_timetracking_enabled, stream_asset_path, sync_conflict_diff,
+    text_block_diff, text_block_diff3, tine_open_devtools, tine_quit, trash_asset,
+    trash_journal_file, trash_sync_conflict, vcs_marker_conflict_diff, write_highlights,
+    write_pdf_view_state,
 };
 use conflict_capsule::{load_conflict_capsules, retire_conflict_capsule, store_conflict_capsule};
 use debug::{
@@ -78,7 +80,8 @@ use git::{
 use graph::{
     app_platform, approve_external_assets, begin_direct_cross_page_move, capture_graph_binding,
     capture_target, create_graph, default_graph_parent, finish_direct_cross_page_move,
-    inspect_graph_access, load_graph, open_graph_window, startup_graph_path, warm_done,
+    indexing_progress, inspect_graph_access, load_graph, open_graph_window, retry_index,
+    startup_graph_path, warm_done,
 };
 use graph_verification::{
     cancel_graph_verification, create_graph_verification, save_graph_verification_report,
@@ -436,21 +439,6 @@ fn focus_last_graph_window(app: &tauri::AppHandle) {
     }
 }
 
-#[cfg(desktop)]
-fn forwarded_graph_path(argv: &[String], cwd: &str) -> Option<String> {
-    let raw = argv.iter().skip(1).find(|arg| !arg.starts_with('-'))?;
-    let path = std::path::Path::new(raw);
-    Some(
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::path::Path::new(cwd).join(path)
-        }
-        .display()
-        .to_string(),
-    )
-}
-
 #[cfg(all(test, desktop))]
 mod multi_window_tests {
     use super::*;
@@ -463,15 +451,18 @@ mod multi_window_tests {
             "graphs/second".to_string(),
         ];
         assert_eq!(
-            forwarded_graph_path(&argv, "/home/user").as_deref(),
-            Some("/home/user/graphs/second")
+            cli::launch_request(&argv, std::path::Path::new("/home/user")),
+            cli::LaunchRequest::Open(std::path::PathBuf::from("/home/user/graphs/second"))
         );
     }
 
     #[test]
     fn capture_only_launch_has_no_graph_path() {
         let argv = vec!["tine".to_string(), "--capture".to_string()];
-        assert!(forwarded_graph_path(&argv, "/tmp").is_none());
+        assert_eq!(
+            cli::launch_request(&argv, std::path::Path::new("/tmp")),
+            cli::LaunchRequest::Capture
+        );
     }
 
     #[test]
@@ -500,6 +491,13 @@ mod multi_window_tests {
 pub fn run() {
     #[cfg(target_os = "linux")]
     init_xlib_threads();
+    // First, before the CLI too: XInitThreads opens no display, so a headless
+    // CLI run pays nothing, and no later path can reach Xlib uninitialized.
+
+    #[cfg(desktop)]
+    if let cli::Startup::Exit(code) = cli::dispatch_env() {
+        std::process::exit(code);
+    }
 
     // Bring up debug logging FIRST (TINE_DEBUG=1 / --debug), so every later
     // milestone — and any panic — is captured to the log file from the very start.
@@ -564,7 +562,9 @@ pub fn run() {
     if std::env::var("TINE_GPU").as_deref() == Ok("0")
         && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none()
     {
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        // SAFETY: `run` calls this before Tauri, GTK or any Tine thread starts,
+        // so no other thread can be reading the environment.
+        unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
         diag("TINE_GPU=0 → set WEBKIT_DISABLE_DMABUF_RENDERER=1 (software compositing)");
     }
 
@@ -656,19 +656,24 @@ pub fn run() {
         // already-running instance with the new argv. `--capture` pops the
         // capture window; a plain re-launch just surfaces the main window.
         .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
-            if argv.iter().any(|a| a == "--capture") {
-                show_capture(app);
-            } else if let Some(path) = forwarded_graph_path(&argv, &cwd) {
-                // WebView2 deadlocks if a WebviewWindow is built directly from
-                // a synchronous event handler. Use the async command path so
-                // Windows' event loop remains available while Tauri creates it.
-                let command_app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = command_app.state::<AppState>();
-                    let _ = open_graph_window(path, command_app.clone(), state).await;
-                });
-            } else {
-                focus_last_graph_window(app);
+            match cli::launch_request(&argv, std::path::Path::new(&cwd)) {
+                cli::LaunchRequest::Capture => show_capture(app),
+                cli::LaunchRequest::Open(path) => {
+                    // WebView2 deadlocks if a WebviewWindow is built directly from
+                    // a synchronous event handler. Use the async command path so
+                    // Windows' event loop remains available while Tauri creates it.
+                    let command_app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let state = command_app.state::<AppState>();
+                        let _ = open_graph_window(
+                            path.display().to_string(),
+                            command_app.clone(),
+                            state,
+                        )
+                        .await;
+                    });
+                }
+                cli::LaunchRequest::Focus => focus_last_graph_window(app),
             }
         }))
         // In-app self-update. The updater reads `plugins.updater` from
@@ -811,7 +816,7 @@ pub fn run() {
             // the capture window once we're up (the main window loads too).
             // Desktop-only: the capture window and `--capture` argv don't exist on mobile.
             #[cfg(desktop)]
-            if std::env::args().any(|a| a == "--capture") {
+            if cli::launch_request_env() == cli::LaunchRequest::Capture {
                 show_capture(app.handle());
             }
             Ok(())
@@ -856,6 +861,7 @@ pub fn run() {
             get_backlinks,
             get_unlinked_refs,
             warm_done,
+            indexing_progress,
             block_ref_counts,
             block_referrers,
             delete_page,
@@ -909,11 +915,9 @@ pub fn run() {
             duplicate_journal_diff,
             resolve_duplicate_journal_day,
             list_journal_filename_migrations,
-            list_sync_conflicts,
-            list_vcs_marker_conflicts,
             sync_conflict_diff,
             vcs_marker_conflict_diff,
-            conflict_queue,
+            conflict_inventory,
             text_block_diff,
             text_block_diff3,
             live_save_conflict_diff,
@@ -971,6 +975,7 @@ pub fn run() {
             watcher_latency_recent,
             list_backups,
             restore_backup,
+            retry_index,
             load_session,
             save_session,
             load_workspaces,

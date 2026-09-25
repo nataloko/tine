@@ -136,6 +136,17 @@ fn nested_boolean(head: &str, depth: usize, leaf: &str) -> String {
     )
 }
 
+fn wait_for_backlink_filter_projection(graph: &Graph) {
+    let started = std::time::Instant::now();
+    while !graph.direct_projection_ready_test() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "projection did not become ready"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn query_parsers_fail_closed_past_the_shared_depth_and_size_limits() {
     let simple_at_limit = nested_boolean("and", QUERY_NESTING_MAX - 1, "(task TODO)");
@@ -218,33 +229,34 @@ fn backlink_filter_context_indexes_visible_descendants_and_parser_owned_facets()
         .unwrap();
 
     let graph = Graph::open(&dir);
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    wait_for_backlink_filter_projection(&graph);
     let runtime_id = graph.backlinks("Target")[0].blocks[0].id.clone();
-    let context = backlink_filter_context(
-        &graph,
-        "Target",
-        &[
-            BacklinkFilterTarget {
-                page: "Source".into(),
-                kind: PageKind::Page,
-                block_id: runtime_id.clone(),
-            },
-            // Defensive duplicate input must not make a complete response
-            // look truncated or duplicate its payload.
-            BacklinkFilterTarget {
-                page: "Source".into(),
-                kind: PageKind::Page,
-                block_id: runtime_id,
-            },
-        ],
-    );
+    let targets = [
+        BacklinkFilterTarget {
+            page: "Source".into(),
+            kind: PageKind::Page,
+            block_id: runtime_id.clone(),
+        },
+        // Defensive duplicate input must not make a complete response
+        // look truncated or duplicate its payload.
+        BacklinkFilterTarget {
+            page: "Source".into(),
+            kind: PageKind::Page,
+            block_id: runtime_id,
+        },
+    ];
+    let context = backlink_filter_context(&graph, "Target", &targets, "\"exact needle\"").unwrap();
 
     assert!(!context.truncated);
     assert_eq!(context.entries.len(), 1);
     let entry = &context.entries[0];
-    assert!(entry.text.contains("exact needle"), "{:?}", entry.text);
     assert!(
-        !entry.text.contains("id::"),
-        "properties are not visible text"
+        entry.text_matches,
+        "visible descendant text must match natively"
     );
     let facets = entry
         .facets
@@ -264,7 +276,380 @@ fn backlink_filter_context_indexes_visible_descendants_and_parser_owned_facets()
         "code-fence text is not a reference facet"
     );
 
+    let matches = |search: &str| {
+        backlink_filter_context(&graph, "Target", &targets, search)
+            .unwrap()
+            .entries[0]
+            .text_matches
+    };
+    for search in [
+        "exact needle",
+        "needle exact",
+        "missing OR needle",
+        "\"exact needle\"",
+        "/exact needle/",
+    ] {
+        assert!(matches(search), "shared Matcher should accept {search:?}");
+    }
+    for search in [
+        "needle missing",
+        "needle -descendant",
+        "\"needle exact\"",
+        "/Exact needle/",
+        "id::",
+    ] {
+        assert!(!matches(search), "shared Matcher should reject {search:?}");
+    }
+
+    for search in ["", "   ", "-needle"] {
+        let empty = backlink_filter_context(&graph, "Target", &targets, search).unwrap();
+        assert!(empty.search_error.is_none());
+        assert!(
+            empty.entries[0].text_matches,
+            "empty search remains unfiltered"
+        );
+    }
+    let invalid = backlink_filter_context(&graph, "Target", &targets, "/[/").unwrap();
+    assert!(invalid.search_error.is_some());
+    assert!(
+        invalid.entries[0].text_matches,
+        "invalid search reports its parse error without hiding roots"
+    );
+    let mut missing_targets = targets.to_vec();
+    missing_targets.push(BacklinkFilterTarget {
+        page: "Source".into(),
+        kind: PageKind::Page,
+        block_id: "missing-or-stale-root".into(),
+    });
+    let missing = backlink_filter_context(&graph, "Target", &missing_targets, "").unwrap();
+    assert_eq!(missing.entries.len(), 1);
+    assert!(
+        missing.truncated,
+        "a missing requested root stays visible through the frontend fallback"
+    );
+
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn backlink_filter_context_scopes_alias_cycles_collisions_and_hydration() {
+    use std::fs;
+
+    let dir = std::env::temp_dir().join(format!(
+        "tine-backlink-filter-alias-scope-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("pages")).unwrap();
+    fs::write(dir.join("pages/A.md"), "alias:: B\n\n- A\n").unwrap();
+    fs::write(dir.join("pages/B.md"), "alias:: C\n\n- B\n").unwrap();
+    fs::write(dir.join("pages/C.md"), "alias:: A\n\n- C\n").unwrap();
+    fs::write(dir.join("pages/Z.md"), "alias:: B\n\n- Z\n").unwrap();
+    fs::write(
+        dir.join("pages/SourceOne.md"),
+        "- exact needle [[A]] [[B]] [[b]] [[Outside]]\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("pages/SourceTwo.md"),
+        "- exact needle [[C]] [[Z]]\n",
+    )
+    .unwrap();
+    for index in 0..32 {
+        fs::write(
+            dir.join("pages").join(format!("Unrelated{index}.md")),
+            "- unrelated\n",
+        )
+        .unwrap();
+    }
+
+    let graph = Graph::open(&dir);
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    wait_for_backlink_filter_projection(&graph);
+    let targets = graph.with_pages(|pages| {
+        pages
+            .iter()
+            .filter(|(entry, _)| entry.name.starts_with("Source"))
+            .map(|(entry, document)| BacklinkFilterTarget {
+                page: entry.name.clone(),
+                kind: entry.kind,
+                block_id: document.roots[0].uuid.clone(),
+            })
+            .collect::<Vec<_>>()
+    });
+    graph.reset_direct_projection_candidate_probe_test();
+
+    let context = backlink_filter_context(&graph, "B", &targets, "exact needle").expect(
+        "a differently cased dictionary spelling must not produce a null-path/text-name row",
+    );
+    assert_eq!(context.entries.len(), 2);
+    assert!(context.entries.iter().all(|entry| entry.text_matches));
+    let facets = context
+        .entries
+        .iter()
+        .flat_map(|entry| entry.facets.iter())
+        .map(|facet| refs::page_key(facet))
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        facets,
+        std::collections::HashSet::from(["outside".to_string()])
+    );
+    let mut hydrated = graph.direct_projection_hydrated_pages_test();
+    hydrated.sort();
+    assert_eq!(
+        hydrated,
+        vec![
+            std::path::PathBuf::from("pages/SourceOne.md"),
+            std::path::PathBuf::from("pages/SourceTwo.md"),
+        ]
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn backlink_filter_context_hydrates_duplicate_physical_names_and_journal_spellings() {
+    use std::fs;
+
+    let dir = std::env::temp_dir().join(format!(
+        "tine-backlink-filter-duplicates-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("pages")).unwrap();
+    fs::create_dir_all(dir.join("journals")).unwrap();
+    fs::write(dir.join("pages/Same.md"), "- duplicate needle\n").unwrap();
+    fs::write(dir.join("pages/same.markdown"), "- duplicate needle\n").unwrap();
+    fs::write(dir.join("journals/2026_09_20.md"), "- journal\n").unwrap();
+    let day = JournalDate {
+        year: 2026,
+        month: 9,
+        day: 20,
+    };
+    let journal_title = JournalFormat::new(None, None).title(day);
+    fs::write(
+        dir.join("pages/JournalSource.md"),
+        format!("- journal needle [[{journal_title}]] [[Outside]]\n"),
+    )
+    .unwrap();
+
+    let graph = Graph::open(&dir);
+    graph
+        .attach_direct_projection(dir.join("private/projection.sqlite"))
+        .unwrap();
+    graph.warm_cache();
+    wait_for_backlink_filter_projection(&graph);
+    let (duplicate_targets, journal_target) = graph.with_pages(|pages| {
+        let duplicates = pages
+            .iter()
+            .filter(|(entry, _)| refs::page_key(&entry.name) == "same")
+            .map(|(entry, document)| BacklinkFilterTarget {
+                page: "same".into(),
+                kind: entry.kind,
+                block_id: document.roots[0].uuid.clone(),
+            })
+            .collect::<Vec<_>>();
+        let journal = pages
+            .iter()
+            .find(|(entry, _)| entry.name == "JournalSource")
+            .map(|(entry, document)| BacklinkFilterTarget {
+                page: entry.name.clone(),
+                kind: entry.kind,
+                block_id: document.roots[0].uuid.clone(),
+            })
+            .unwrap();
+        (duplicates, journal)
+    });
+    assert_eq!(
+        duplicate_targets.len(),
+        2,
+        "fixture needs duplicate physical names"
+    );
+
+    graph.reset_direct_projection_candidate_probe_test();
+    let duplicates =
+        backlink_filter_context(&graph, "Target", &duplicate_targets, "duplicate needle").unwrap();
+    assert_eq!(duplicates.entries.len(), 2);
+    let mut hydrated = graph.direct_projection_hydrated_pages_test();
+    hydrated.sort();
+    assert_eq!(
+        hydrated,
+        vec![
+            std::path::PathBuf::from("pages/Same.md"),
+            std::path::PathBuf::from("pages/same.markdown"),
+        ]
+    );
+
+    let journal =
+        backlink_filter_context(&graph, "2026-09-20", &[journal_target], "journal needle").unwrap();
+    assert_eq!(journal.entries.len(), 1);
+    assert_eq!(
+        journal.entries[0]
+            .facets
+            .iter()
+            .map(|facet| refs::page_key(facet))
+            .collect::<Vec<_>>(),
+        vec!["outside"]
+    );
+
+    graph.direct_projection_set_source_revision_test(
+        &dir.join("pages/JournalSource.md"),
+        "stale-test-revision",
+    );
+    assert!(matches!(
+        backlink_filter_context(
+            &graph,
+            "2026-09-20",
+            &[BacklinkFilterTarget {
+                page: "JournalSource".into(),
+                kind: PageKind::Page,
+                block_id: journal.entries[0].block_id.clone(),
+            }],
+            "journal needle",
+        ),
+        Err(QueryExecutionError::NotReady(
+            QueryReadinessReason::PendingEdits
+        ))
+    ));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn backlink_filter_scoped_journal_names_match_effective_title_resolver() {
+    use std::fs;
+
+    let day_20 = JournalDate {
+        year: 2026,
+        month: 9,
+        day: 20,
+    };
+    let day_21 = JournalDate {
+        year: 2026,
+        month: 9,
+        day: 21,
+    };
+
+    for (case, config, title_format) in [
+        ("default", None, None),
+        (
+            "custom",
+            Some(
+                "{:journal/file-name-format \"yyyy_MM_dd\"\n\
+                  :journal/page-title-format \"dd-MM-yyyy\"}\n",
+            ),
+            Some("dd-MM-yyyy"),
+        ),
+    ] {
+        let dir = std::env::temp_dir().join(format!(
+            "tine-backlink-filter-journal-title-{case}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("journals")).unwrap();
+        if let Some(config) = config {
+            fs::create_dir_all(dir.join("logseq")).unwrap();
+            fs::write(dir.join("logseq/config.edn"), config).unwrap();
+        }
+        let format = JournalFormat::new(Some("yyyy_MM_dd"), title_format);
+        let effective_title = format.title(day_21);
+        fs::write(
+            dir.join("journals/2026_09_20.md"),
+            format!("title:: {effective_title}\n\n- first journal\n"),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("journals/2026_09_19.md"),
+            format!("title:: {effective_title}\n\n- duplicate effective journal\n"),
+        )
+        .unwrap();
+
+        let graph = Graph::open(&dir);
+        graph
+            .attach_direct_projection(dir.join("private/projection.sqlite"))
+            .unwrap();
+        graph.warm_cache();
+        wait_for_backlink_filter_projection(&graph);
+        assert_eq!(
+            graph
+                .list_pages()
+                .iter()
+                .filter(|entry| entry.kind == PageKind::Journal && entry.name == effective_title)
+                .count(),
+            2,
+            "fixture must expose duplicate effective journal names"
+        );
+
+        let aliases = graph.page_aliases();
+        for target in [format.title(day_20), format.title(day_21)] {
+            let established = graph_equivalent_page_names(&graph, &aliases, &target).1;
+            let scoped = graph
+                .backlink_filter_scope(&target, &[])
+                .unwrap()
+                .names_norm;
+            assert_eq!(
+                scoped, established,
+                "scoped journal equivalence drifted for {case} target {target}"
+            );
+        }
+
+        let day_20_names = graph
+            .backlink_filter_scope(&format.title(day_20), &[])
+            .unwrap()
+            .names_norm;
+        assert_eq!(
+            day_20_names,
+            vec![refs::page_key(&format.title(day_20))],
+            "the physical Sep 20 filename must not override the effective Sep 21 title"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn backlink_filter_context_source_keeps_projection_setup_scoped() {
+    let query_source = crate::test_support::rust_module_production_files("query.rs")
+        .into_iter()
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let start = query_source.find("pub fn backlink_filter_context").unwrap();
+    let body = &query_source[start
+        ..query_source[start..]
+            .find("\n}\n")
+            .map(|end| start + end + 3)
+            .unwrap()];
+    for forbidden in [
+        ".page_aliases(",
+        "graph_equivalent_page_names(",
+        "reference_candidate_pages_indexed(",
+        ".with_pages(",
+        ".list_pages(",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "per-search filter setup must not use the graph-wide route: {forbidden}"
+        );
+    }
+
+    let direct_source = include_str!("model/direct_query.rs");
+    for required in [
+        "INDEXED BY pages_name_idx",
+        "WHERE page_name.key = ?1 AND page.text_kind = 1",
+        "INDEXED BY reference_alias_declarations_source_idx",
+        "INDEXED BY reference_alias_declarations_name_idx",
+        "WITH requested(text_kind, name_key) AS (VALUES",
+        "direct_projection_pages_for_sources",
+    ] {
+        assert!(
+            direct_source.contains(required),
+            "scoped projection route lost {required}"
+        );
+    }
 }
 
 #[test]
@@ -900,11 +1285,11 @@ fn autocomplete_property_facets_follow_og_visibility_sources_and_budget() {
 }
 
 #[test]
-fn content_predicate_uses_canonical_unicode_without_accent_folding() {
+fn content_predicate_uses_the_a6_search_fold() {
     let none = ctx_named();
     let block = DocBlock::new("Re\u{301}sume\u{301}");
     assert!(pred("\"Résumé\"").eval(&block, &none));
-    assert!(!pred("\"Resume\"").eval(&block, &none));
+    assert!(pred("\"Resume\"").eval(&block, &none));
 }
 
 #[test]
@@ -2587,4 +2972,42 @@ fn result_families_stop_constructing_at_row_and_byte_budgets() {
     assert!(facets_exceeded);
     assert!(facets.iter().map(|(_, values)| values.len()).sum::<usize>() <= 2);
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// GH #542: an attribute pattern lowers only when it is a filter on the
+/// returned block alone.
+#[test]
+fn gh542_attribute_patterns_lower_only_block_local_meaning() {
+    let lower = |src: &str| advanced_pred(src, None, TODAY);
+
+    // A flipped comparison is the same bound.
+    let (a, _, ignored_a) =
+        lower("[:find (pull ?b [*]) :where [?b :block/scheduled ?d] [(<= ?d 20260630)]]");
+    let (b, _, ignored_b) =
+        lower("[:find (pull ?b [*]) :where [?b :block/scheduled ?d] [(>= 20260630 ?d)]]");
+    assert!(ignored_a.is_empty() && ignored_b.is_empty());
+    assert_eq!(a.unwrap().filter, b.unwrap().filter);
+
+    // A value variable shared by two patterns is a join (scheduled == deadline):
+    // neither pattern may lower to "has a schedule".
+    let (_, ran, ignored) =
+        lower("[:find (pull ?b [*]) :where [?b :block/scheduled ?d] [?b :block/deadline ?d]]");
+    assert!(ran.is_empty(), "{ran:?}");
+    assert_eq!(ignored, vec!["pattern", "pattern"]);
+
+    // A `not` correlated with an outer binding is not "no deadline".
+    let (_, ran, ignored) = lower(
+        "[:find (pull ?b [*]) :where (task ?b #{\"TODO\"}) [?b :block/scheduled ?d] (not [?b :block/deadline ?d])]",
+    );
+    assert_eq!(ran, vec!["task"]);
+    assert!(ignored.contains(&"not".to_string()), "{ignored:?}");
+
+    // A literal of the wrong type never matches in Logseq; it is not guessed.
+    let (lowered, _, ignored) = lower("[:find (pull ?b [*]) :where [?b :block/marker 3]]");
+    assert!(lowered.is_none());
+    assert_eq!(ignored, vec!["pattern"]);
+
+    // The pulled variable must be the one the clauses constrain.
+    let (lowered, _, _) = lower("[:find (pull ?x [*]) :where [?b :block/marker \"TODO\"]]");
+    assert!(lowered.is_none());
 }

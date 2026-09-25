@@ -967,18 +967,31 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "fs.rename",
             1,
         ),
+        // 2026-09-20: P4 removes exact owned unpublished stage files and their
+        // known SQLite sidecars through the directory capability. Prefix-only
+        // matches are preserved, and storage owns destination publication.
+        (
+            "crates/tine-core/src/direct_projection.rs",
+            "cap.remove_file",
+            3,
+        ),
         (
             "crates/tine-core/src/direct_projection.rs",
             "fs.create_dir_all",
             1,
         ),
+        // 2026-09-22: GH #543 (design v4 stage 4) moved the writer lease's
+        // lock-file open into its own module, unchanged.
+        // 2026-09-24: the background integrity check records its last pass
+        // beside the image in the app data dir (design D1): one disposable
+        // text file, never the graph; a lost or torn record costs one check.
         (
-            "crates/tine-core/src/direct_projection.rs",
-            "fs.remove_file",
+            "crates/tine-core/src/direct_projection/integrity.rs",
+            "fs.write",
             1,
         ),
         (
-            "crates/tine-core/src/direct_projection.rs",
+            "crates/tine-core/src/direct_projection_lease.rs",
             "open.create",
             1,
         ),
@@ -990,14 +1003,18 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             1,
         ),
         (
+            // 9 and 3 since GH #538: the conditional replace removes its
+            // staged probe temp on refusal, and `restore_vacated_name` falls
+            // back to a plain rename of a vacated name when the storage
+            // refuses the no-replace flag.
             "crates/tine-core/src/filesystem_durability/atomic_fs.rs",
             "fs.remove_file",
-            8,
+            9,
         ),
         (
             "crates/tine-core/src/filesystem_durability/atomic_fs.rs",
             "fs.rename",
-            2,
+            3,
         ),
         (
             "crates/tine-core/src/filesystem_durability/atomic_fs.rs",
@@ -1083,6 +1100,14 @@ fn g_a_mutation_primitive_counts_are_pinned_per_file() {
             "crates/tine-core/src/model/projection_rename.rs",
             "cap.remove_file",
             2,
+        ),
+        // GH #538 (Martin 2026-09-24, B1): the checked plain rename used only
+        // where the platform refuses the no-replace flag itself, after an
+        // absence check (`plain_rename_where_the_flag_is_refused`, §2.10b).
+        (
+            "crates/tine-core/src/model/projection_rename.rs",
+            "cap.rename",
+            1,
         ),
         (
             "crates/tine-core/src/model/projection_rename.rs",
@@ -1280,7 +1305,10 @@ fn g_b_choke_helper_caller_counts_are_pinned() {
         ("atomic_copy", 0),
         ("atomic_copy_new", 1),
         ("atomic_copy_file_new", 1),
-        ("move_file_noreplace", 18),
+        // 11 since GH #538: the conditional replace and the retired-file
+        // restore take the mover as a parameter (a test seam for storage that
+        // refuses the flag); production binds it to `move_file_noreplace`.
+        ("move_file_noreplace", 11),
         ("move_to_trash", 3),
         ("create_projection_chain_component", 1),
         ("empty_asset_trash", 1),
@@ -1406,6 +1434,11 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
         ],
     );
     let expected = [
+        (
+            "crates/tine-core/src/direct_projection.rs",
+            "durable_directory.open",
+            1,
+        ),
         // GH #466: the three Direct Files graph-text sites (create, validated
         // write, bounded replace) left this boundary — its Android arm is a
         // hard link that shared storage refuses — for the graph tree's own
@@ -1433,7 +1466,7 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     dependency_surface.sort();
     assert!(fs::read_to_string(repository_root().join("crates/tine-core/Cargo.toml"))
         .unwrap()
-        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.20.0\""));
+        .contains("tine-storage = { git = \"https://github.com/martinkoutecky/tine-storage\", tag = \"v0.28.2\""));
     // The digest covers every tine-storage import and direct call in
     // production Rust, so any change to that surface fails here. Re-pin it with
     // one dated line below naming the packet and what moved; this file's git
@@ -1455,10 +1488,194 @@ fn g_d_tine_storage_write_boundaries_are_pinned() {
     // to the K4 digest above: paths moved, nothing else.
     // 2026-09-15: K7 split watcher.rs and commands.rs after K0 had removed
     // their tine-storage surface; zero inventory rows moved, so the digest held.
+    // 2026-09-17: GH #543 pinned v0.20.1 (writer cache budget, deferred
+    // indexes) and then v0.20.2 (navigation readers page on index-served
+    // keysets); the pin string above moved twice, the v0.20.1 bump added
+    // the `set_page_cache_budget`/`shrink_page_cache_budget` calls in
+    // direct_projection.rs, and v0.20.2 changed no call site.
+    // 2026-09-17: GH #543 partial admission pinned v0.20.3 and added the
+    // relaxed-WAL build calls that P4 later retired with partial serving.
+    // 2026-09-17: the bounded-reads packet drove BOTH Friendly block reads from
+    // the trigram index instead of filtering a full scan with it, which binds a
+    // candidate literal and a candidate cap per read: query/friendly.rs gains
+    // `PhysicalQueryValue::Text(` and `PhysicalQueryValue::Integer(` sites.
+    // Read-side binds only. The write crossings asserted above are unchanged,
+    // no call site was added to a storage writer, and the pin is still v0.20.3.
+    // 2026-09-17: GH #543 pinned v0.24.0, which keys the navigation
+    // reference-name read to `reference_postings_navigation_names_idx` and
+    // narrows its statement to the DISTINCT it wants. The pin string above
+    // moved v0.20.3 → v0.24.0. `direct_projection.rs`'s cursor closure changed
+    // SHAPE — `navigation_reference_names_after` takes `(normalized_name,
+    // raw_name)` where it took a 4-tuple — but that is an argument change at an
+    // existing call site, not a new or removed one, so no inventory row moved
+    // and the digest below held (the same way the v0.20.2 bump did).
+    // 2026-09-18: GH #543 — the torn-header recreate path added storage open,
+    // schema initialization and validation calls that P4 later replaced.
+    // 2026-09-19: compact-projection P0b routed every projection SQL statement
+    // through `query/projection_sql.rs`, which imports
+    // `PhysicalProjectionQuerySnapshot`, `PhysicalQueryValue` and
+    // `MaterializationError` from tine-storage: one new import row for the
+    // door file. The 17 call sites keep their snapshot imports and call the
+    // door instead of the storage methods (method calls are not inventory
+    // rows), so no other row moved and no write crossing changed.
+    // 2026-09-19: compact-projection P1 pinned v0.25.0, which deletes the
+    // Managed Storage spine from tine-storage (durable batches, journals v1/v2,
+    // sealed digests, oplog frontier, managed layout: 32,640 → 11,863 source
+    // lines) and leaves the Direct Files durability and SQLite projection
+    // surface. tine-core imported nothing from the deleted half, so the pin
+    // string above moved v0.24.0 → v0.25.0 and the digest is unchanged.
+    // 2026-09-19: compact-projection P1 pinned v0.26.0, which trims the
+    // crate's public surface to the methods Tine's Direct Files path calls
+    // (35 public methods on exported types deleted). Nothing Tine imports or
+    // calls moved, so the pin string above moved v0.25.0 → v0.26.0 and the
+    // digest is unchanged.
+    // 2026-09-20: compact-projection P2 removed probe_fts_ready and its one
+    // PhysicalQueryValue::Integer pattern in query/results.rs. Restoring that
+    // single inventory row reproduces the previous digest exactly; no write
+    // crossing or storage dependency pin changed. P3 native folding adds none.
+    // 2026-09-20: native linked-reference filtering adds one PhysicalQueryValue
+    // import in model/direct_query.rs, twelve Text and one Integer patterns or
+    // bindings for scoped read-only queries. No other inventory row changed.
+    // 2026-09-20: compact-projection P3a adapted projection DTO imports and
+    // calls from physical hash coordinates to public paths/result IDs and
+    // integer private coordinates, moved SQL bind sites from blobs to
+    // integers, and removed the retired blob decoder. The read/write call
+    // ownership and the write crossings asserted above are unchanged.
+    // 2026-09-20: P3b correction A classifies malformed streamed candidates
+    // directly as ResultReadError::Corrupt instead of constructing three
+    // storage InvalidQuery errors. Correction B binds source exclusions and
+    // decodes the page/block entity discriminator in the shared unlinked
+    // candidate read. These alter read-only value/error inventory rows; no
+    // storage write crossing or public storage dependency pin changed.
+    // 2026-09-20: one-pass page ranking removes one read-only Integer bind;
+    // the byte-length/text callback frame adds two InvalidQuery error sites.
+    // No write crossing or dependency pin changes.
+    // 2026-09-20: compact-projection P4 replaces partial relaxed-WAL builds
+    // with a fresh unpublished OFF image and a storage-owned directory
+    // publication. direct_projection.rs gains one DurableDirectoryPublication
+    // write crossing plus the fresh/open/validation calls, and removes the
+    // retired build-durability calls.
+    // 2026-09-20: the P4 final reader-drain correction routes every pooled
+    // projection read, including alias ownership, through one mutex-held
+    // admission helper. This changes only the counted receiver-call shape;
+    // it adds no storage import or authority crossing.
+    // 2026-09-20: the P4 streaming-build correction replaces the per-chunk
+    // `apply_with_source_revisions_and_aliases` call plus final page-order,
+    // optimize and staged-replacement calls with append, finish and finalized-
+    // token publication. Schema initialization and one pre-publication schema
+    // validation moved inside storage; the ordinary apply call remains. No
+    // authority crossing or dependency pin changed.
+    // 2026-09-20: final compact-projection delivery pins tine-storage v0.27.0.
+    // The production import and direct-call inventory is unchanged, so the
+    // digest below holds.
+    // 2026-09-21: GH #550 settles pre-seed launch deltas against the reopened
+    // image with two read-only `database.source_delta` calls in
+    // `settle_unseeded_deltas`. No write crossing or dependency pin changed.
+    // 2026-09-21: GH #543 pins tine-storage v0.27.1 (fresh-build speedup:
+    // cached statements and coordinate-resolved postings inside storage). The
+    // production import and direct-call inventory is unchanged.
+    // 2026-09-21: BL1 adds read-only derived SQL snapshots and typed row
+    // validation. No storage write crossing, schema or dependency pin changes.
+    // 2026-09-22: GH #543 bounded warm repair applies the pages a warm named
+    // changed through `apply_warm_repair`: one more
+    // `apply_with_source_revisions_aliases_and_page_order` call (the existing
+    // order-turn write, now also used for the repair's single transaction) and
+    // one read-only `source_delta` call. No new storage import, write kind,
+    // schema or dependency pin.
+    // 2026-09-22: the B1 file-size cap moved direct_projection.rs's lowering
+    // functions verbatim into direct_projection/lowering.rs (`use super::*`).
+    // With that file's rows read as direct_projection.rs, the surface hashes
+    // to the digest above: paths moved, nothing else.
+    // 2026-09-22: GH #543 (audit R4-02) adds one read-only derived SQL
+    // snapshot, `holds_source_revision`, so a page open skips a delta the
+    // ready image already holds. No storage write crossing, schema or
+    // dependency pin changes.
+    // 2026-09-22: GH #543 (design v4 §0.1) `apply_incomplete_full` keeps an
+    // unreadable page's rows under a full snapshot: one more read-only
+    // `source_delta` call; its write goes through the existing
+    // `apply_warm_repair`. No new storage import, write kind, schema or
+    // dependency pin.
+    // 2026-09-23: GH #543 (audit R8, file-size budget B1) moves the page-order
+    // functions (`reconcile_page_order`, `settle_unseeded_deltas`) unchanged
+    // from direct_projection.rs to direct_projection/page_order.rs: three
+    // `source_delta` reads and one page-order apply change file, nothing else.
+    // 2026-09-23: GH #543 (audit R9-01/R9-02) `full_repair_delta` replaces
+    // `full_sources_match` and `apply_incomplete_full`: the same one
+    // read-only `source_delta` call, one fewer source-revision literal, and
+    // `ContentDigest` / `PhysicalGraphProjectionSourceDelta` named as types
+    // for the sent-source ledger. No storage write crossing, schema or
+    // dependency pin changes.
+    // 2026-09-23: GH #543 (file-size budget B1) moves the repair functions
+    // (`full_repair_delta`, `validate_warm`, `apply_full_repair`,
+    // `apply_warm_repair`) unchanged from direct_projection.rs to
+    // direct_projection/repair.rs: two `source_delta` reads change file,
+    // nothing else.
+    // 2026-09-23: GH #543 (audit R11-01, decision DK4) a fresh build carries
+    // the pages a snapshot could not read by re-lowering them from the image
+    // it replaces: `carried.rs` opens one read-only derived SQL snapshot. The
+    // in-place repair writes each batch through `lower_in_batches`, so
+    // repair.rs gains one `apply_with_source_revisions_and_aliases` call (an
+    // existing write kind). No new write kind, schema or dependency pin.
+    // 2026-09-23: GH #543 (audit R12-05) index readers report damage to the
+    // one decider: `direct_projection_owner.rs` matches
+    // `MaterializationError::Corrupt` to classify a read error, and an
+    // undecodable derived row is reported as `Corrupt` in
+    // `derived_reads.rs`. Error types only; no write, schema or pin change.
+    // 2026-09-23: GH #543 (audits R13-05, R13-06) a stored page kind is decoded
+    // once, by `derived_reads::page_kind`, so `direct_projection.rs` loses its
+    // two `Corrupt` constructions, and a journal's day is read from its row:
+    // `derived_reads.rs` gains one read-only `open_direct` (`journal_days`)
+    // and one `Integer` decode. Reads and error types only; no write, schema
+    // or pin change.
+    // 2026-09-23: GH #543 index reconciler (design note
+    // 2026-09-23-index-reconciler-design.md) deletes warm_queue.rs,
+    // page_order.rs and repair.rs: every `source_delta` read, the page-order
+    // apply (`apply_with_source_revisions_aliases_and_page_order`) and the
+    // sent-source `ContentDigest` / `PhysicalGraphProjectionSourceDelta`
+    // names go. The survey reads stored revisions through one more read-only
+    // `open_direct`. Removals and reads only; no new write kind, schema or
+    // dependency pin.
+    // 2026-09-24: GH #594 the Linked References candidate read joins stored
+    // block order in one read-only SQL statement, so each stored id resolves
+    // through `ResultIdentity::public_id`: the `page_referrer_candidates_after`
+    // call and its entity-coordinate matches go, and an unresolvable id is
+    // reported as `MaterializationError::Corrupt`. Reads and error types only;
+    // no write, schema or pin change.
+    // 2026-09-24: GH #594 R3 — lowering names every block by its structural
+    // id and the session maps live ids. A reader captures the live-id
+    // exceptions beside its snapshot by reading stored source revisions, and
+    // a live id translates to its stored id before a lookup: two
+    // `PhysicalQueryValue::Text(` binds in direct_projection.rs and one in
+    // derived_reads.rs. Read-side binds only; no write, schema or pin change.
+    // 2026-09-24: the launch integrity check runs `PRAGMA quick_check` in the
+    // background through one read-only `open_direct` snapshot in
+    // `integrity.rs`, reading one `Text` verdict (design D1). Read only; no
+    // write, schema or pin change.
+    // 2026-09-24: a reopen serves the stored image during the launch check
+    // only when its stored facts were written under the current facts
+    // version and parse configuration (design D2): `derived_reads.rs` gains
+    // one read-only `open_direct` and binds one `Integer` and one `Text`.
+    // Read only; no write, schema or pin change.
+    // 2026-09-24: ADR 0069 pins tine-storage v0.28.0 (schema 31: the
+    // `short_word_fts` table, written from the new `short_word_tokens` field
+    // inside storage's existing page transaction). Lowering fills one more
+    // field; the production import and direct-call inventory is unchanged.
+    // 2026-09-24: GH #543 stabilization pins tine-storage v0.28.1. A worker
+    // turn applies through one `PhysicalGraphProjectionTurn` (one transaction
+    // per turn instead of one per 32 pages); the live writer keeps temporary
+    // files in memory and disables inline autocheckpoints, and a background
+    // thread runs `checkpoint_passive_at` on its own connection. Same writes
+    // and schema; fewer transactions and no fsync inside a turn.
+    // 2026-09-25: GH #543 reopen regression pins tine-storage v0.28.2:
+    // `checkpoint_passive_at` also empties a fully copied WAL when nothing
+    // holds it, and the background checkpoint retries that briefly. The retry
+    // reads the checkpoint's result (`outcome.is_err`), which the census counts
+    // as a storage-receiver use; no new storage import or call.
+    let digest = inventory_digest(&dependency_surface);
     assert_eq!(
-        inventory_digest(&dependency_surface),
-        "d72792b40312484f7a82147334ce4624de2b710afd4f30633bafedceb94b8583",
-        "the complete tine-storage import/direct-call surface changed: {dependency_surface:#?}"
+        digest,
+        "ee34a2700508480a4855efb84fcc87c12a9f3265ccf75609bbb5b2d929573910",
+        "the complete tine-storage import/direct-call surface changed (digest now {digest}): {dependency_surface:#?}"
     );
 }
 
@@ -1956,5 +2173,138 @@ fn comments_that_cite_a_test_name_a_test_that_exists() {
          (invariant I-11: code does not lie about itself). Write the guard, or cite the \
          one that really covers the claim. Offenders:\n{}",
         offenders.join("\n")
+    );
+}
+
+/// "Does Tine already hold these bytes of this page" has one answer:
+/// `Graph::page_revision_current` asks every store (parsed cache, served
+/// session record, index) through one rule, and the index's part is
+/// `DirectProjection::holds_source_revision`, which answers from the page's
+/// queued mark before the stored image. Each extra producer so far trusted one store
+/// for another and lost an edit or republished unchanged bytes (GH #543,
+/// audits R8-02, R9-02, R9-03). `image_holds_source_revision` is the narrower
+/// question "do the stored rows carry these exact bytes", which only a
+/// publication of ids without a delta may ask. A new call site is a new
+/// producer: route it through `page_revision_current` (exemplar:
+/// `model/sync_file.rs`) instead of pinning it here.
+#[test]
+fn page_currency_has_one_producer() {
+    let files = production_rust();
+    let names = [
+        "page_revision_current",
+        "index_has_revision",
+        "holds_source_revision",
+        "image_holds_source_revision",
+    ];
+    let mut sites = Vec::new();
+    for file in files {
+        for name in names {
+            let uses = identifier_occurrences(&file.code, &format!("{name}("))
+                - identifier_occurrences(&file.code, &format!("fn {name}("));
+            if uses != 0 {
+                sites.push(format!("{} {name} {uses}", file.relative));
+            }
+        }
+    }
+    sites.sort();
+    assert_eq!(
+        sites,
+        [
+            "crates/tine-core/src/model/graph_drift.rs holds_source_revision 1",
+            "crates/tine-core/src/model/graph_drift.rs image_holds_source_revision 1",
+            "crates/tine-core/src/model/graph_drift.rs index_has_revision 1",
+            "crates/tine-core/src/model/sync_file.rs index_has_revision 1",
+            "crates/tine-core/src/model/sync_file.rs page_revision_current 2",
+        ],
+        "page currency gained a producer; see this test's doc comment"
+    );
+}
+
+/// "What can a watcher event at this path change?" has one answer:
+/// `Graph::graph_text_watch_reach`. The batch queue (full diff or exact path)
+/// and the platform callback (invalidate the guarded identity index or not)
+/// each used to answer it with their own rules, and both read a gone path or
+/// the configuration file as "maybe a directory of pages", so every settings
+/// change diffed the whole graph and every rename-away dropped the identity
+/// index (GH #543, audit R9-05, R9-06). A third decider is a new place for
+/// that to drift: call `graph_text_watch_reach` (exemplar:
+/// `src-tauri/src/watcher/runtime.rs`, `graph_text_observation`) instead of
+/// pinning a new site here.
+#[test]
+fn watch_reach_has_one_producer() {
+    let mut sites = Vec::new();
+    for file in production_rust() {
+        for name in ["graph_text_watch_reach", "gone_path_holds_files_under"] {
+            let uses = identifier_occurrences(&file.code, &format!("{name}("))
+                - identifier_occurrences(&file.code, &format!("fn {name}("));
+            if uses != 0 {
+                sites.push(format!("{} {name} {uses}", file.relative));
+            }
+        }
+    }
+    sites.sort();
+    assert_eq!(
+        sites,
+        [
+            "crates/tine-core/src/model/write_receipts.rs gone_path_holds_files_under 1",
+            "src-tauri/src/watcher.rs graph_text_watch_reach 1",
+            "src-tauri/src/watcher/runtime.rs graph_text_watch_reach 1",
+        ],
+        "watch reach gained a decider; see this test's doc comment"
+    );
+}
+
+/// "Who lowers pages into the index?" has one answer: `lower_in_batches`
+/// (`crates/tine-core/src/direct_projection/lowering.rs`), the only
+/// production caller of `physical_page`. It writes in batches, checks the stop
+/// flag between them and reports progress, so every page source (a full
+/// snapshot, the pages a fresh build carries over, an in-place repair, queued
+/// updates) is stoppable by `close` and visible to the user. Before, four sites
+/// lowered on their own, and a whole-graph repair over one unreadable page ran
+/// as one unstoppable 70 s turn (GH #543, audit R11-01, decision DK4; I-12,
+/// I-24). A new source builds `LoweringInput`s and hands them to that loop;
+/// it does not call `physical_page`.
+#[test]
+fn page_lowering_has_one_loop() {
+    let mut sites = Vec::new();
+    for file in production_rust() {
+        let uses = identifier_occurrences(&file.code, "physical_page(")
+            - identifier_occurrences(&file.code, "fn physical_page(");
+        if uses != 0 {
+            sites.push(format!("{} physical_page {uses}", file.relative));
+        }
+    }
+    assert_eq!(
+        sites,
+        ["crates/tine-core/src/direct_projection/lowering.rs physical_page 1"],
+        "page lowering gained a caller outside `lower_in_batches`; see this test's doc comment"
+    );
+}
+
+/// A test counter is read with one load, never as arithmetic on two.
+///
+/// `consumer_page_parses_test` used to return `parses - indexing_parses`,
+/// two relaxed loads one after the other. The owner could parse between
+/// them, so the answer came out one short, and a seeded interleaving run
+/// underflowed on `consumer_page_parses_test() - before` about once in 300
+/// seeds (GH #543, audit R9-07). Count the part you want in its own counter
+/// instead; the exemplar is `PageBuildTestState::consumer_parses`
+/// (`crates/tine-core/src/model/page_cache_index.rs`).
+#[test]
+fn no_counter_is_read_as_arithmetic_on_two_loads() {
+    let pattern = Regex::new(r"\.load\([^)]*\)\s*[-+]\s*[\w.:()]*\.load\(").unwrap();
+    let offenders: Vec<String> = repository_rust_sources()
+        .iter()
+        .flat_map(|(path, source)| {
+            pattern
+                .find_iter(source)
+                .map(move |found| format!("{path}:{}", source[..found.start()].lines().count()))
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "an atomic counter read as the sum or difference of two loads races its \
+         writer (GH #543, R9-07); keep the wanted part in its own counter like \
+         PageBuildTestState::consumer_parses: {offenders:?}"
     );
 }

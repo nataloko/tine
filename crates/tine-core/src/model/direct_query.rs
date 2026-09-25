@@ -5,6 +5,62 @@
 
 use super::*;
 
+const BACKLINK_FILTER_EQUIVALENCE_SQL: &str = "WITH RECURSIVE component(name_key) AS (
+    SELECT ?1
+    UNION
+    SELECT alias_name.key
+    FROM component
+    JOIN names AS owner_name ON owner_name.key = component.name_key
+    JOIN pages AS owner INDEXED BY pages_name_idx
+      ON owner.name_id = owner_name.name_id
+    JOIN reference_alias_declarations AS declaration
+      INDEXED BY reference_alias_declarations_source_idx
+      ON declaration.source_page_id = owner.page_id
+    JOIN names AS alias_name ON alias_name.name_id = declaration.alias_name_id
+    UNION
+    SELECT owner_name.key
+    FROM component
+    JOIN names AS alias_name ON alias_name.key = component.name_key
+    JOIN reference_alias_declarations AS declaration
+      INDEXED BY reference_alias_declarations_name_idx
+      ON declaration.alias_name_id = alias_name.name_id
+    JOIN pages AS owner ON owner.page_id = declaration.source_page_id
+    JOIN names AS owner_name ON owner_name.name_id = owner.name_id
+)
+SELECT component.name_key, page.path,
+       CASE WHEN page.page_id IS NULL THEN NULL ELSE page_name.raw END,
+       alias_name.key
+FROM component
+LEFT JOIN names AS page_name ON page_name.key = component.name_key
+LEFT JOIN pages AS page INDEXED BY pages_name_idx
+  ON page.name_id = page_name.name_id
+LEFT JOIN reference_alias_declarations AS declaration
+  INDEXED BY reference_alias_declarations_source_idx
+  ON declaration.source_page_id = page.page_id
+LEFT JOIN names AS alias_name ON alias_name.name_id = declaration.alias_name_id
+ORDER BY component.name_key, page.path, alias_name.key";
+
+const BACKLINK_FILTER_JOURNAL_SQL: &str = "SELECT page_name.raw
+FROM names AS page_name
+JOIN pages AS page INDEXED BY pages_name_idx ON page.name_id = page_name.name_id
+WHERE page_name.key = ?1 AND page.text_kind = 1
+ORDER BY page.path
+LIMIT 1";
+
+const BACKLINK_FILTER_SOURCE_BATCH: usize = 256;
+
+/// How long an index-backed read waits for the index before its caller
+/// falls back to parsing (GH #543).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum IndexWait {
+    /// While whole-graph index work is coming: the caller has no retry, so
+    /// its fallback would parse the graph the coming pass is reading.
+    WhileComing,
+    /// A short latency ceiling for one queued delta: an interactive caller
+    /// that reports `NotReady` and retries instead of parsing.
+    Bounded,
+}
+
 impl Graph {
     /// **SPEC §5.9's Direct Files dispatch, in ONE place.**
     ///
@@ -97,12 +153,10 @@ impl Graph {
         // incarnation; never recapture a moving target inside this request.
         // Capture the lifecycle identity once, before recovery. Ordinary saves
         // keep the same epoch and do not cancel the request.
-        let request = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|projection| (Arc::clone(projection), projection.query_epoch()));
+        let request = self.direct_projection.get().map(|projection| {
+            let epoch = projection.query_epoch();
+            (projection, epoch)
+        });
         let cancelled = || {
             let replaced = request
                 .as_ref()
@@ -133,11 +187,12 @@ impl Graph {
                 result
             }
         };
-        // Whether the repair must ERASE the disposable database before
-        // rebuilding it. A failed read owes that; an idle projection that has
-        // simply not started yet does not, and erasing it there discarded the
-        // whole persisted index on every launch (GH #543).
-        let reset_before_rebuild = match attempt_captured() {
+        // The failure the read met, if it failed: only a failure can owe a
+        // new image, and whether it does is the one decider's call (K1). An
+        // idle projection that has simply not started yet is validated, never
+        // rebuilt: rebuilding it discarded the whole persisted index on every
+        // launch (GH #543).
+        let failure = match attempt_captured() {
             DirectAttempt::Answered(answer) => return Ok(answer),
             DirectAttempt::Cancelled => return Err(cancelled()),
             DirectAttempt::Unavailable(reason) => return Err(Error::Unavailable(reason)),
@@ -148,21 +203,38 @@ impl Graph {
                     return Err(Error::NotReady(Readiness::PendingEdits))
                 }
                 Some(ProjectionProgress::Working(reason)) => return Err(Error::NotReady(reason)),
+                // Stopped trying this session: no repair, no retry loop (GH #594).
+                Some(ProjectionProgress::Failed(class)) => {
+                    return Err(Error::Unavailable(Reason::IndexFailed(class)))
+                }
                 Some(ProjectionProgress::Stopped) | None => {
                     return Err(Error::Unavailable(Reason::ProjectionUnavailable))
                 }
                 // Idle and stale: nothing is coming, so repair. The repair
                 // still resets when the worker actually failed; it validates
                 // when the projection is merely not started yet.
-                Some(ProjectionProgress::Stale) => false,
+                Some(ProjectionProgress::Stale) => None,
             },
-            DirectAttempt::FailedRead(_) => true,
+            DirectAttempt::FailedRead(reason) => {
+                Some(crate::direct_projection::IndexFailure::of_read(reason))
+            }
         };
-        if reset_before_rebuild {
-            self.direct_projection_recover_after_failed_read();
-        } else {
-            self.direct_projection_repair(false);
+        #[cfg(test)]
+        if failure.is_some() {
+            // Bind first: an `if let` scrutinee would hold the guard across
+            // the pause.
+            let pause = self
+                .page_build_test
+                .failed_read_repair_pause
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(pause) = pause {
+                pause.reached.wait();
+                pause.release.wait();
+            }
         }
+        self.direct_projection_repair(failure);
         match attempt_captured() {
             DirectAttempt::Answered(answer) => Ok(answer),
             DirectAttempt::Cancelled => Err(cancelled()),
@@ -172,6 +244,9 @@ impl Graph {
             DirectAttempt::NotReady => match self.direct_projection_progress() {
                 Some(ProjectionProgress::Ready) => Err(Error::NotReady(Readiness::PendingEdits)),
                 Some(ProjectionProgress::Working(reason)) => Err(Error::NotReady(reason)),
+                Some(ProjectionProgress::Failed(class)) => {
+                    Err(Error::Unavailable(Reason::IndexFailed(class)))
+                }
                 Some(ProjectionProgress::Stopped) | None => {
                     Err(Error::Unavailable(Reason::ProjectionUnavailable))
                 }
@@ -189,12 +264,7 @@ impl Graph {
         &self,
     ) -> Option<crate::direct_projection::ProjectionProgress> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
+        let projection = self.direct_projection.get()?;
         Some(projection.progress_at(generation))
     }
 
@@ -229,7 +299,7 @@ impl Graph {
         } else {
             crate::direct_projection::RegistrySensitivity::Insensitive
         };
-        let mut job = match projection.open_current_query_job(registry_sensitivity) {
+        let mut job = match self.open_query_job_at(projection, registry_sensitivity) {
             crate::direct_projection::QueryJobOpen::Job(job) => job,
             crate::direct_projection::QueryJobOpen::NotReady => return DirectAttempt::NotReady,
             crate::direct_projection::QueryJobOpen::Busy => return DirectAttempt::Busy,
@@ -261,10 +331,6 @@ impl Graph {
             Arc::new(crate::query::registry::Registry::empty(&config))
         };
         let compiled = crate::query::compiled::CompiledLeaves::for_query(&query.evaluable_filter());
-        let fts_ready = match crate::query::results::probe_fts_ready(&mut job.snapshot) {
-            Ok(ready) => ready,
-            Err(error) => return direct_attempt_from_read(Err(error.into())),
-        };
         let inputs = LoweringInputs {
             today,
             registry: &registry,
@@ -275,7 +341,6 @@ impl Graph {
             // `ConstructionBudget` the walk charges.
             cutoff: None,
             compiled: &compiled,
-            fts_ready,
             result_set_rule: RESULT_SET_RULE,
             relation_rule: RELATION_RULE,
         };
@@ -302,13 +367,10 @@ impl Graph {
         // and the identity capture; `read_results` owns the descriptor read,
         // the budget and the payload batches, and installs the statement's
         // compiled-regex program on the job's own connection.
-        // The identity policy, captured with the snapshot: a page THIS process
-        // lowered answers with its stored live id; a row reused from an earlier
-        // session answers with the structural id the fresh parse assigns it.
-        let identity = crate::query::results::ResultIdentity {
-            session_pages: Arc::clone(&job.session_pages),
-            all_session: false,
-        };
+        // The identity decoder, captured with the snapshot: a row answers with
+        // its stored structural id, unless this session's document names that
+        // block by a live id recorded at the row's revision (R3).
+        let identity = job.identity.clone();
         // The recency axis is the WALK'S producer, by the two inputs the
         // projection stores; it runs only for a page the answer admitted.
         let recency = |page: crate::query::results::RecencyPage<'_>| {
@@ -382,10 +444,7 @@ impl Graph {
         self.dispatch_direct_query(|request| {
             self.direct_projection_read_job(request, sensitivity, |job| {
                 let registry = self.direct_lowering_registry(prepared.requires_registry(), job)?;
-                let identity = crate::query::results::ResultIdentity {
-                    session_pages: Arc::clone(&job.session_pages),
-                    all_session: false,
-                };
+                let identity = job.identity.clone();
                 let recency = |page: crate::query::results::RecencyPage<'_>| {
                     crate::query::page_recency_secs_for(
                         page.journal_day,
@@ -409,6 +468,19 @@ impl Graph {
         })
     }
 
+    /// Whether a publication may capture its sources now: typed not-ready,
+    /// wrapped in the IO error publication returns, while the index is being
+    /// built or is catching up. The command boundary unwraps it into the same
+    /// `query-not-ready` wire every query read uses.
+    pub(crate) fn publication_readiness(&self) -> io::Result<()> {
+        match self.direct_projection_progress() {
+            Some(crate::direct_projection::ProjectionProgress::Working(reason)) => Err(
+                io::Error::other(crate::query::QueryExecutionError::NotReady(reason)),
+            ),
+            _ => Ok(()),
+        }
+    }
+
     /// Bind the static publisher's captured source documents to one main image.
     /// A byte/config mismatch is local to this explicit publication command;
     /// ordinary live reads never wait for this correspondence.
@@ -429,17 +501,18 @@ impl Graph {
                 request,
                 crate::direct_projection::RegistrySensitivity::Required,
                 |job| {
-                    if !job.publication_sources_match(sources, &self.config.parse_config())? {
+                    if !job.publication_sources_match(sources, &self.config().parse_config())? {
+                        // The index has not caught up with the captured files:
+                        // the same retryable not-ready as any query read.
                         return Ok(Err(io::Error::new(
                             io::ErrorKind::WouldBlock,
-                            "The graph is still updating. Try publishing again shortly.",
+                            crate::query::QueryExecutionError::NotReady(
+                                crate::query::QueryReadinessReason::PendingEdits,
+                            ),
                         )));
                     }
                     let registry = self.direct_lowering_registry(true, job)?;
-                    let identity = ResultIdentity {
-                        session_pages: Arc::new(HashSet::new()),
-                        all_session: false,
-                    };
+                    let identity = ResultIdentity::structural();
                     let recency = |page: RecencyPage<'_>| {
                         crate::query::page_recency_secs_for(
                             page.journal_day,
@@ -602,26 +675,22 @@ impl Graph {
         })
     }
 
-    /// The statement half of [`Graph::direct_page_rows`], and of
-    /// [`Graph::direct_ir_explain_empty`]'s counting: ONE query job, then the
-    /// caller's reads over its snapshot.
-    ///
-    /// It performs no repair of its own — it reports which §5.9 state it
-    /// reached, exactly as `direct_projection_statement_pre_view` does, so the
-    /// classification and the recovery stay in `dispatch_direct_query`.
-    pub(super) fn direct_projection_query_job<T>(
+    /// Open a query job at this thread's currency ([`Graph::read_currency`]),
+    /// recording a job taken before the launch check validated the image.
+    fn open_query_job_at(
         &self,
-        request: &DirectQueryRequest,
+        projection: &Arc<crate::direct_projection::DirectProjection>,
         registry_sensitivity: crate::direct_projection::RegistrySensitivity,
-        read: impl FnOnce(
-            &mut crate::direct_projection::DirectQueryJob,
-            bool,
-        ) -> Result<T, crate::query::QueryExecutionError>,
-    ) -> DirectAttempt<T> {
-        self.direct_projection_read_job(request, registry_sensitivity, |job| {
-            let fts_ready = crate::query::results::probe_fts_ready(&mut job.snapshot)?;
-            read(job, fts_ready)
-        })
+    ) -> crate::direct_projection::QueryJobOpen {
+        let currency = Self::read_currency();
+        // Asked before the capture: validation during it leaves the mark on.
+        let stored =
+            currency == crate::direct_projection::Currency::LaunchStored && !projection.validated();
+        let job = projection.open_current_query_job(registry_sensitivity, currency);
+        if stored && matches!(job, crate::direct_projection::QueryJobOpen::Job(_)) {
+            Self::note_stored_served();
+        }
+        job
     }
 
     /// Own admission and one current read job; callers supply only their reads.
@@ -638,7 +707,7 @@ impl Graph {
                 crate::query::QueryUnavailableReason::ProjectionUnavailable,
             );
         };
-        let mut job = match projection.open_current_query_job(registry_sensitivity) {
+        let mut job = match self.open_query_job_at(projection, registry_sensitivity) {
             crate::direct_projection::QueryJobOpen::Job(job) => job,
             crate::direct_projection::QueryJobOpen::NotReady => return DirectAttempt::NotReady,
             crate::direct_projection::QueryJobOpen::Busy => return DirectAttempt::Busy,
@@ -686,7 +755,7 @@ impl Graph {
         } else {
             crate::direct_projection::RegistrySensitivity::Insensitive
         };
-        self.direct_projection_query_job(request, registry_sensitivity, |job, fts_ready| {
+        self.direct_projection_read_job(request, registry_sensitivity, |job| {
             let registry = self.direct_lowering_registry(query.filter.has_props_leaf(), job)?;
             let compiled =
                 crate::query::compiled::CompiledLeaves::for_query(&query.evaluable_filter());
@@ -699,7 +768,6 @@ impl Graph {
                     // post-order limit and `COUNT(*) OVER()` exact count.
                     cutoff: None,
                     compiled: &compiled,
-                    fts_ready,
                     result_set_rule: RESULT_SET_RULE,
                     relation_rule: RELATION_RULE,
                 },
@@ -749,7 +817,7 @@ impl Graph {
         } else {
             crate::direct_projection::RegistrySensitivity::Insensitive
         };
-        self.direct_projection_query_job(request, registry_sensitivity, |job, fts_ready| {
+        self.direct_projection_read_job(request, registry_sensitivity, |job| {
             let profile = crate::query::ConstructionProfile::from_view(view);
             // One lowering per probe, all under ONE registry snapshot: a probe that
             // read a different effective type than its siblings would explain a
@@ -779,17 +847,13 @@ impl Graph {
                             registry: &registry,
                             cutoff: None,
                             compiled: &compiled,
-                            fts_ready,
                             result_set_rule: RESULT_SET_RULE,
                             relation_rule: RELATION_RULE,
                         },
                     )
                 })
                 .collect::<Vec<_>>();
-            let identity = crate::query::results::ResultIdentity {
-                session_pages: Arc::clone(&job.session_pages),
-                all_session: false,
-            };
+            let identity = job.identity.clone();
             let recency = |page: crate::query::results::RecencyPage<'_>| {
                 crate::query::page_recency_secs_for(page.journal_day, &self.root.join(page.path))
             };
@@ -843,21 +907,21 @@ impl Graph {
         })
     }
 
-    /// §5.9/M9: schedule the recovery a FAILED projection read owes.
-    ///
-    /// `mark_stale` alone would strand the projection until another edit. Repair
-    /// uses a complete source inventory and bounded page batches when there is
-    /// no parsed cache, or reuses an already-owned parsed snapshot. It never
-    /// builds a parsed graph solely to reconstruct the disposable database.
+    /// §5.9/M9: the recovery a failed read owes, for a fixture that drives it
+    /// directly (see `recover_until_ready`). The app's reads reach it through
+    /// the dispatch above, with the failure they met.
+    #[cfg(test)]
     pub(crate) fn direct_projection_recover_after_failed_read(&self) {
-        self.direct_projection_repair(true);
+        self.direct_projection_repair(Some(
+            crate::direct_projection::IndexFailure::StatementRefused,
+        ));
     }
 
-    /// The repair itself. `reset` erases the disposable database first.
+    /// The repair itself, for the `failure` a read met (`None`: it found the
+    /// index idle and not ready).
     ///
-    /// Erasing is the repair a torn or unreadable file owes, and it is never
-    /// the repair an intact one owes: `reset()` drops every source stamp, so
-    /// the complete inventory that follows re-lowers EVERY page. The app runs
+    /// A new image is the repair a damaged one owes, and it is never the
+    /// repair an intact one owes: it re-lowers EVERY page. The app runs
     /// queries before its background warm reaches the projection — the journal
     /// feed, backlinks, Ctrl-K — and such a query finds the worker idle,
     /// unvalidated and not yet failed, which `progress_at` reports as `Stale`.
@@ -867,60 +931,56 @@ impl Graph {
     /// nobody touching it (GH #543). A projection that has not failed is
     /// repaired by validating it against the source revisions it already
     /// stores, never by erasing it.
-    fn direct_projection_repair(&self, reset: bool) {
+    fn direct_projection_repair(&self, failure: Option<crate::direct_projection::IndexFailure>) {
         let Ok(_repair) = self.projection_recovery.try_lock() else {
             return;
         };
-        let (reset, _in_flight) = {
-            let projection = self.direct_projection.lock().unwrap();
-            let Some(projection) = projection.as_ref() else {
-                return;
-            };
-            let reset = reset || projection.worker_failed();
-            if reset {
-                projection.request_rebuild();
-            }
-            // Published BEFORE the payload is computed, which takes seconds on
-            // a large graph: a query racing this repair must read it as work in
-            // progress, not as an idle stale projection nobody is repairing.
-            (reset, projection.begin_repair())
-        };
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let Some(pages) = self.cache.read().unwrap().as_ref().map(Arc::clone) else {
-            // The existing worker resets the disposable projection before
-            // validating this source inventory, then consumes bounded page
-            // batches. Never call warm_cache here: its legacy fallback builds
-            // the parsed graph when streaming cannot currently acquire ownership.
-            self.warm_projection_cancellable(&|| false);
+        crate::direct_projection::projection_diag(|| {
+            format!(
+                "repair requested failure={failure:?} parsed_cache={}",
+                self.cache.read().unwrap().is_some()
+            )
+        });
+        let Some(projection) = self.direct_projection.get() else {
             return;
         };
-        let revisions = self.disk_revs.read().unwrap().clone();
-        // A reset must be followed by a payload; see `direct_projection_enqueue_full`.
-        self.direct_projection_enqueue_full(generation, pages, Arc::new(revisions), reset);
+        if failure.is_some_and(|failure| projection.failure_owes_new_image(failure)) {
+            // A failed worker turn recorded its own need (`Fresh` or
+            // `Validate`) when it failed. `request_rebuild` is a no-op while
+            // a fresh build already replaces the image (IT-10).
+            projection.request_rebuild();
+        }
+        if projection.owner_registered() {
+            // Whole-graph index work is the owner's to start: a repair here
+            // would be a second pass racing it on the query thread, both
+            // reading every page (GH #543). The need is reported; leave it.
+            crate::direct_projection::projection_diag(|| {
+                "repair left to the index owner".to_owned()
+            });
+            return;
+        }
+        // No owner (the CLI, headless runs, tests): run one owner iteration
+        // inline -- the same pass the owner loop runs, for the need as it
+        // stands now. Published before the pass, which takes seconds on a
+        // large graph: a query racing it reads work in progress, not an idle
+        // stale projection nobody is repairing.
+        let _in_flight = projection.begin_repair();
+        let (need, _) = projection.index_need_now();
+        let _ = self.inline_index_pass(&projection, need, &|| false);
     }
 
     pub(super) fn direct_projection_note_fallback_read(&self) {
-        if let Some(projection) = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)
-        {
+        if let Some(projection) = self.direct_projection.get() {
             projection.note_fallback_read();
         }
     }
 
+    /// Through the readiness wait like every index read: asked at a
+    /// generation the index had not applied, it declined, and the caller
+    /// answered from a parsed cache that lacks an unreadable page's stored
+    /// references (audit R15-07).
     pub(super) fn direct_projection_referenced_page_names(&self) -> Option<Vec<String>> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
-        let names = projection.referenced_page_names(generation)?;
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(names)
+        self.indexed_read(|projection, at| projection.referenced_page_names(at))
     }
 
     /// Load exactly the named pages from the parsed cache, in the order asked
@@ -945,7 +1005,12 @@ impl Graph {
         let mut pages = Vec::new();
         for relative in paths {
             let path = self.root.join(&relative);
-            let slot = cache_index.by_path.get(&path).copied()?;
+            // A candidate the parsed cache does not hold (gone, or it did not
+            // parse) is absent from the walk this read replaces too: skip it,
+            // as `parse_pages_on_demand` does (GH #594 L6).
+            let Some(slot) = cache_index.by_path.get(&path).copied() else {
+                continue;
+            };
             let page = snapshot.get(slot)?;
             if page.0.path != path || page.0.rel_path != relative.to_string_lossy() {
                 return None;
@@ -963,127 +1028,320 @@ impl Graph {
         (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(pages)
     }
 
+    fn direct_projection_pages_for_sources(
+        &self,
+        generation: u64,
+        sources: Vec<(PathBuf, String)>,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        let cache = self.cache.read().unwrap();
+        if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) != generation {
+            return None;
+        }
+        let Some(snapshot) = cache.as_ref().map(Arc::clone) else {
+            drop(cache);
+            return self.parse_pages_on_demand_with_revisions(generation, sources);
+        };
+        let revisions = self.disk_revs.read().unwrap();
+        let config_digest = self.config().parse_config().digest();
+        let mut pages = Vec::with_capacity(sources.len());
+        for (relative, projected_revision) in sources {
+            let path = self.root.join(&relative);
+            let source_revision = revisions.get(&path)?;
+            if crate::direct_projection::projection_source_revision(source_revision, config_digest)
+                != projected_revision
+            {
+                return None;
+            }
+            let slot = self.cached_page_index_for_path(&snapshot, &path)?;
+            let page = snapshot.get(slot)?;
+            if page.0.path != path || page.0.rel_path != relative.to_string_lossy() {
+                return None;
+            }
+            pages.push(page.clone());
+        }
+        drop(revisions);
+        drop(cache);
+        #[cfg(test)]
+        DIRECT_HYDRATED_PAGES.with(|recorded| {
+            recorded.borrow_mut().extend(
+                pages
+                    .iter()
+                    .map(|(entry, _)| PathBuf::from(&entry.rel_path)),
+            );
+        });
+        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(pages)
+    }
+
+    pub(crate) fn backlink_filter_scope(
+        &self,
+        target: &str,
+        requested_pages: &[(PageKind, String)],
+    ) -> Result<crate::query::BacklinkFilterScope, crate::query::QueryExecutionError> {
+        use tine_storage::sqlite::PhysicalQueryValue;
+
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        self.dispatch_direct_query(|request| {
+            self.direct_projection_read_job(
+                request,
+                crate::direct_projection::RegistrySensitivity::Insensitive,
+                |job| {
+                    let rows = crate::query::projection_sql::run(
+                        &mut job.snapshot,
+                        BACKLINK_FILTER_EQUIVALENCE_SQL,
+                        &[PhysicalQueryValue::Text(crate::refs::page_key(target))],
+                    )
+                    .map_err(|error| -> crate::query::QueryExecutionError {
+                        crate::query::results::sql_or_cancelled(&job.snapshot, error).into()
+                    })?;
+                    let mut real_pages = crate::query::RealPageNames::new();
+                    let mut aliases = Vec::new();
+                    for row in rows {
+                        let [PhysicalQueryValue::Text(_), path, name, alias] = row.as_slice()
+                        else {
+                            return Err(crate::query::QueryExecutionError::Unavailable(
+                                crate::query::QueryUnavailableReason::InvalidSnapshot,
+                            ));
+                        };
+                        match (path, name, alias) {
+                            (
+                                PhysicalQueryValue::Text(path),
+                                PhysicalQueryValue::Text(name),
+                                PhysicalQueryValue::Text(alias),
+                            ) => {
+                                let key = crate::refs::page_key(name);
+                                let path = PathBuf::from(path);
+                                match real_pages.get_mut(&key) {
+                                    Some((winner_path, winner_name)) if path < *winner_path => {
+                                        *winner_path = path;
+                                        *winner_name = name.clone();
+                                    }
+                                    Some(_) => {}
+                                    None => {
+                                        real_pages.insert(key, (path, name.clone()));
+                                    }
+                                }
+                                aliases.push((alias.clone(), name.clone()));
+                            }
+                            (
+                                PhysicalQueryValue::Text(path),
+                                PhysicalQueryValue::Text(name),
+                                PhysicalQueryValue::Null,
+                            ) => {
+                                let key = crate::refs::page_key(name);
+                                let path = PathBuf::from(path);
+                                match real_pages.get_mut(&key) {
+                                    Some((winner_path, winner_name)) if path < *winner_path => {
+                                        *winner_path = path;
+                                        *winner_name = name.clone();
+                                    }
+                                    Some(_) => {}
+                                    None => {
+                                        real_pages.insert(key, (path, name.clone()));
+                                    }
+                                }
+                            }
+                            (
+                                PhysicalQueryValue::Null,
+                                PhysicalQueryValue::Null,
+                                PhysicalQueryValue::Null,
+                            ) => {}
+                            _ => {
+                                return Err(crate::query::QueryExecutionError::Unavailable(
+                                    crate::query::QueryUnavailableReason::InvalidSnapshot,
+                                ));
+                            }
+                        }
+                    }
+                    let mut resolved = crate::query::equivalent_page_names(
+                        &real_pages,
+                        &aliases,
+                        target,
+                    );
+                    let format = crate::date::JournalFormat::new(
+                        self.config().journal_file_name_format.as_deref(),
+                        self.config().journal_page_title_format.as_deref(),
+                    );
+                    if let Some(target_day) = format.parse(target) {
+                        let rows = crate::query::projection_sql::run(
+                            &mut job.snapshot,
+                            BACKLINK_FILTER_JOURNAL_SQL,
+                            &[PhysicalQueryValue::Text(crate::refs::page_key(
+                                &format.title(target_day),
+                            ))],
+                        )
+                        .map_err(|error| -> crate::query::QueryExecutionError {
+                            crate::query::results::sql_or_cancelled(&job.snapshot, error).into()
+                        })?;
+                        if let Some(row) = rows.first() {
+                            let [PhysicalQueryValue::Text(journal_name)] = row.as_slice() else {
+                                return Err(crate::query::QueryExecutionError::Unavailable(
+                                    crate::query::QueryUnavailableReason::InvalidSnapshot,
+                                ));
+                            };
+                            crate::query::apply_journal_page_equivalence(
+                                &mut resolved,
+                                &format,
+                                target_day,
+                                journal_name,
+                            );
+                        }
+                    }
+
+                    let mut sources = std::collections::BTreeMap::<PathBuf, String>::new();
+                    for chunk in requested_pages.chunks(BACKLINK_FILTER_SOURCE_BATCH) {
+                        let values = (0..chunk.len())
+                            .map(|index| {
+                                let first = index * 2 + 1;
+                                format!("(?{first}, ?{})", first + 1)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let sql = format!(
+                            "WITH requested(text_kind, name_key) AS (VALUES {values}) \
+                             SELECT page.path, revision.revision \
+                             FROM requested \
+                             JOIN names AS page_name ON page_name.key = requested.name_key \
+                             JOIN pages AS page INDEXED BY pages_name_idx \
+                               ON page.name_id = page_name.name_id \
+                              AND page.text_kind = requested.text_kind \
+                             LEFT JOIN direct_source_revisions AS revision \
+                               ON revision.path = page.path \
+                             ORDER BY page.path"
+                        );
+                        let mut parameters = Vec::with_capacity(chunk.len() * 2);
+                        for (kind, name) in chunk {
+                            parameters.push(PhysicalQueryValue::Integer(match kind {
+                                PageKind::Page => 0,
+                                PageKind::Journal => 1,
+                            }));
+                            parameters.push(PhysicalQueryValue::Text(name.clone()));
+                        }
+                        let rows = crate::query::projection_sql::run(
+                            &mut job.snapshot,
+                            &sql,
+                            &parameters,
+                        )
+                        .map_err(|error| -> crate::query::QueryExecutionError {
+                            crate::query::results::sql_or_cancelled(&job.snapshot, error).into()
+                        })?;
+                        for row in rows {
+                            let [PhysicalQueryValue::Text(path), PhysicalQueryValue::Text(revision)] =
+                                row.as_slice()
+                            else {
+                                return Err(crate::query::QueryExecutionError::Unavailable(
+                                    crate::query::QueryUnavailableReason::InvalidSnapshot,
+                                ));
+                            };
+                            sources.insert(PathBuf::from(path), revision.clone());
+                        }
+                    }
+                    let pages = self
+                        .direct_projection_pages_for_sources(
+                            generation,
+                            sources.into_iter().collect(),
+                        )
+                        .ok_or(crate::query::QueryExecutionError::NotReady(
+                            crate::query::QueryReadinessReason::PendingEdits,
+                        ))?;
+                    Ok(crate::query::BacklinkFilterScope {
+                        names_norm: resolved.1,
+                        pages,
+                    })
+                },
+            )
+        })
+    }
+
     pub(super) fn direct_projection_page_aliases_with_owners(
         &self,
     ) -> Option<Vec<(String, String, String)>> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
-        if !projection.wait_ready_at(generation) {
-            return None;
-        }
-        let aliases = projection.page_aliases_with_owners(generation)?;
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(aliases)
+        self.indexed_read(|projection, at| projection.page_aliases_with_owners(at))
     }
 
     pub(super) fn direct_projection_real_page_names(&self) -> Option<crate::query::RealPageNames> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
-        let mut names = projection.real_page_names(generation)?;
-        for (path, _) in names.values_mut() {
-            *path = self.root.join(&*path);
-        }
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(names)
+        self.indexed_read(|projection, at| {
+            let mut names = projection.real_page_names(at)?;
+            for (path, _) in names.values_mut() {
+                *path = self.root.join(&*path);
+            }
+            Some(names)
+        })
     }
 
     pub(super) fn direct_projection_reference_candidate_pages(
         &self,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
+        mode: crate::query::candidate::CandidateMode,
+        wait: IndexWait,
     ) -> Option<(
         Vec<(PageEntry, Arc<Document>)>,
-        Option<std::collections::HashSet<[u8; 16]>>,
+        Option<std::collections::HashSet<String>>,
+        Option<std::collections::HashSet<PathBuf>>,
     )> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
-        if !projection.wait_for_reference_generation(generation) {
-            return None;
+        let read = |projection: &Arc<crate::direct_projection::DirectProjection>,
+                    at: crate::direct_projection::ReadAt| {
+            let candidates = projection.reference_candidates(
+                at,
+                names_norm,
+                self_page,
+                kind,
+                mode,
+                &self.config(),
+            )?;
+            let pages = self.direct_projection_pages_for_paths(at.generation, candidates.paths)?;
+            Some((pages, candidates.blocks, candidates.page_owners))
+        };
+        match wait {
+            IndexWait::WhileComing => self.indexed_read(read),
+            IndexWait::Bounded => {
+                let at = crate::direct_projection::ReadAt {
+                    generation: self.cache_gen.load(std::sync::atomic::Ordering::Acquire),
+                    currency: Self::read_currency(),
+                };
+                let projection = self.direct_projection.get()?;
+                if !projection.wait_for_reference_generation(at) {
+                    return None;
+                }
+                read(&projection, at)
+            }
         }
-        let candidates = projection.reference_candidates(generation, names_norm, kind)?;
-        let pages = self.direct_projection_pages_for_paths(generation, candidates.paths)?;
-        Some((pages, candidates.blocks))
     }
 
     pub(super) fn direct_projection_block_page_hint(&self, uuid: &str) -> Option<Option<String>> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
-        let hint = projection.block_page_hint(generation, uuid)?;
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(hint)
+        self.indexed_read(|projection, at| projection.block_page_hint(at, uuid))
     }
 
     pub(super) fn direct_projection_block_ref_counts(
         &self,
     ) -> Option<std::collections::HashMap<String, usize>> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
-        if !projection.wait_ready_at(generation) {
-            return None;
-        }
-        let counts = projection.block_ref_counts(generation)?;
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation).then_some(counts)
+        self.indexed_read(|projection, at| projection.block_ref_counts(at))
     }
 
     pub(crate) fn direct_projection_block_referrer_candidate_pages(
         &self,
         uuid: &str,
     ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let projection = self
-            .direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)?;
-        let paths = projection.block_referrer_candidate_paths(generation, uuid)?;
-        self.direct_projection_pages_for_paths(generation, paths)
-    }
-
-    pub(super) fn direct_projection_ready(&self) -> bool {
-        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|projection| projection.ready_at(generation))
+        self.indexed_read(|projection, at| {
+            let paths = projection.block_referrer_candidate_paths(at, uuid)?;
+            self.direct_projection_pages_for_paths(at.generation, paths)
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn direct_projection_ready_test(&self) -> bool {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
         self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
+            .get()
             .is_some_and(|projection| projection.ready_at(generation))
     }
 
     #[cfg(test)]
-    pub(crate) fn direct_projection_mark_stale_test(&self) {
-        self.direct_projection_mark_stale();
+    pub(crate) fn direct_projection_owe_validation_test(&self) {
+        if let Some(projection) = self.direct_projection.get() {
+            projection.owe_validation_test();
+        }
     }
 
     /// R3: the attached projection itself, so a test can open a query job on
@@ -1092,15 +1350,12 @@ impl Graph {
     pub(crate) fn direct_projection_test(
         &self,
     ) -> Option<Arc<crate::direct_projection::DirectProjection>> {
-        self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(Arc::clone)
+        self.direct_projection.get()
     }
 
-    /// R3: the production rebuild path a failed read takes — request the
-    /// rebuild, then enqueue the warm parser snapshot it needs.
+    /// ONE recovery attempt, for an interleaving fixture that races that
+    /// single attempt against other work and asserts what it did. A fixture
+    /// that only needs recovery to converge uses `recover_until_ready`.
     #[cfg(test)]
     pub(crate) fn direct_projection_recover_after_failed_read_test(&self) {
         self.direct_projection_recover_after_failed_read();
@@ -1109,9 +1364,7 @@ impl Graph {
     #[cfg(test)]
     pub(crate) fn direct_projection_indexed_reads_test(&self) -> u64 {
         self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
+            .get()
             .map_or(0, |projection| projection.indexed_reads())
     }
 
@@ -1119,18 +1372,14 @@ impl Graph {
     #[cfg(test)]
     pub(crate) fn direct_projection_statement_reads_test(&self) -> u64 {
         self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
+            .get()
             .map_or(0, |projection| projection.statement_reads())
     }
 
     #[cfg(test)]
     pub(crate) fn direct_projection_fallback_reads_test(&self) -> u64 {
         self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
+            .get()
             .map_or(0, |projection| projection.fallback_reads())
     }
 
@@ -1151,11 +1400,23 @@ impl Graph {
         DIRECT_HYDRATED_PAGES.with(|paths| paths.borrow().clone())
     }
 
+    #[cfg(test)]
+    pub(crate) fn direct_projection_set_source_revision_test(
+        &self,
+        path: &std::path::Path,
+        revision: &str,
+    ) {
+        self.disk_revs
+            .write()
+            .unwrap()
+            .insert(path.to_path_buf(), revision.to_string());
+    }
+
     /// §5.9: make the NEXT read through the statement seam fail, as a torn or
     /// truncated projection file, a disk error or a resource limit would.
     #[cfg(test)]
     pub(crate) fn direct_projection_inject_read_failure_test(&self) {
-        if let Some(projection) = self.direct_projection.lock().unwrap().as_ref() {
+        if let Some(projection) = self.direct_projection.get() {
             projection.inject_next_statement_failure();
         }
     }
@@ -1163,18 +1424,7 @@ impl Graph {
     #[cfg(test)]
     pub(crate) fn direct_projection_referenced_name_reads_test(&self) -> u64 {
         self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
+            .get()
             .map_or(0, |projection| projection.referenced_name_reads())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn direct_projection_fuzzy_candidate_reads_test(&self) -> u64 {
-        self.direct_projection
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map_or(0, |projection| projection.fuzzy_candidate_reads())
     }
 }

@@ -3,6 +3,13 @@
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    /// The path that answered this thread's last Friendly search (test only).
+    pub(crate) static LAST_FRIENDLY_SERVED_BY: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl Graph {
     /// Full-text search across all blocks.
     pub fn search(
@@ -14,6 +21,7 @@ impl Graph {
             &crate::query_plan::QueryPlan::block_search_literal(query, limit),
             false,
             None,
+            true,
         )
         .map(|answer| crate::query_plan::block_hits_to_groups(answer.hits))
     }
@@ -61,14 +69,42 @@ impl Graph {
         explain: bool,
         display: crate::query_plan::FriendlyDisplayOptions,
     ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
-        let plan = crate::query_plan::friendly_search_plan(
+        self.run_graph_search_displayed_for(
+            source,
+            page_limit,
+            block_limit,
+            scope,
+            explain,
+            display,
+            crate::query_plan::FriendlyConsumer::NonInteractive,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_graph_search_displayed_for(
+        &self,
+        source: &str,
+        page_limit: usize,
+        block_limit: usize,
+        scope: Option<crate::query_plan::QueryPageScope>,
+        explain: bool,
+        display: crate::query_plan::FriendlyDisplayOptions,
+        consumer: crate::query_plan::FriendlyConsumer,
+    ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
+        let plan = crate::query_plan::friendly_search_plan_for(
             source,
             page_limit,
             block_limit,
             scope,
             display,
+            consumer,
         );
-        self.read_friendly_plan(&plan, explain, None)
+        self.read_friendly_plan(
+            &plan,
+            explain,
+            None,
+            consumer == crate::query_plan::FriendlyConsumer::CtrlK,
+        )
     }
 
     /// Interactive search lane: a newer request in the same lane cooperatively
@@ -95,6 +131,7 @@ impl Graph {
             &crate::query_plan::QueryPlan::block_search_literal(query, limit),
             false,
             Some(cancelled),
+            true,
         )
         .map(|answer| crate::query_plan::block_hits_to_groups(answer.hits))
     }
@@ -144,6 +181,30 @@ impl Graph {
         explain: bool,
         display: crate::query_plan::FriendlyDisplayOptions,
     ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
+        self.run_graph_search_latest_displayed_for(
+            lane,
+            source,
+            page_limit,
+            block_limit,
+            scope,
+            explain,
+            display,
+            crate::query_plan::FriendlyConsumer::NonInteractive,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_graph_search_latest_displayed_for(
+        &self,
+        lane: &str,
+        source: &str,
+        page_limit: usize,
+        block_limit: usize,
+        scope: Option<crate::query_plan::QueryPageScope>,
+        explain: bool,
+        display: crate::query_plan::FriendlyDisplayOptions,
+        consumer: crate::query_plan::FriendlyConsumer,
+    ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
         use std::sync::atomic::Ordering;
         let epoch = {
             let mut lanes = self.search_lanes.lock().unwrap();
@@ -153,17 +214,19 @@ impl Graph {
                 .clone()
         };
         let mine = epoch.fetch_add(1, Ordering::AcqRel) + 1;
-        let plan = crate::query_plan::friendly_search_plan(
+        let plan = crate::query_plan::friendly_search_plan_for(
             source,
             page_limit,
             block_limit,
             scope,
             display,
+            consumer,
         );
         self.read_friendly_plan(
             &plan,
             explain,
             Some(Arc::new(move || epoch.load(Ordering::Acquire) != mine)),
+            consumer == crate::query_plan::FriendlyConsumer::CtrlK,
         )
     }
 
@@ -172,6 +235,7 @@ impl Graph {
         plan: &crate::query_plan::QueryPlan,
         explain: bool,
         lane: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+        pre_ready_interactive: bool,
     ) -> Result<crate::query_plan::QueryExecution, crate::query::QueryExecutionError> {
         use crate::query::friendly::{
             friendly_without_read, read_friendly_results, FriendlyReadInputs,
@@ -179,15 +243,13 @@ impl Graph {
         if let Some(answer) = friendly_without_read(plan, explain, &lane) {
             return Ok(answer);
         }
+        let started = std::time::Instant::now();
         let answer = self.dispatch_direct_query(|request| {
             self.direct_projection_read_job(
                 request,
                 crate::direct_projection::RegistrySensitivity::Insensitive,
                 |job| {
-                    let identity = crate::query::results::ResultIdentity {
-                        session_pages: Arc::clone(&job.session_pages),
-                        all_session: false,
-                    };
+                    let identity = job.identity.clone();
                     read_friendly_results(
                         &mut job.snapshot,
                         &FriendlyReadInputs {
@@ -205,24 +267,110 @@ impl Graph {
         if lane.as_ref().is_some_and(|cancelled| cancelled()) {
             return Ok(friendly_without_read(plan, explain, &lane).unwrap());
         }
-        answer
+        // Which path answered, on the opt-in diagnostics channel: an answer
+        // the pages served while the index could not is otherwise
+        // indistinguishable from an indexed one (GH #543 Ctrl-K latency).
+        let served = |served_by: &'static str,
+                      detail: &str,
+                      answer: &Result<_, crate::query::QueryExecutionError>| {
+            #[cfg(test)]
+            LAST_FRIENDLY_SERVED_BY.with(|last| last.set(Some(served_by)));
+            crate::direct_projection::projection_diag(|| {
+                format!(
+                    "friendly search served_by={served_by}{detail} ok={} elapsed={}ms",
+                    answer.is_ok(),
+                    started.elapsed().as_millis()
+                )
+            });
+        };
+        match answer {
+            Ok(answer) => {
+                let answer = Ok(answer);
+                served("index", "", &answer);
+                answer
+            }
+            Err(crate::query::QueryExecutionError::Cancelled) => {
+                Err(crate::query::QueryExecutionError::Cancelled)
+            }
+            Err(error) if !pre_ready_interactive => Err(error),
+            Err(
+                error @ (crate::query::QueryExecutionError::NotReady(_)
+                | crate::query::QueryExecutionError::Unavailable(
+                    crate::query::QueryUnavailableReason::ProjectionUnavailable
+                    | crate::query::QueryUnavailableReason::ReadFailed
+                    | crate::query::QueryUnavailableReason::IndexFailed(_),
+                )),
+            ) => {
+                let reason = format!(" because={error:?}");
+                let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+                let cancelled = || lane.as_ref().is_some_and(|cancelled| cancelled());
+                let answer = self
+                    .with_captured_pages(|pages| {
+                        crate::query_plan::pre_ready_interactive_snapshot(
+                            plan,
+                            pages,
+                            || self.pre_ready_inventory(pages, generation, &cancelled),
+                            explain,
+                            &cancelled,
+                        )
+                    })
+                    .ok_or(error);
+                served("pages", &reason, &answer);
+                answer
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The page side of a pre-ready search over `pages`, reused while the
+    /// cache generation stands: rebuilding it per keystroke cost ~105 ms at
+    /// 10k pages. `generation` is read before `pages` was captured; a
+    /// generation that moved since then may not match `pages`, so that
+    /// inventory is built fresh and not kept.
+    fn pre_ready_inventory(
+        &self,
+        pages: &[(PageEntry, Arc<crate::doc::Document>)],
+        generation: u64,
+        cancelled: &impl Fn() -> bool,
+    ) -> Option<Arc<crate::query_plan::PreReadyPageInventory>> {
+        let current = || self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation;
+        if current() {
+            if let Some((cached, inventory)) = self.pre_ready_inventory.lock().unwrap().as_ref() {
+                if *cached == generation {
+                    return Some(Arc::clone(inventory));
+                }
+            }
+        }
+        let inventory = Arc::new(crate::query_plan::pre_ready_page_inventory(
+            pages, cancelled,
+        )?);
+        if current() {
+            *self.pre_ready_inventory.lock().unwrap() = Some((generation, Arc::clone(&inventory)));
+        }
+        Some(inventory)
     }
 
     /// Fuzzy page-name matches for the quick switcher.
     pub fn quick_switch(&self, query: &str, limit: usize) -> Vec<PageEntry> {
-        crate::query_plan::legacy_page_search_entries(
-            self.list_pages(),
-            self.page_aliases_with_owners(),
-            self.referenced_page_names(),
-            query,
-            limit,
-        )
+        let plan = crate::query_plan::QueryPlan::page_name_fuzzy(query, limit);
+        self.read_friendly_plan(&plan, false, None, false)
+            .map(|answer| crate::query_plan::page_hits_to_entries(answer.hits))
+            .unwrap_or_else(|_| {
+                crate::query_plan::pre_ready_page_search_entries(
+                    self.list_pages(),
+                    self.page_aliases_with_owners(),
+                    self.referenced_page_names(),
+                    query,
+                    limit,
+                )
+            })
     }
 
     /// All `template:: <name>` templates across the graph, with the blocks to
     /// insert (ids and template properties stripped).
     pub fn templates(&self) -> Vec<TemplateDto> {
-        crate::query::templates(self)
+        // Its blocks are inserted into a page: never the unchecked image.
+        self.exact_read(|| crate::query::templates(self))
     }
 
     /// Resolve a `((uuid))` block reference to its shallow identity row.
@@ -269,15 +417,14 @@ impl Graph {
         max_values: usize,
         max_bytes: usize,
     ) -> (Vec<(String, Vec<String>)>, bool) {
-        if self.direct_projection_ready() {
-            if let Some(result) =
-                self.direct_projection_property_facets(false, max_values, max_bytes)
-            {
-                return result;
-            }
-        }
+        let fallback = match self.indexed_or_fallback(|| {
+            self.direct_projection_property_facets(false, max_values, max_bytes)
+        }) {
+            Ok(result) => return result,
+            Err(fallback) => fallback,
+        };
         self.direct_projection_note_fallback_read();
-        crate::query::property_facets_bounded(self, max_values, max_bytes)
+        crate::query::property_facets_bounded_over(self, fallback, max_values, max_bytes)
     }
 
     pub fn autocomplete_property_facets_bounded(
@@ -285,14 +432,16 @@ impl Graph {
         max_items: usize,
         max_bytes: usize,
     ) -> (Vec<(String, Vec<String>)>, bool) {
-        if self.direct_projection_ready() {
-            if let Some(result) = self.direct_projection_property_facets(true, max_items, max_bytes)
-            {
-                return result;
-            }
-        }
+        let fallback = match self.indexed_or_fallback(|| {
+            self.direct_projection_property_facets(true, max_items, max_bytes)
+        }) {
+            Ok(result) => return result,
+            Err(fallback) => fallback,
+        };
         self.direct_projection_note_fallback_read();
-        crate::query::autocomplete_property_facets_bounded(self, max_items, max_bytes)
+        crate::query::autocomplete_property_facets_bounded_over(
+            self, fallback, max_items, max_bytes,
+        )
     }
 
     // ---- Assets & PDF highlights ----

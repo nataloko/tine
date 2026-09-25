@@ -9,6 +9,14 @@
 // than at module scope, so the store↔persistence import cycle resolves cleanly.
 // `persistence.storeSurface.test.ts` pins that import list: it is the coupling
 // this split exists to bound, so it may not grow unnoticed.
+//
+// The list grew once more for `adoptFoldedPageHeader` (GH #546). A save is the
+// only event that knows which bytes actually became the file, and the page
+// header the projection folded out of the first bullet exists only in those
+// bytes. Until the store is told, it keeps proposing a page shape that
+// contradicts the file it just wrote, and the disk firewall refuses the next
+// save mid-edit. So this is still "WHEN and HOW an edit reaches disk" telling
+// the tree what reached it — not persistence reaching into the doc tree.
 
 import {
   doc,
@@ -18,6 +26,7 @@ import {
   setProspectiveTarget,
   pageByName,
   pageInstanceGeneration,
+  adoptFoldedPageHeader,
   pageToDto,
   setEditorActivation,
   sweepReplaceable,
@@ -30,16 +39,17 @@ import {
   clearConflict,
   isConflicted,
   conflicts,
-  conflictObjectFor,
   bumpDataRev,
   bumpPageInventoryRev,
   pushToast,
+  dismissToast,
   registerLiveSaveConflict,
   refreshLiveSaveConflictDraft,
 } from "./ui";
 import type { ClipboardSourcePage } from "./clipboard";
 import { measureIssue248, measureIssue248Async } from "./issue248Probe";
 import { recordClipboardAcceptedSaveForTest } from "./clipboardWorkProbe";
+import { openUnsavedRecovery } from "./unsavedRecovery";
 
 // ---------------------------------------------------------------------------
 // Guard state (owned here; mutated only through the accessors below)
@@ -73,6 +83,11 @@ let graphBindingRev = 0;
 // concurrently) and each runs against the LATEST store state.
 const saveChain = new Map<string, Promise<boolean>>();
 const transientFailures = new Map<string, number>();
+// The one sticky toast per page that a no-retry refusal raised. Every later
+// edit re-runs the save and meets the same refusal, so it is deduplicated
+// rather than stacked, and it goes away once the page saves or leaves the
+// working set (GH #535).
+const refusedSaveToasts = new Map<string, { id: number; message: string }>();
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 // When the current run of edits first went dirty, so the debounce below can be
@@ -477,6 +492,8 @@ export function resetSaveState() {
   heldPageSaves.clear();
   heldSaveIntents.clear();
   transientFailures.clear();
+  for (const { id } of refusedSaveToasts.values()) dismissToast(id);
+  refusedSaveToasts.clear();
   for (const timer of retryTimers.values()) clearTimeout(timer);
   retryTimers.clear();
 }
@@ -497,6 +514,9 @@ function scheduleDataRev() {
 
 function clearTransientRetry(name: string) {
   transientFailures.delete(name);
+  const refused = refusedSaveToasts.get(name);
+  if (refused !== undefined) dismissToast(refused.id);
+  refusedSaveToasts.delete(name);
   const timer = retryTimers.get(name);
   if (timer) clearTimeout(timer);
   retryTimers.delete(name);
@@ -519,6 +539,9 @@ export function isRetryableSaveFailure(error: unknown): boolean {
     "precheck.limit",
     "identity.owned_elsewhere",
     "identity.name_taken",
+    // The data-preservation firewall judged the draft's CONTENT; resending the
+    // same draft is refused again (GH #535, GH #546).
+    "refused.data_preservation",
   ].some((nonRetryable) => code === nonRetryable);
 }
 
@@ -572,7 +595,21 @@ export function isSaveConflictFailure(error: unknown): boolean {
 function scheduleTransientRetry(name: string, token: number, error: unknown) {
   if (!isRetryableSaveFailure(error)) {
     transientFailures.delete(name);
-    pushToast(`Couldn't save “${name}”. (${String(error)})`, "error");
+    // The page stays dirty, so the edits live on in this window, but no retry
+    // will ever write them. Say so once, keep saying it until it stops being
+    // true, and give the way to the draft (Copy draft / Open page) instead of
+    // a transient toast per keystroke that leaves the page silently stuck.
+    const message = saveFailureCode(error) === "refused.data_preservation"
+      ? `Tine did not save “${name}”, to protect what is already in its file. Your edits are kept in this window only. (${String(error)})`
+      : `Couldn't save “${name}”. Your edits are kept in this window only. (${String(error)})`;
+    const prior = refusedSaveToasts.get(name);
+    if (prior !== undefined && prior.message !== message) dismissToast(prior.id);
+    const id = pushToast(message, "error", {
+      sticky: true,
+      dedupe: true,
+      action: { label: "Review unsaved", run: openUnsavedRecovery },
+    });
+    refusedSaveToasts.set(name, { id, message });
     return;
   }
   const failures = (transientFailures.get(name) ?? 0) + 1;
@@ -956,6 +993,11 @@ async function doSave(
       if (baseline === null) bumpPageInventoryRev();
       savedSinceDrain.add(name); // record for the git commit-message composer (read-only)
     }
+    // These bytes are now the file. If they carry a page header the projection
+    // folded out of the first bullet, the store must stop presenting it as an
+    // ordinary root, or its next proposal contradicts the file it just wrote
+    // and the disk firewall refuses the save mid-edit (GH #546).
+    if (dto.pre_block) adoptFoldedPageHeader(name, dto.pre_block);
     // The favorites arrangement lives in an ordinary page, so editing it in
     // Tine's own editor is how a keyboard user reorders favorites. The sidebar
     // has to follow that edit, and this is the one place every in-app page save
@@ -1209,8 +1251,9 @@ export async function flushAll(): Promise<boolean> {
     && conflicts().length === 0;
 }
 
-/** Explain a refused rename flush using the state that actually blocked it.
- * The guard remains graph-wide because rename reloads every mounted page. */
+/** Explain why a MERGE could not start: it still resets the whole working set,
+ *  so every page must be saved first. (A plain rename no longer needs that;
+ *  see `prepareRename`, GH #535.) */
 export function renameFlushFailureMessage(): string {
   const quoted = (names: readonly string[]) => {
     const shown = names.slice(0, 3).map((name) => `“${name}”`).join(", ");
@@ -1218,17 +1261,13 @@ export function renameFlushFailureMessage(): string {
   };
   const conflicted = conflicts();
   if (conflicted.length) {
-    const missingReview = conflicted.filter((name) => !conflictObjectFor(pageByName(name)?.path, name));
-    if (missingReview.length) {
-      return `Couldn't rename: saves are blocked for ${quoted(missingReview)}, but no conflict review is available. Check the save error or debug log before retrying. Your pending edits are still here.`;
-    }
-    return `Couldn't rename: ${quoted(conflicted)} ${conflicted.length === 1 ? "has an unresolved save conflict" : "have unresolved save conflicts"}. Open ${conflicted.length === 1 ? "that page" : "those pages"} and resolve ${conflicted.length === 1 ? "it" : "them"} before renaming. Your pending edits are still here.`;
+    return `Couldn't merge: ${quoted(conflicted)} ${conflicted.length === 1 ? "has an unresolved save conflict" : "have unresolved save conflicts"}. Open ${conflicted.length === 1 ? "that page" : "those pages"} and resolve ${conflicted.length === 1 ? "it" : "them"} before merging. Your pending edits are still here.`;
   }
   const pending = [...new Set([...dirty, ...saveChain.keys()])];
   if (pending.length) {
-    return `Couldn't save pending edits in ${quoted(pending)} before renaming. Check the save error for ${pending.length === 1 ? "that page" : "those pages"}, then try again. Your pending edits are still here.`;
+    return `Couldn't save pending edits in ${quoted(pending)} before merging. Check the save error for ${pending.length === 1 ? "that page" : "those pages"}, then try again. Your pending edits are still here.`;
   }
-  return "Couldn't finish pending saves before renaming. Check the save error, then try again. Your pending edits are still here.";
+  return "Couldn't finish pending saves before merging. Check the save error, then try again. Your pending edits are still here.";
 }
 
 /** Resolve a save conflict by overwriting the on-disk file with the in-memory

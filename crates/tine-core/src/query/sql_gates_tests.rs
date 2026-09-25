@@ -96,7 +96,6 @@ impl Corpus {
 
     pub(crate) fn open(root: PathBuf, owns_root: bool) -> Corpus {
         let graph = Graph::open(&root);
-        graph.warm_cache();
         let projection_dir = std::env::temp_dir().join(format!(
             "tine-query-sql-projection-{}",
             root.file_name()
@@ -108,6 +107,7 @@ impl Corpus {
         graph
             .attach_direct_projection(path.clone())
             .expect("the projection worker starts");
+        graph.warm_cache();
         let started = Instant::now();
         while !graph.direct_projection_ready_test() {
             assert!(
@@ -202,33 +202,14 @@ impl Corpus {
         names
     }
 
-    /// The EXISTING FTS-building signal, read on the SAME materialized read as
-    /// the query and separately from projection readiness (§5.10). A freshly
-    /// created projection is published `phase = 1` and maintains its FTS rows
-    /// inline; `phase = 0` is the transient building state, where the change
-    /// rows go to `search_fts_outbox` and the FTS tables stay empty.
-    pub(crate) fn fts_ready(&self) -> bool {
-        let rows = self
-            .reader
-            .run_projection_query(
-                "SELECT phase FROM search_fts_build WHERE singleton = 1",
-                &[],
-            )
-            .expect("the FTS build marker is readable through the seam");
-        matches!(
-            rows.first().and_then(|row| row.first()),
-            Some(PhysicalQueryValue::Integer(1))
-        )
-    }
-
-    /// How many block rows the substring FTS holds. A ready path that measured
+    /// How many rows the unified trigram FTS holds. An indexed path that measured
     /// an EMPTY index would prove nothing, so the gates assert this is nonzero
     /// before trusting a candidate bound.
-    fn substring_fts_rows(&self) -> i64 {
+    pub(crate) fn trigram_fts_rows(&self) -> i64 {
         let rows = self
             .reader
-            .run_projection_query("SELECT COUNT(*) FROM search_substring_fts", &[])
-            .expect("the substring FTS is readable through the seam");
+            .run_projection_query("SELECT COUNT(*) FROM search_fts", &[])
+            .expect("the trigram FTS is readable through the seam");
         match rows.first().and_then(|row| row.first()) {
             Some(PhysicalQueryValue::Integer(count)) => *count,
             other => panic!("COUNT(*) is an integer, got {other:?}"),
@@ -245,10 +226,11 @@ impl Corpus {
         let rows = self
             .reader
             .run_projection_query(
-                "SELECT b.block_id FROM blocks b \
+                "SELECT b.result_id FROM blocks b \
                  JOIN pages p ON p.page_id = b.page_id \
+                 JOIN names pn ON pn.name_id = p.name_id \
                  JOIN block_text t ON t.block_id = b.block_id \
-                 WHERE p.name = ?1 AND instr(t.content, ?2) > 0",
+                 WHERE pn.raw = ?1 AND instr(t.content, ?2) > 0",
                 &[
                     PhysicalQueryValue::Text(page.to_string()),
                     PhysicalQueryValue::Text(needle.to_string()),
@@ -261,9 +243,7 @@ impl Corpus {
             "{page}/{needle:?} must name exactly one fixture block"
         );
         match rows[0].first() {
-            Some(PhysicalQueryValue::Blob(id)) => Uuid::from_slice(id)
-                .expect("a 16-byte block id")
-                .to_string(),
+            Some(PhysicalQueryValue::Text(id)) => id.clone(),
             other => panic!("a block row selects its id, got {other:?}"),
         }
     }
@@ -273,16 +253,14 @@ impl Corpus {
         let rows = self
             .reader
             .run_projection_query(
-                "SELECT b.block_id FROM blocks b JOIN pages p ON p.page_id = b.page_id \
-                 WHERE p.name = ?1",
+                "SELECT b.result_id FROM blocks b JOIN pages p ON p.page_id = b.page_id \
+                 JOIN names pn ON pn.name_id = p.name_id WHERE pn.raw = ?1",
                 &[PhysicalQueryValue::Text(name.to_string())],
             )
             .expect("the page's blocks are readable through the seam");
         rows.into_iter()
             .map(|row| match row.first() {
-                Some(PhysicalQueryValue::Blob(id)) => Uuid::from_slice(id)
-                    .expect("a 16-byte block id")
-                    .to_string(),
+                Some(PhysicalQueryValue::Text(id)) => id.clone(),
                 other => panic!("a block row selects its id, got {other:?}"),
             })
             .collect()
@@ -290,13 +268,8 @@ impl Corpus {
 
     /// One lowered statement, with the SAME shared Match parse the walk builds
     /// for this execution (§5.10) — never a second `Matcher::parse`.
-    pub(crate) fn lower(
-        &self,
-        source: &str,
-        dialect: QueryDialect,
-        fts_ready: bool,
-    ) -> (Anchor, SqlQuery) {
-        self.lower_as(source, dialect, fts_ready, RESULT_SET_RULE, RELATION_RULE)
+    pub(crate) fn lower(&self, source: &str, dialect: QueryDialect) -> (Anchor, SqlQuery) {
+        self.lower_as(source, dialect, RESULT_SET_RULE, RELATION_RULE)
     }
 
     /// The same lowering under one named spelling of §5.3's result-set rule and
@@ -306,7 +279,6 @@ impl Corpus {
         &self,
         source: &str,
         dialect: QueryDialect,
-        fts_ready: bool,
         result_set_rule: ResultSetRule,
         relation_rule: RelationRule,
     ) -> (Anchor, SqlQuery) {
@@ -319,7 +291,6 @@ impl Corpus {
             registry: &registry,
             cutoff: None,
             compiled: &compiled,
-            fts_ready,
             result_set_rule,
             relation_rule,
         };
@@ -338,13 +309,15 @@ impl Corpus {
             .expect("the regex predicate installs on the read-only seam");
     }
 
-    /// The lowering's answer over the same graph, through the D-15 seam.
-    fn sql(&self, source: &str, dialect: QueryDialect) -> BTreeSet<String> {
-        self.sql_with(source, dialect, self.fts_ready())
+    fn bind_ranks(&self, ranks: &crate::query::rank::QueryRankPrograms) {
+        self.reader
+            .set_query_rank_function(ranks.uncancelled_function())
+            .expect("the rank function installs on the read-only seam");
     }
 
-    fn sql_with(&self, source: &str, dialect: QueryDialect, fts_ready: bool) -> BTreeSet<String> {
-        self.sql_as(source, dialect, fts_ready, RESULT_SET_RULE, RELATION_RULE)
+    /// The lowering's answer over the same graph, through the D-15 seam.
+    fn sql(&self, source: &str, dialect: QueryDialect) -> BTreeSet<String> {
+        self.sql_as(source, dialect, RESULT_SET_RULE, RELATION_RULE)
     }
 
     /// The SQL page answer with multiplicity preserved. This is intentionally
@@ -370,12 +343,12 @@ impl Corpus {
             registry: &registry,
             cutoff: None,
             compiled: &compiled,
-            fts_ready: self.fts_ready(),
             result_set_rule: RESULT_SET_RULE,
             relation_rule: RELATION_RULE,
         };
         let statement = lower_query(query, &inputs);
         self.bind_regexes(&statement.regexes);
+        self.bind_ranks(&statement.ranks);
         let rows = self
             .reader
             .run_projection_query(&statement.sql, &statement.params)
@@ -397,13 +370,12 @@ impl Corpus {
         &self,
         source: &str,
         dialect: QueryDialect,
-        fts_ready: bool,
         result_set_rule: ResultSetRule,
         relation_rule: RelationRule,
     ) -> BTreeSet<String> {
-        let (anchor, statement) =
-            self.lower_as(source, dialect, fts_ready, result_set_rule, relation_rule);
+        let (anchor, statement) = self.lower_as(source, dialect, result_set_rule, relation_rule);
         self.bind_regexes(&statement.regexes);
+        self.bind_ranks(&statement.ranks);
         let rows = self
             .reader
             .run_projection_query(&statement.sql, &statement.params)
@@ -412,9 +384,16 @@ impl Corpus {
             });
         rows.into_iter()
             .map(|row| match (anchor, row.first()) {
-                (Anchor::Block, Some(PhysicalQueryValue::Blob(id))) => Uuid::from_slice(id)
-                    .expect("a 16-byte block id")
-                    .to_string(),
+                (Anchor::Block, Some(PhysicalQueryValue::Integer(id))) => {
+                    let resolved = self.reader.run_projection_query(
+                        "SELECT result_id FROM blocks WHERE block_id = ?1",
+                        &[PhysicalQueryValue::Integer(*id)],
+                    ).expect("a selected private block coordinate resolves");
+                    match resolved.first().and_then(|row| row.first()) {
+                        Some(PhysicalQueryValue::Text(id)) => id.clone(),
+                        other => panic!("a private block coordinate resolves to its public result id, got {other:?}"),
+                    }
+                }
                 (Anchor::Page, _) => match row.get(1) {
                     Some(PhysicalQueryValue::Text(name)) => crate::refs::page_key(name),
                     other => panic!("a page row selects its name, got {other:?}"),
@@ -447,7 +426,6 @@ impl Corpus {
             registry: &registry,
             cutoff: None,
             compiled: &compiled,
-            fts_ready: self.fts_ready(),
             result_set_rule: RESULT_SET_RULE,
             relation_rule: RELATION_RULE,
         };
@@ -457,8 +435,9 @@ impl Corpus {
 
     /// `(plan, positively_bounded, matches_nothing)`.
     fn explain(&self, source: &str, dialect: QueryDialect) -> (Vec<String>, bool, bool) {
-        let (_anchor, statement) = self.lower(source, dialect, self.fts_ready());
+        let (_anchor, statement) = self.lower(source, dialect);
         self.bind_regexes(&statement.regexes);
+        self.bind_ranks(&statement.ranks);
         // The parameters are bound for the EXPLAIN too: with `sqlite_stat4`
         // present the planner may choose differently for a bound value than for
         // an unbound one, and an explain that left them out would measure a
@@ -543,8 +522,8 @@ pub(crate) fn write_fast_corpus(root: &Path) {
     )
     .expect("Proj/Alpha/Deep");
 
-    // Content: repeated whitespace and a line break, which `searchable_text`
-    // collapses and `query_visible` does not.
+    // Content: repeated whitespace, retained by both the exact projection and
+    // the scalar-trigram candidate payload.
     std::fs::write(
         root.join("pages/content.md"),
         "- alpha  beta\n- alpha beta\n- ALPHA BETA gamma\n- 100% literal_underscore\n",
@@ -558,10 +537,9 @@ pub(crate) fn write_fast_corpus(root: &Path) {
     // * `foobar` must be found by `foo` (a trigram), by `oob` (a trigram that
     //   crosses no token boundary the word tokenizer would respect) and by `oo`
     //   (no trigram at all, so no bound and the exact predicate alone);
-    // * three consecutive spaces and a mid-line tab survive in
-    //   `query_visible_folded` and do NOT survive the FTS producers' whitespace
-    //   collapsing, so a phrase term must be matched exactly and bounded by a
-    //   whitespace-free RUN of itself;
+    // * three consecutive spaces and a mid-line tab survive in exact visible
+    //   text; candidate membership remains only a superset and exact matching
+    //   decides the result;
     // * punctuation, an embedded double quote and an embedded control character
     //   must not turn a candidate needle into FTS query syntax or drop it;
     // * the precomposed and decomposed spellings of `Café` are the same string
@@ -633,11 +611,8 @@ pub(crate) fn write_fast_corpus(root: &Path) {
     .expect("nested refs page");
 
     // §4.3.2's regex predicate, over the EXACT visible text. Every line here
-    // exists to separate `block_text.query_visible` from the two columns beside
-    // it: `blocks.query_visible_folded` is lower-cased and NFC-folded, and
-    // `searchable_text` collapses runs of whitespace and line breaks. A regex
-    // answered from either of those would disagree with the walk, which reads
-    // `BlockProjection::visible`.
+    // exists to separate raw authored text and its folded trigram payload from
+    // the exact `BlockProjection::visible` text the verifier reconstructs.
     std::fs::write(
         root.join("pages/regex.md"),
         "- SHOUTING case survives here\n\
@@ -660,6 +635,36 @@ pub(crate) fn write_fast_corpus(root: &Path) {
     .expect("journal");
     std::fs::write(root.join("journals/not_a_date.md"), "- an unparsed stem\n")
         .expect("odd journal");
+}
+
+/// Ordinary nonmatching rows used only by plan-shape gates. The shared semantic
+/// corpus stays tiny and unchanged, while these gates retain the same optimized
+/// statistics production uses and make every named positive anchor selective.
+fn write_selective_plan_background(root: &Path) {
+    for page in 0..256 {
+        let mut body = String::new();
+        for block in 0..8 {
+            body.push_str(&format!(
+                "- neutral qzxv background {page:03} row {block:02}\n"
+            ));
+        }
+        std::fs::write(
+            root.join("pages").join(format!("neutral-{page:03}.md")),
+            body,
+        )
+        .expect("selective plan background page");
+    }
+}
+
+fn assert_selective_plan_background(corpus: &Corpus) {
+    assert!(
+        corpus.graph.list_pages().len() >= 256,
+        "the optimized plan fixture must contain the nonmatching page background"
+    );
+    assert!(
+        corpus.trigram_fts_rows() >= 2_048,
+        "the optimized plan fixture must contain the nonmatching block background"
+    );
 }
 
 /// The focused page-`blocks` corpus. It separates root/deep matches, Markdown
@@ -1252,6 +1257,65 @@ fn the_walk_and_the_lowering_answer_every_shape_identically() {
     );
 }
 
+#[test]
+fn page_like_identity_patterns_agree_between_walk_and_lowering() {
+    let _serial = serialize();
+    let root = scratch("page-like-identity-patterns");
+    std::fs::create_dir_all(root.join("pages")).expect("pages");
+    std::fs::create_dir_all(root.join("journals")).expect("journals");
+    for (file, body) in [
+        ("Cafe.md", "- ascii\n"),
+        ("Café.md", "- accent\n"),
+        ("Ｃａｆｅ.md", "- fullwidth\n"),
+        ("100%25 Real.md", "- escaped percent\n"),
+        ("under_score.md", "- escaped underscore\n"),
+    ] {
+        std::fs::write(root.join("pages").join(file), body).expect("page");
+    }
+    let corpus = Corpus::open(root, true);
+    let cases: &[(&str, &[&str])] = &[
+        ("@page and name like 'cafe'", &["cafe"]),
+        ("@page and name like 'caf_'", &["cafe", "café"]),
+        ("@page and name like 'ｃａｆｅ'", &["ｃａｆｅ"]),
+        ("@page and name like '100\\%%'", &["100% real"]),
+        ("@page and name like 'under\\_score'", &["under_score"]),
+        ("@page and name like '/cafe/'", &[]),
+        ("@page and name like ' cafe '", &[]),
+    ];
+
+    for (source, expected) in cases {
+        let walk = corpus.walk_page_names(source);
+        let sql = corpus.sql_page_names(source);
+        assert_eq!(walk, sql, "walk/lowering parity: {source}");
+        assert_eq!(walk, *expected, "identity-pattern semantics: {source}");
+    }
+}
+
+#[test]
+fn a6_erased_match_terms_agree_between_walk_and_lowering() {
+    let _serial = serialize();
+    let root = scratch("a6-erased-match");
+    write_fast_corpus(&root);
+    let corpus = Corpus::open(root, true);
+    let mark = "\u{301}";
+    for source in [
+        format!("content match '{mark}'"),
+        format!("not content match '{mark}'"),
+        format!("content match '{mark} alpha'"),
+        format!("content match '{mark} OR alpha'"),
+        format!("content match 'alpha -{mark}'"),
+    ] {
+        assert_eq!(
+            corpus.walk(&source, QueryDialect::Tql),
+            corpus.sql(&source, QueryDialect::Tql),
+            "{source}"
+        );
+    }
+    assert!(corpus
+        .sql(&format!("content match '{mark}'"), QueryDialect::Tql)
+        .is_empty());
+}
+
 /// The same gate over the anonymized graph (AGENTS §4 tier 2). A disagreement
 /// here is a CORPUS DEFECT in the fixture above: extract the minimal shape into
 /// `write_fast_corpus`, never weaken the gate. Only shape sources and counts are
@@ -1403,7 +1467,7 @@ pub(crate) const CONTENT_PLAN_SHAPES: &[(&str, QueryDialect, ContentPlan)] = &[
     (
         "content match '\"   \"'",
         QueryDialect::Tql,
-        ContentPlan::ShortUnindexable,
+        ContentPlan::Fts,
     ),
     // One unbounded OR arm unbounds the leaf; the other arm keeps its bound.
     (
@@ -1476,10 +1540,9 @@ const CONTENT_SHAPES: &[(&str, QueryDialect)] = &[
 ];
 
 /// §5.10's central safety rule, made falsifiable: **a candidate bound may only
-/// ever over-approximate.** The two lowerings of the SAME shape — one with the
-/// trigram bound, one without — must select exactly the same rows, and both
-/// must equal the walk. A bound that excluded one true match shows up here as a
-/// difference, not as a slightly faster answer.
+/// ever over-approximate.** The indexed lowering and the exhaustive walk must
+/// select exactly the same rows. A bound that excluded one true match shows up
+/// here as a difference, not as a slightly faster answer.
 ///
 /// This is the test that makes `foobar` findable by `foo`, `oob` AND `oo`, and
 /// it is why `search_fts`'s word-token matches are not substituted for
@@ -1490,30 +1553,16 @@ fn the_fts_candidate_bound_never_excludes_a_true_match() {
     let root = scratch("candidate-superset");
     write_fast_corpus(&root);
     let corpus = Corpus::open(root, true);
-    // A ready path measured against an EMPTY index would prove nothing.
+    // An indexed path measured against an EMPTY index would prove nothing.
     assert!(
-        corpus.fts_ready(),
-        "the fixture projection must publish a READY FTS index"
-    );
-    assert!(
-        corpus.substring_fts_rows() > 0,
+        corpus.trigram_fts_rows() > 0,
         "the substring FTS must actually hold rows, or the bound is vacuous"
     );
     let mut differences = Vec::new();
     let mut bounded_shapes = 0usize;
     for (source, dialect) in CONTENT_SHAPES {
-        let bounded = corpus.sql_with(source, *dialect, true);
-        let exact = corpus.sql_with(source, *dialect, false);
+        let bounded = corpus.sql(source, *dialect);
         let walk = corpus.walk(source, *dialect);
-        if bounded != exact {
-            differences.push(format!(
-                "{source}: the candidate bound changed the answer — bounded={} exact={} \
-                 only_in_exact={}",
-                bounded.len(),
-                exact.len(),
-                exact.difference(&bounded).count()
-            ));
-        }
         if walk != bounded {
             differences.push(format!(
                 "{source}: walk={} sql={} only_in_walk={}",
@@ -1522,8 +1571,8 @@ fn the_fts_candidate_bound_never_excludes_a_true_match() {
                 walk.difference(&bounded).count()
             ));
         }
-        let (_anchor, statement) = corpus.lower(source, *dialect, true);
-        if statement.sql.contains("search_substring_fts") {
+        let (_anchor, statement) = corpus.lower(source, *dialect);
+        if statement.sql.contains("search_fts MATCH") {
             bounded_shapes += 1;
         }
     }
@@ -1541,48 +1590,9 @@ fn the_fts_candidate_bound_never_excludes_a_true_match() {
     );
 }
 
-/// The transient `fts-building` class (§5.10): with the index still building,
-/// the SAME exact predicates run on the ready block columns. Not empty results,
-/// not an error, not a new walk route — and the statement never names an FTS
-/// table, so a deliberately EMPTY building index cannot change the answer.
-/// Nothing here requests a rebuild or waits for one (I-13).
-#[test]
-fn a_building_fts_index_answers_every_content_shape_from_the_ready_columns() {
-    let _serial = serialize();
-    let root = scratch("fts-building");
-    write_fast_corpus(&root);
-    let corpus = Corpus::open(root, true);
-    let mut differences = Vec::new();
-    for (source, dialect) in CONTENT_SHAPES {
-        let (_anchor, statement) = corpus.lower(source, *dialect, false);
-        if statement.sql.contains("search_substring_fts")
-            || statement.sql.contains("search_fts_owners")
-            || statement.sql.contains("MATCH ")
-        {
-            differences.push(format!("{source}: the building path still asks the index"));
-            continue;
-        }
-        let sql = corpus.sql_with(source, *dialect, false);
-        let walk = corpus.walk(source, *dialect);
-        if walk != sql {
-            differences.push(format!(
-                "{source}: walk={} sql={} only_in_walk={}",
-                walk.len(),
-                sql.len(),
-                walk.difference(&sql).count()
-            ));
-        }
-    }
-    assert!(
-        differences.is_empty(),
-        "the building path does not answer from the ready columns:\n{}",
-        differences.join("\n")
-    );
-}
-
-/// The same two §5.10 comparisons over the anonymized graph (AGENTS §4 tier 2):
-/// walk vs SQL with the FTS index READY, and walk vs SQL with the index
-/// BUILDING. A disagreement here is a CORPUS DEFECT in `write_fast_corpus` —
+/// The same §5.10 indexed-SQL versus exhaustive-walk comparison over the
+/// anonymized graph (AGENTS §4 tier 2). A disagreement here is a CORPUS DEFECT
+/// in `write_fast_corpus` —
 /// extract the minimal shape into the fixture, never weaken the gate. Only
 /// shape sources and counts are printed; no page name, block text or property
 /// value leaves the corpus.
@@ -1595,33 +1605,26 @@ fn the_content_operators_agree_with_the_walk_over_a_real_corpus() {
         return;
     };
     let corpus = Corpus::open(PathBuf::from(&root), false);
-    assert!(
-        corpus.fts_ready(),
-        "the real corpus must publish a READY FTS"
-    );
-    let fts_rows = corpus.substring_fts_rows();
+    let fts_rows = corpus.trigram_fts_rows();
     assert!(fts_rows > 0, "the real corpus substring FTS is empty");
     let mut differences = Vec::new();
     let mut bounded = 0usize;
     let mut rows = 0usize;
     let mut classes = std::collections::BTreeMap::<String, usize>::new();
     for (source, dialect) in CONTENT_SHAPES {
-        let ready = corpus.sql_with(source, *dialect, true);
-        let building = corpus.sql_with(source, *dialect, false);
+        let indexed = corpus.sql(source, *dialect);
         let walk = corpus.walk(source, *dialect);
-        rows += ready.len();
-        for (label, answer) in [("ready", &ready), ("building", &building)] {
-            if &walk != answer {
-                differences.push(format!(
-                    "{source} [{label}]: walk={} sql={} only_in_walk={} only_in_sql={}",
-                    walk.len(),
-                    answer.len(),
-                    walk.difference(answer).count(),
-                    answer.difference(&walk).count()
-                ));
-            }
+        rows += indexed.len();
+        if walk != indexed {
+            differences.push(format!(
+                "{source}: walk={} sql={} only_in_walk={} only_in_sql={}",
+                walk.len(),
+                indexed.len(),
+                walk.difference(&indexed).count(),
+                indexed.difference(&walk).count()
+            ));
         }
-        let (_anchor, statement) = corpus.lower(source, *dialect, true);
+        let (_anchor, statement) = corpus.lower(source, *dialect);
         if statement.positively_bounded {
             bounded += 1;
         }
@@ -1631,7 +1634,7 @@ fn the_content_operators_agree_with_the_walk_over_a_real_corpus() {
     }
     eprintln!(
         "content_identity_over_a_real_corpus shapes={} bounded={bounded} matched_rows={rows} \
-         substring_fts_rows={fts_rows} plan_classes={classes:?} disagreements={}",
+         trigram_fts_rows={fts_rows} plan_classes={classes:?} disagreements={}",
         CONTENT_SHAPES.len(),
         differences.len()
     );
@@ -1643,10 +1646,9 @@ fn the_content_operators_agree_with_the_walk_over_a_real_corpus() {
     );
 }
 
-/// §5.10 asks for the short/unindexable, regex and transient-building plan
-/// classes to be recorded SEPARATELY from the indexed case. A gate that could
-/// not name them would have to choose between failing them and exempting every
-/// content predicate.
+/// §5.10 asks for the short/unindexable and regex plan classes to be recorded
+/// separately from the indexed case. A gate that could not name them would
+/// have to choose between failing them and exempting every content predicate.
 #[test]
 fn the_content_plan_classes_are_recorded_separately_from_the_indexed_case() {
     let _serial = serialize();
@@ -1654,23 +1656,11 @@ fn the_content_plan_classes_are_recorded_separately_from_the_indexed_case() {
     write_fast_corpus(&root);
     let corpus = Corpus::open(root, true);
     for (source, dialect, expected) in CONTENT_PLAN_SHAPES {
-        let (_anchor, statement) = corpus.lower(source, *dialect, true);
+        let (_anchor, statement) = corpus.lower(source, *dialect);
         assert_eq!(
             statement.content_plans,
             vec![*expected],
             "{source} is a {expected:?} content path"
-        );
-        // The same leaf, with the index still building, is the transient class
-        // on every shape that would otherwise reach it.
-        let (_anchor, building) = corpus.lower(source, *dialect, false);
-        let expected_building = match expected {
-            ContentPlan::Regex => ContentPlan::Regex,
-            _ => ContentPlan::FtsBuilding,
-        };
-        assert_eq!(
-            building.content_plans,
-            vec![expected_building],
-            "{source} while the index builds"
         );
     }
 }
@@ -1690,7 +1680,6 @@ fn the_two_result_set_spellings_answer_identically() {
     let root = scratch("result-set-rule");
     write_fast_corpus(&root);
     let corpus = Corpus::open(root, true);
-    let fts_ready = corpus.fts_ready();
     let mut disagreements = Vec::new();
     let mut compared = 0usize;
     const SPELLINGS: [ResultSetRule; 3] = [
@@ -1702,7 +1691,7 @@ fn the_two_result_set_spellings_answer_identically() {
         let walk = corpus.walk(source, *dialect);
         let answers: Vec<_> = SPELLINGS
             .iter()
-            .map(|rule| corpus.sql_as(source, *dialect, fts_ready, *rule, RELATION_RULE))
+            .map(|rule| corpus.sql_as(source, *dialect, *rule, RELATION_RULE))
             .collect();
         compared += 1;
         for (rule, rows) in SPELLINGS.iter().zip(&answers) {
@@ -1751,13 +1740,12 @@ fn the_two_relation_spellings_answer_identically() {
     let root = scratch("relation-rule");
     write_fast_corpus(&root);
     let corpus = Corpus::open(root, true);
-    let fts_ready = corpus.fts_ready();
     const SPELLINGS: [RelationRule; 2] = [RelationRule::Lists, RelationRule::DriverAndProbes];
     let mut disagreements = Vec::new();
     for (source, dialect) in IDENTITY_SHAPES {
         let walk = corpus.walk(source, *dialect);
         for rule in SPELLINGS {
-            let rows = corpus.sql_as(source, *dialect, fts_ready, RESULT_SET_RULE, rule);
+            let rows = corpus.sql_as(source, *dialect, RESULT_SET_RULE, rule);
             if rows != walk {
                 disagreements.push(format!(
                     "{source} under {rule:?}: walk={} sql={}",
@@ -1784,7 +1772,7 @@ fn the_two_relation_spellings_answer_identically() {
     ] {
         let walk = corpus.walk(source, dialect);
         for rule in SPELLINGS {
-            let rows = corpus.sql_as(source, dialect, fts_ready, RESULT_SET_RULE, rule);
+            let rows = corpus.sql_as(source, dialect, RESULT_SET_RULE, rule);
             if rows != walk {
                 disagreements.push(format!(
                     "{source} under {rule:?}: walk={} sql={}",
@@ -1816,12 +1804,12 @@ fn a_second_relation_condition_probes_its_index_instead_of_listing_it() {
     let _serial = serialize();
     let root = scratch("relation-plan");
     write_fast_corpus(&root);
+    write_selective_plan_background(&root);
     let corpus = Corpus::open(root, true);
-    let fts_ready = corpus.fts_ready();
+    assert_selective_plan_background(&corpus);
     let source = "(and [[Project]] (not (task DONE)))";
     let plan_for = |rule| {
-        let (_anchor, statement) =
-            corpus.lower_as(source, QueryDialect::Og, fts_ready, RESULT_SET_RULE, rule);
+        let (_anchor, statement) = corpus.lower_as(source, QueryDialect::Og, RESULT_SET_RULE, rule);
         corpus.bind_regexes(&statement.regexes);
         corpus
             .reader
@@ -1870,9 +1858,10 @@ fn a_second_relation_condition_probes_its_index_instead_of_listing_it() {
     // the driver produced, which is the whole cost claim. The index's NAME is
     // SQLite's business; `(block_id=?)` is the claim.
     assert!(
-        probes
-            .iter()
-            .any(|step| step.starts_with("SEARCH t") && step.contains("(block_id=?)")),
+        probes.iter().any(|step| {
+            step.starts_with("SEARCH t")
+                && (step.contains("(block_id=?)") || step.contains("(rowid=?)"))
+        }),
         "the correlated probe must seek the task facet by block id: {}",
         probes.join(" | ")
     );
@@ -1889,7 +1878,6 @@ fn a_second_relation_condition_probes_its_index_instead_of_listing_it() {
         corpus.sql_as(
             source,
             QueryDialect::Og,
-            fts_ready,
             RESULT_SET_RULE,
             RelationRule::Lists
         ),
@@ -1911,19 +1899,13 @@ fn a_nested_conjunction_is_part_of_the_root_conjunction() {
     let root = scratch("relation-spine");
     write_fast_corpus(&root);
     let corpus = Corpus::open(root, true);
-    let fts_ready = corpus.fts_ready();
     let flat = "(and [[Project]] (not (task DONE)))";
     // The same question with its named conjunct one level down, which is what
     // OG's grouped `and` produces.
     let nested_ir = "(and (not (task DONE)) (and [[Project]] (task TODO)))";
     let plan_for = |source: &str| {
-        let (_anchor, statement) = corpus.lower_as(
-            source,
-            QueryDialect::Og,
-            fts_ready,
-            RESULT_SET_RULE,
-            RELATION_RULE,
-        );
+        let (_anchor, statement) =
+            corpus.lower_as(source, QueryDialect::Og, RESULT_SET_RULE, RELATION_RULE);
         corpus.bind_regexes(&statement.regexes);
         corpus
             .reader
@@ -1947,7 +1929,7 @@ fn a_nested_conjunction_is_part_of_the_root_conjunction() {
         nested_plan.join(" | ")
     );
     assert_eq!(
-        corpus.sql_with(nested_ir, QueryDialect::Og, fts_ready),
+        corpus.sql(nested_ir, QueryDialect::Og),
         corpus.walk(nested_ir, QueryDialect::Og),
         "and it still answers the walk's rows"
     );
@@ -2068,18 +2050,18 @@ fn a_nested_refs_leaf_reads_the_anchor_context_and_never_a_subtraction() {
 /// §4.3.2's regex predicate, on REAL ROWS: the text it sees is the EXACT
 /// visible text, and the compiled-regex table is scoped to ONE statement.
 ///
-/// The three columns a regex could plausibly read differ on this fixture —
-/// `query_visible` keeps case, accents and whitespace runs; `query_visible_folded`
-/// lower-cases and NFC-folds; `searchable_text` collapses whitespace — so each
-/// assertion here fails for a lowering that read the wrong one.
+/// Raw authored text and the exact visible projection differ on this fixture,
+/// so the test also refuses a verifier that matches the storage payload
+/// directly instead of applying `DocBlock::preamble`.
 #[test]
 fn manager_regex_missing_payload_is_a_read_error() {
     let _serial = serialize();
     let root = scratch("missing-regex-payload");
     write_fast_corpus(&root);
     let corpus = Corpus::open(root, true);
-    let (_, statement) = corpus.lower("content regexp '.'", QueryDialect::Tql, true);
+    let (_, statement) = corpus.lower("content regexp '.'", QueryDialect::Tql);
     corpus.bind_regexes(&statement.regexes);
+    corpus.bind_ranks(&statement.ranks);
     let damage =
         rusqlite::Connection::open(corpus.projection_dir().join("projection.sqlite")).unwrap();
     damage.execute("DELETE FROM block_text", []).unwrap();
@@ -2092,26 +2074,11 @@ fn manager_regex_missing_payload_is_a_read_error() {
     );
 }
 
-/// The projection stores each block's exact visible text and its fold in
-/// adjacent columns, and `blocks.query_visible_folded` is EXACTLY
-/// `canonical_fold(block_text.query_visible)` on real rows.
-///
-/// This is a correctness precondition of ranking, not an implementation note.
-/// `read_friendly_plan`'s block rank program reads the STORED fold through
-/// `framed_pair_sql` rather than folding every candidate row, because that
-/// per-row `canonical_fold` measured 72-77% of total search time on a
-/// 605k-block graph (GH #543). If any producer wrote something else into that
-/// column, every search would silently admit the wrong blocks -- and the only
-/// thing standing behind the substitution would be a comment in
-/// `direct_projection.rs` saying the pair is written together from one
-/// `BlockProjection`.
-///
-/// `write_fast_corpus` is deliberately the fixture rather than a new one:
-/// `SHOUTING case`, `Uppercase\u{c9}clair`, the decomposed `Cafe\u{301}` and the
-/// three-space and tab runs each separate the fold from the raw spelling, which
-/// is what lets the final assertion below refuse a vacuous pass.
+/// The projection retains the raw authored bytes and physical path needed to
+/// reconstruct exact visible text. Search/index text is deliberately not an
+/// exact-text authority; all exact predicates derive through this pair.
 #[test]
-fn the_projection_stores_the_exact_fold_of_every_visible_text() {
+fn the_projection_stores_the_raw_inputs_for_exact_visible_text() {
     let _serial = serialize();
     let root = scratch("stored-fold-producer");
     write_fast_corpus(&root);
@@ -2119,8 +2086,9 @@ fn the_projection_stores_the_exact_fold_of_every_visible_text() {
     let rows = corpus
         .reader
         .run_projection_query(
-            "SELECT bt.query_visible, b.query_visible_folded \
-             FROM blocks b JOIN block_text bt ON bt.block_id = b.block_id",
+            "SELECT bt.content, p.path \
+             FROM blocks b JOIN block_text bt ON bt.block_id = b.block_id \
+             JOIN pages p ON p.page_id = b.page_id",
             &[],
         )
         .expect("the projection answers the stored-fold query");
@@ -2128,27 +2096,22 @@ fn the_projection_stores_the_exact_fold_of_every_visible_text() {
         !rows.is_empty(),
         "the fixture must project blocks for this gate to say anything at all"
     );
-    let mut differing = 0usize;
+    let mut syntax_was_projected = 0usize;
     for row in &rows {
-        let (visible, folded) = match (row.first(), row.get(1)) {
-            (Some(PhysicalQueryValue::Text(visible)), Some(PhysicalQueryValue::Text(folded))) => {
-                (visible, folded)
+        let (raw, path) = match (row.first(), row.get(1)) {
+            (Some(PhysicalQueryValue::Text(raw)), Some(PhysicalQueryValue::Text(path))) => {
+                (raw, path)
             }
             other => panic!("both columns are TEXT NOT NULL, got {other:?}"),
         };
-        assert_eq!(
-            folded,
-            &crate::search_query::canonical_fold(visible),
-            "blocks.query_visible_folded must be canonical_fold(block_text.query_visible)"
-        );
-        if folded != visible {
-            differing += 1;
+        let visible = crate::query::text::visible_from_raw_path(raw, path);
+        if visible != *raw {
+            syntax_was_projected += 1;
         }
     }
     assert!(
-        differing > 0,
-        "this fixture must hold text whose fold DIFFERS from its visible spelling, \
-         or a producer that stored the raw text would satisfy this gate vacuously"
+        syntax_was_projected > 0,
+        "the fixture must contain syntax whose authored and visible forms differ"
     );
 }
 
@@ -2184,7 +2147,7 @@ fn a_regex_predicate_reads_the_exact_visible_text_through_a_statement_scoped_tab
         BTreeSet::from([block("clair accented")])
     );
     assert!(here("content regexp 'uppercase\u{e9}clair'", QueryDialect::Tql).is_empty());
-    // …and whitespace runs, which `searchable_text` collapses.
+    // …and whitespace runs reconstructed from raw authored text.
     assert_eq!(
         here("content regexp 'spaced\\s{3}out'", QueryDialect::Tql),
         BTreeSet::from([block("spaced   out")])
@@ -2232,7 +2195,7 @@ fn a_regex_predicate_reads_the_exact_visible_text_through_a_statement_scoped_tab
     // cannot outlive its statement. Install one statement's program, then the
     // EMPTY program a regex-free statement installs, and the first statement's
     // ID no longer answers — it FAILS the read rather than matching nothing.
-    let (_anchor, statement) = corpus.lower("content regexp 'SHOUTING'", QueryDialect::Tql, true);
+    let (_anchor, statement) = corpus.lower("content regexp 'SHOUTING'", QueryDialect::Tql);
     assert_eq!(statement.regexes.bindings.len(), 1);
     corpus.bind_regexes(&statement.regexes);
     assert_eq!(
@@ -2265,7 +2228,9 @@ fn a_positively_bounded_query_searches_its_anchor_and_indexes_its_subqueries() {
     let _serial = serialize();
     let root = scratch("plan");
     write_fast_corpus(&root);
+    write_selective_plan_background(&root);
     let corpus = Corpus::open(root, true);
+    assert_selective_plan_background(&corpus);
     let (failures, vacuous) = measure_plans(&corpus);
     assert!(
         failures.is_empty(),
@@ -2494,15 +2459,13 @@ fn the_walk_and_the_lowering_are_timed_against_each_other_on_a_real_corpus() {
     const REPEATS: u32 = 5;
     eprintln!("paired_base_query_receipt corpus=real repeats={REPEATS}");
     for (source, dialect) in PLAN_SHAPES {
-        measure_shape(&corpus, source, *dialect, REPEATS, true);
+        measure_shape(&corpus, source, *dialect, REPEATS);
     }
-    // §5.10's three not-index-bounded classes are reported SEPARATELY from the
-    // indexed case, and the transient class is measured on the SAME projection
-    // rather than on a second corpus, so the two numbers are comparable.
+    // §5.10's not-index-bounded classes are reported separately from the
+    // indexed case.
     eprintln!("paired_base_content_receipt corpus=real repeats={REPEATS}");
     for (source, dialect) in CONTENT_SHAPES {
-        measure_shape(&corpus, source, *dialect, REPEATS, true);
-        measure_shape(&corpus, source, *dialect, REPEATS, false);
+        measure_shape(&corpus, source, *dialect, REPEATS);
     }
 }
 
@@ -2544,7 +2507,6 @@ fn the_two_result_set_spellings_are_timed_against_each_other_on_a_real_corpus() 
         .and_then(|value| value.parse().ok())
         .unwrap_or(51)
         .max(5);
-    let fts_ready = corpus.fts_ready();
     eprintln!("result_set_rule_decision corpus=real repeats={repeats}");
     let mut regressions = Vec::new();
     let mut decisive: Option<(u128, u128)> = None;
@@ -2553,7 +2515,6 @@ fn the_two_result_set_spellings_are_timed_against_each_other_on_a_real_corpus() 
             &corpus,
             source,
             *dialect,
-            fts_ready,
             repeats,
             ResultSetRule::CorrelatedProbe,
         ) else {
@@ -2563,7 +2524,6 @@ fn the_two_result_set_spellings_are_timed_against_each_other_on_a_real_corpus() 
             &corpus,
             source,
             *dialect,
-            fts_ready,
             repeats,
             ResultSetRule::MatchSetCte,
         ) else {
@@ -2573,7 +2533,6 @@ fn the_two_result_set_spellings_are_timed_against_each_other_on_a_real_corpus() 
             &corpus,
             source,
             *dialect,
-            fts_ready,
             repeats,
             ResultSetRule::MatchSetCteMaterialized,
         );
@@ -2643,26 +2602,19 @@ fn the_two_relation_spellings_are_timed_against_each_other_on_a_real_corpus() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(11)
         .max(3);
-    let fts_ready = corpus.fts_ready();
     eprintln!("relation_rule_decision corpus=real repeats={repeats}");
     let mut regressions = Vec::new();
     let mut improvements = 0usize;
     for (source, dialect) in PLAN_SHAPES {
-        let Some(lists) = time_relation_rule(
-            &corpus,
-            source,
-            *dialect,
-            fts_ready,
-            repeats,
-            RelationRule::Lists,
-        ) else {
+        let Some(lists) =
+            time_relation_rule(&corpus, source, *dialect, repeats, RelationRule::Lists)
+        else {
             continue;
         };
         let Some(probes) = time_relation_rule(
             &corpus,
             source,
             *dialect,
-            fts_ready,
             repeats,
             RelationRule::DriverAndProbes,
         ) else {
@@ -2709,20 +2661,18 @@ fn time_relation_rule(
     corpus: &Corpus,
     source: &str,
     dialect: QueryDialect,
-    fts_ready: bool,
     repeats: u32,
     rule: RelationRule,
 ) -> Option<(usize, u128, BTreeSet<String>, String)> {
-    let (_anchor, statement) = corpus.lower_as(source, dialect, fts_ready, RESULT_SET_RULE, rule);
+    let (_anchor, statement) = corpus.lower_as(source, dialect, RESULT_SET_RULE, rule);
     if statement.matches_nothing {
         return None;
     }
-    let answer = corpus.sql_as(source, dialect, fts_ready, RESULT_SET_RULE, rule);
+    let answer = corpus.sql_as(source, dialect, RESULT_SET_RULE, rule);
     let mut samples = Vec::new();
     for _ in 0..repeats {
         let start = Instant::now();
-        let _ =
-            std::hint::black_box(corpus.sql_as(source, dialect, fts_ready, RESULT_SET_RULE, rule));
+        let _ = std::hint::black_box(corpus.sql_as(source, dialect, RESULT_SET_RULE, rule));
         samples.push(start.elapsed().as_micros());
     }
     samples.sort_unstable();
@@ -2827,14 +2777,13 @@ fn time_rule(
     corpus: &Corpus,
     source: &str,
     dialect: QueryDialect,
-    fts_ready: bool,
     repeats: u32,
     rule: ResultSetRule,
 ) -> Option<(usize, u128)> {
-    let first = corpus.sql_as(source, dialect, fts_ready, rule, RELATION_RULE);
+    let first = corpus.sql_as(source, dialect, rule, RELATION_RULE);
     let start = Instant::now();
     for _ in 0..repeats {
-        let _ = corpus.sql_as(source, dialect, fts_ready, rule, RELATION_RULE);
+        let _ = corpus.sql_as(source, dialect, rule, RELATION_RULE);
     }
     Some((first.len(), (start.elapsed() / repeats).as_micros()))
 }
@@ -2842,15 +2791,9 @@ fn time_rule(
 /// One paired-base line: the walk and the SQL path for the same query, on the
 /// same corpus, in the same session. `plan` names §5.10's class so an
 /// unindexable or transient path is never read as the indexed one.
-fn measure_shape(
-    corpus: &Corpus,
-    source: &str,
-    dialect: QueryDialect,
-    repeats: u32,
-    fts_ready: bool,
-) {
+fn measure_shape(corpus: &Corpus, source: &str, dialect: QueryDialect, repeats: u32) {
     // Warm both sides once so neither pays for the other's first-touch cost.
-    let first = corpus.sql_with(source, dialect, fts_ready);
+    let first = corpus.sql(source, dialect);
     let _ = corpus.walk(source, dialect);
     let walk_start = Instant::now();
     for _ in 0..repeats {
@@ -2859,10 +2802,10 @@ fn measure_shape(
     let walk = walk_start.elapsed() / repeats;
     let sql_start = Instant::now();
     for _ in 0..repeats {
-        let _ = corpus.sql_with(source, dialect, fts_ready);
+        let _ = corpus.sql(source, dialect);
     }
     let sql = sql_start.elapsed() / repeats;
-    let (_anchor, statement) = corpus.lower(source, dialect, fts_ready);
+    let (_anchor, statement) = corpus.lower(source, dialect);
     let plan = if statement.content_plans.is_empty() {
         if statement.positively_bounded {
             "indexed".to_string()
@@ -2932,11 +2875,10 @@ fn dump_the_lowered_statements_as_a_measurement_baseline() {
         return;
     };
     let corpus = Corpus::open(PathBuf::from(&root), false);
-    let fts_ready = corpus.fts_ready();
     let mut captured: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for (source, dialect) in MEASURE_SHAPES {
-        let (_anchor, statement) = corpus.lower(source, *dialect, fts_ready);
+        let (_anchor, statement) = corpus.lower(source, *dialect);
         captured.insert((*source).to_string(), statement.sql);
     }
     std::fs::write(
@@ -2985,7 +2927,6 @@ fn the_baseline_and_current_statements_are_measured_against_each_other() {
     )
     .expect("the baseline artifact parses");
     let corpus = Corpus::open(PathBuf::from(&root), false);
-    let fts_ready = corpus.fts_ready();
     // Nine is the floor the packet sets; more rounds cost milliseconds here and
     // narrow the control spread, which is the only thing that decides whether a
     // difference is reportable at all.
@@ -3008,7 +2949,7 @@ fn the_baseline_and_current_statements_are_measured_against_each_other() {
             disagreements.push(format!("{source}: absent from the captured baseline"));
             continue;
         };
-        let (anchor, statement) = corpus.lower(source, *dialect, fts_ready);
+        let (anchor, statement) = corpus.lower(source, *dialect);
         corpus.bind_regexes(&statement.regexes);
         // The two statements bind the SAME values in the SAME order — this
         // packet changes projection lists and one join, never a bound value —
@@ -3184,13 +3125,12 @@ fn a_block_query_selects_three_columns_and_never_decorates_its_candidates() {
     let root = scratch("no-candidate-decoration");
     write_fast_corpus(&root);
     let corpus = Corpus::open(root, true);
-    let fts_ready = corpus.fts_ready();
 
     // A shape with a page predicate is deliberately included: its `pages`
     // access must be its OWN scoped subquery, so removing the candidate-stage
     // join cannot have moved a page predicate's table access anywhere.
     for source in ["(task TODO)", "(journal)", "[[Project]]"] {
-        let (anchor, statement) = corpus.lower(source, QueryDialect::Og, fts_ready);
+        let (anchor, statement) = corpus.lower(source, QueryDialect::Og);
         assert_eq!(anchor, Anchor::Block, "{source}");
         assert!(
             statement.sql.starts_with(
@@ -3230,15 +3170,17 @@ fn a_block_query_selects_three_columns_and_never_decorates_its_candidates() {
             assert_eq!(row.len(), 3, "{source}: {row:?}");
             match (&row[0], &row[1], &row[2]) {
                 (
-                    PhysicalQueryValue::Blob(block_id),
-                    PhysicalQueryValue::Blob(page_id),
+                    PhysicalQueryValue::Integer(block_id),
+                    PhysicalQueryValue::Integer(page_id),
                     PhysicalQueryValue::Text(path),
                 ) => {
-                    assert_eq!(block_id.len(), 16, "{source}");
-                    assert_eq!(page_id.len(), 16, "{source}");
+                    assert!(*block_id > 0, "{source}");
+                    assert!(*page_id > 0, "{source}");
                     assert!(path.ends_with(".md"), "{source}");
                 }
-                other => panic!("{source}: the row contract is (blob, blob, text): {other:?}"),
+                other => {
+                    panic!("{source}: the row contract is (integer, integer, text): {other:?}")
+                }
             }
         }
     }
@@ -3249,7 +3191,6 @@ fn a_block_query_selects_three_columns_and_never_decorates_its_candidates() {
     let (_anchor, probe) = corpus.lower_as(
         "(task TODO)",
         QueryDialect::Og,
-        fts_ready,
         ResultSetRule::CorrelatedProbe,
         RELATION_RULE,
     );
@@ -3266,13 +3207,14 @@ fn a_block_query_selects_three_columns_and_never_decorates_its_candidates() {
         probe.sql
     );
 
-    // `@page` output is untouched by this packet: four columns, name and kind
-    // included, because the page result construction reads them.
-    let (anchor, page) = corpus.lower("@page and journal = true", QueryDialect::Tql, fts_ready);
+    // `@page` keeps its four public columns; the name now comes through the
+    // dictionary join used by every other page-name reader.
+    let (anchor, page) = corpus.lower("@page and journal = true", QueryDialect::Tql);
     assert_eq!(anchor, Anchor::Page);
     assert!(
-        page.sql
-            .starts_with("SELECT p.page_id, p.name, p.text_kind, p.journal_day FROM pages p "),
+        page.sql.starts_with(
+            "SELECT p.page_id, pn.raw, p.text_kind, p.journal_day FROM pages p JOIN names pn "
+        ),
         "{}",
         page.sql
     );
@@ -3332,11 +3274,12 @@ fn the_reference_panel_narrowing_ratio_is_measured_on_a_real_corpus() {
     // The NAME is read only to run the panel query; it is never printed.
     let ranked = snapshot
         .run_projection_query(
-            "SELECT normalized_name, COUNT(DISTINCT source_page_id) AS pages
-             FROM reference_postings
-             WHERE target_type = 0 AND reference_kind <= 4
-             GROUP BY normalized_name
-             ORDER BY pages DESC, normalized_name
+            "SELECT n.key, COUNT(DISTINCT r.source_page_id) AS pages
+             FROM reference_postings r
+             JOIN names n ON n.name_id = r.target_name_id
+             WHERE r.target_type = 0 AND r.reference_kind <= 4
+             GROUP BY n.key
+             ORDER BY pages DESC, n.key
              LIMIT 8",
             &[],
         )
@@ -3352,9 +3295,10 @@ fn the_reference_panel_narrowing_ratio_is_measured_on_a_real_corpus() {
         };
         let referring_blocks = snapshot
             .run_projection_query(
-                "SELECT COUNT(DISTINCT source_entity_id) FROM reference_postings
-                 WHERE target_type = 0 AND reference_kind <= 4
-                   AND normalized_name = ?1 AND source_entity_type = 1",
+                "SELECT COUNT(DISTINCT r.source_entity_id) FROM reference_postings r
+                 JOIN names n ON n.name_id = r.target_name_id
+                 WHERE r.target_type = 0 AND r.reference_kind <= 4
+                   AND n.key = ?1 AND r.source_entity_type = 1",
                 &[PhysicalQueryValue::Text(name.clone())],
             )
             .expect("the block count runs")
@@ -3367,9 +3311,10 @@ fn the_reference_panel_narrowing_ratio_is_measured_on_a_real_corpus() {
         let blocks_in_candidates = snapshot
             .run_projection_query(
                 "SELECT COUNT(*) FROM blocks WHERE page_id IN (
-                     SELECT DISTINCT source_page_id FROM reference_postings
-                     WHERE target_type = 0 AND reference_kind <= 4
-                       AND normalized_name = ?1)",
+                     SELECT DISTINCT r.source_page_id FROM reference_postings r
+                     JOIN names n ON n.name_id = r.target_name_id
+                     WHERE r.target_type = 0 AND r.reference_kind <= 4
+                       AND n.key = ?1)",
                 &[PhysicalQueryValue::Text(name.clone())],
             )
             .expect("the candidate block count runs")
@@ -3415,10 +3360,9 @@ fn the_reference_panel_narrowing_ratio_is_measured_on_a_real_corpus() {
 /// requires that narrowing actually applied somewhere, so a corpus where the
 /// index never named a block cannot pass the gate by doing nothing.
 /// `narrowed_classifications` / `walked_classifications` count EXPLICIT targets
-/// only. Plain (unlinked) references are narrowed to pages by FTS and not to
-/// blocks — `plain_text_candidate_pages_after` projects the owning page and not
-/// the owning entity — so folding them in would dilute the one number this
-/// change is supposed to move.
+/// only. Plain (unlinked) references now have their own exact per-needle
+/// interactive window, while this historical ratio measures the posting
+/// relation's explicit-reference block narrowing.
 struct NarrowingComparison {
     differences: Vec<String>,
     narrowed_targets: usize,
@@ -3613,17 +3557,13 @@ fn the_corpus_own_queries_are_timed_against_the_walk() {
         root.display()
     );
     let corpus = Corpus::open(root, false);
-    let fts_ready = corpus.fts_ready();
-    eprintln!(
-        "observed_queries total={} fts_ready={fts_ready}",
-        shapes.len()
-    );
+    eprintln!("observed_queries total={}", shapes.len());
     for (index, (name, argument)) in shapes.iter().enumerate() {
         let dialect = match crate::query::macro_text::FormFamily::for_macro_name(name) {
             crate::query::macro_text::FormFamily::Tql => QueryDialect::Tql,
             crate::query::macro_text::FormFamily::Edn => QueryDialect::Og,
         };
-        let rows = corpus.sql_with(argument, dialect, fts_ready);
+        let rows = corpus.sql(argument, dialect);
         let walked = corpus.walk(argument, dialect);
         let agrees = rows == walked;
         let _ = corpus.walk(argument, dialect);
@@ -3634,7 +3574,7 @@ fn the_corpus_own_queries_are_timed_against_the_walk() {
         let walk = walk_start.elapsed() / OBSERVED_REPEATS;
         let sql_start = Instant::now();
         for _ in 0..OBSERVED_REPEATS {
-            let _ = corpus.sql_with(argument, dialect, fts_ready);
+            let _ = corpus.sql(argument, dialect);
         }
         let sql = sql_start.elapsed() / OBSERVED_REPEATS;
         // The same statement under §5.11's PREVIOUS spelling, so the driver
@@ -3642,26 +3582,14 @@ fn the_corpus_own_queries_are_timed_against_the_walk() {
         // only on the invented `PLAN_SHAPES`. Identical for a query with one
         // relation leaf; the difference is the whole point for the others.
         let lists = {
-            let _ = corpus.sql_as(
-                argument,
-                dialect,
-                fts_ready,
-                RESULT_SET_RULE,
-                RelationRule::Lists,
-            );
+            let _ = corpus.sql_as(argument, dialect, RESULT_SET_RULE, RelationRule::Lists);
             let start = Instant::now();
             for _ in 0..OBSERVED_REPEATS {
-                let _ = corpus.sql_as(
-                    argument,
-                    dialect,
-                    fts_ready,
-                    RESULT_SET_RULE,
-                    RelationRule::Lists,
-                );
+                let _ = corpus.sql_as(argument, dialect, RESULT_SET_RULE, RelationRule::Lists);
             }
             start.elapsed() / OBSERVED_REPEATS
         };
-        let (_anchor, statement) = corpus.lower(argument, dialect, fts_ready);
+        let (_anchor, statement) = corpus.lower(argument, dialect);
         let plan = if statement.content_plans.is_empty() {
             if statement.positively_bounded {
                 "indexed".to_string()

@@ -507,10 +507,15 @@ impl Graph {
         // already-cached page MUST NOT call cache_upsert: it bumps `cache_gen`,
         // which keys every memoized backlink/reference result — so an unchanged
         // re-save would force a whole-graph rescan on every open dashboard.
-        // A path-pinned save (`cache == false`, a duplicate-day stray, #21) NEVER
-        // touches the `(kind,name)` cache: that slot belongs to the canonical file,
-        // and folding the stray's content in would make name-resolution serve it.
-        // The stray is re-parsed from disk on its next path-addressed load.
+        // A path-pinned save (`cache == false`, a duplicate-day stray, #21) still
+        // owns its OWN path slot — what it must not do is take the day away from
+        // the canonical file when someone opens it BY NAME. Those are different
+        // questions and different code: cache slots are keyed by path, while
+        // name resolution does not read this cache's `by_name` map at all.
+        // `find_entry` builds its own index over `list_pages` and explicitly
+        // prefers the date-stem file (`lookup.rs`), which is what makes opening
+        // the day deterministic. `a_page_cache_by_name_map_is_not_a_lookup`
+        // pins that, because it is the whole reason this save is safe.
         let need_cache_update = cache
             && (changed || {
                 let guard = self.cache.read().unwrap();
@@ -518,6 +523,23 @@ impl Graph {
                     .as_ref()
                     .is_some_and(|pages| self.cached_page_index_for_path(pages, &path).is_none())
             });
+        // GH #543 (fifth audit A5-N2): the `(kind,name)` exclusion above had
+        // quietly become an exclusion from the INDEX too. The projection's rows
+        // are keyed by PATH, not by logical name, so a pinned file has its own
+        // rows and they are what search answers from — but `cache_upsert` is
+        // where the delta is published, so skipping it left this file indexed at
+        // its pre-save text forever, with the index idle, validated and ready.
+        // Nothing was queued and a successful answer never reaches the repair a
+        // refusal would start, so it never corrected itself.
+        //
+        // (Sixth audit A6-N1: publishing the delta alone was still not enough.
+        // The parsed cache is an authoritative PRODUCER — a repair snapshots it
+        // and republishes it wholesale at the current generation — so a pinned
+        // save that left its own slot holding pre-save text had its rows undone
+        // by the next repair, and, publishing at an unchanged generation, could
+        // not outrank them either. A file this save rewrote goes through the
+        // same front door as every other rewritten file.)
+        let need_cache_update = need_cache_update || (!cache && changed);
         if need_cache_update {
             // For a brand-new journal, derive its date_key from the name so it's
             // recognized as a dated journal by `journals_desc` (which reads this

@@ -52,55 +52,77 @@ impl Graph {
         self.reconciliation_scan_open_config_description
     }
 
-    /// Digest of the configuration bytes this instance last wrote, if any.
-    ///
-    /// `None` on an instance that has published nothing — including every
-    /// short-lived capability, whose refresh is cheap enough not to
-    /// need the distinction.
-    pub fn recent_config_write(&self) -> Option<BlobDescription> {
-        *self.recent_config_write.read().unwrap()
+    /// Digest of the `config.edn` bytes the configuration this instance
+    /// serves was taken from (`None`: no readable file). Equal to
+    /// [`config_file_description`] exactly when disk holds nothing this
+    /// instance has not taken in, which is the watcher's reason to do nothing.
+    pub fn served_config_description(&self) -> Option<BlobDescription> {
+        *self.served_config_description.read().unwrap()
     }
 
-    /// Record what a configuration write just published. Called by the one
-    /// funnel every setter goes through (`Graph::write_config`).
-    pub(crate) fn note_config_write(&self) {
-        *self.recent_config_write.write().unwrap() = config_file_description(&self.root);
+    /// The configuration as last taken in.
+    pub fn config(&self) -> Arc<Config> {
+        Arc::clone(&self.config.read().unwrap())
+    }
+
+    /// Change this instance's configuration before anyone else holds it
+    /// (exports and the CLI override single settings for one run).
+    pub fn config_mut(&mut self) -> &mut Config {
+        Arc::make_mut(self.config.get_mut().unwrap())
+    }
+
+    /// Re-read `config.edn` and take in a change that reaches only settings.
+    /// [`ConfigReach::Graph`] leaves this instance as it is: the caller opens
+    /// a new `Graph`, which is the only way that change is taken in.
+    pub fn take_in_config(&self) -> crate::config::ConfigReach {
+        let bytes = fs::read(reconciliation_scan_config_path_at_open(&self.root)).ok();
+        let description = bytes.as_deref().map(BlobDescription::of);
+        let new = bytes
+            .as_deref()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .map(Config::parse)
+            .unwrap_or_default();
+        let mut current = self.config.write().unwrap();
+        let reach = current.reach(&new);
+        if reach == crate::config::ConfigReach::Settings {
+            *current = Arc::new(new);
+        }
+        if reach != crate::config::ConfigReach::Graph {
+            *self.served_config_description.write().unwrap() = description;
+        }
+        reach
     }
 
     pub fn meta(&self) -> GraphMeta {
+        let config = self.config();
         GraphMeta {
             root: self.root.display().to_string(),
-            journals_dir: self.config.journals_dir.clone(),
-            pages_dir: self.config.pages_dir.clone(),
-            preferred_workflow: match self.config.preferred_workflow {
+            journals_dir: config.journals_dir.clone(),
+            pages_dir: config.pages_dir.clone(),
+            preferred_workflow: match config.preferred_workflow {
                 crate::config::Workflow::Todo => "todo".into(),
                 crate::config::Workflow::Now => "now".into(),
             },
-            shortcuts: self.config.shortcuts.clone(),
-            start_of_week: self.config.start_of_week,
-            linked_references_collapsed_threshold: self
-                .config
-                .linked_references_collapsed_threshold,
-            block_hidden_properties: self.config.block_hidden_properties.clone(),
-            default_journal_template: self.config.default_journal_template.clone(),
-            default_home: self.config.default_home.clone(),
-            favorites: self.config.favorites.clone(),
-            favorites_page: self.config.favorites_page.clone(),
+            shortcuts: config.shortcuts.clone(),
+            start_of_week: config.start_of_week,
+            linked_references_collapsed_threshold: config.linked_references_collapsed_threshold,
+            block_hidden_properties: config.block_hidden_properties.clone(),
+            default_journal_template: config.default_journal_template.clone(),
+            default_home: config.default_home.clone(),
+            favorites: config.favorites.clone(),
+            favorites_page: config.favorites_page.clone(),
             journal_page_title_format: self.journal_format.title_format().to_string(),
             journal_file_name_format: self.journal_format.file_format().to_string(),
-            preferred_format: self.config.preferred_format.ext().to_string(),
-            macros: self.config.macros.clone(),
-            enable_timetracking: self.config.enable_timetracking,
-            show_brackets: self.config.show_brackets,
-            doc_mode_enter_for_new_block: self.config.doc_mode_enter_for_new_block,
-            logical_outdenting: self.config.logical_outdenting,
-            logbook_with_second_support: self.config.logbook.with_second_support,
-            logbook_enabled_in_timestamped_blocks: self
-                .config
-                .logbook
-                .enabled_in_timestamped_blocks,
-            logbook_enabled_in_all_blocks: self.config.logbook.enabled_in_all_blocks,
-            guide_announced: self.config.guide_announced,
+            preferred_format: config.preferred_format.ext().to_string(),
+            macros: config.macros.clone(),
+            enable_timetracking: config.enable_timetracking,
+            show_brackets: config.show_brackets,
+            doc_mode_enter_for_new_block: config.doc_mode_enter_for_new_block,
+            logical_outdenting: config.logical_outdenting,
+            logbook_with_second_support: config.logbook.with_second_support,
+            logbook_enabled_in_timestamped_blocks: config.logbook.enabled_in_timestamped_blocks,
+            logbook_enabled_in_all_blocks: config.logbook.enabled_in_all_blocks,
+            guide_announced: config.guide_announced,
         }
     }
 
@@ -112,18 +134,38 @@ impl Graph {
         self.cache_gen.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Pages skipped by the latest whole-graph search-cache build because their
-    /// parse/projection panicked. Paths are graph-relative and safe to surface.
+    /// Graph text Tine cannot read or parse right now, and listing skips
+    /// (`path: why`), as last observed per path (`UnreadablePages`). Paths
+    /// are graph-relative and safe to surface.
     pub fn page_index_failures(&self) -> Vec<String> {
-        self.page_index_failures.read().unwrap().clone()
+        self.page_index_failures.read().unwrap().to_vec()
+    }
+
+    /// The page failures not yet announced, marking them announced. A failure
+    /// that clears and later recurs is announced again. Tine indexes the rest
+    /// of the graph around a page it cannot read, so nothing else tells the
+    /// user that page is missing from search, queries and references.
+    pub fn take_unannounced_page_failures(&self) -> Vec<String> {
+        let current = self.page_index_failures();
+        let mut announced = self
+            .announced_page_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        announced.retain(|failure| current.contains(failure));
+        let fresh: Vec<String> = current
+            .into_iter()
+            .filter(|failure| !announced.contains(failure))
+            .collect();
+        announced.extend(fresh.iter().cloned());
+        fresh
     }
 
     pub fn journals_path(&self) -> PathBuf {
-        self.root.join(&self.config.journals_dir)
+        self.root.join(&self.config().journals_dir)
     }
 
     pub fn pages_path(&self) -> PathBuf {
-        self.root.join(&self.config.pages_dir)
+        self.root.join(&self.config().pages_dir)
     }
 
     /// Graph-root-relative, forward-slashed path for an absolute file path inside
@@ -147,6 +189,26 @@ impl Graph {
             return None;
         }
         Some(abs)
+    }
+
+    /// GH #597: a path saved under another case spelling of its file (a tab,
+    /// Recent entry or sidebar item recorded while Tine handed out
+    /// `pages/Contents.md` for `contents.md`) resolves to the file's spelling
+    /// on disk. Only a spelling that differs from the disk's by case is
+    /// followed, and the result passes [`Self::resolve_rel`] itself.
+    pub(super) fn resolve_rel_disk_spelling(&self, rel: &str) -> Option<PathBuf> {
+        let rel = rel.trim().replace('\\', "/");
+        let canonical_root = fs::canonicalize(&self.root).ok()?;
+        let actual = fs::canonicalize(self.resolve_rel_lexical(&rel)?).ok()?;
+        let disk_rel = actual
+            .strip_prefix(&canonical_root)
+            .ok()?
+            .to_str()?
+            .replace('\\', "/");
+        if disk_rel == rel || disk_rel.to_lowercase() != rel.to_lowercase() {
+            return None;
+        }
+        self.resolve_rel(&disk_rel)
     }
 
     pub(super) fn resolve_graph_text_rel(
@@ -181,7 +243,8 @@ impl Graph {
             return None;
         }
         let parts = rel.split('/').collect::<Vec<_>>();
-        let configured_root = [&self.config.journals_dir, &self.config.pages_dir]
+        let config = self.config();
+        let configured_root = [&config.journals_dir, &config.pages_dir]
             .into_iter()
             .filter_map(|configured| {
                 let components = configured.split('/').collect::<Vec<_>>();
@@ -230,7 +293,7 @@ impl Graph {
             return Err(bad_path());
         }
         let components = relative_path.split('/').collect::<Vec<_>>();
-        let configured_root_len = [&self.config.journals_dir, &self.config.pages_dir]
+        let configured_root_len = [&self.config().journals_dir, &self.config().pages_dir]
             .into_iter()
             .filter_map(|configured_root| {
                 let root_components = configured_root.split('/').collect::<Vec<_>>();
@@ -496,6 +559,6 @@ impl Graph {
     /// The format (`Md`/`Org`) new pages and journals are created in, from
     /// `config.edn`'s `:preferred-format`. Existing files keep their own format.
     pub fn preferred_format(&self) -> Format {
-        self.config.preferred_format
+        self.config().preferred_format
     }
 }

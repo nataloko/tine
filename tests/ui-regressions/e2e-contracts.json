@@ -292,6 +292,22 @@
    ],
    "stability": "stable"
   },
+  "scripts/e2e-process-group.test.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "A scenario that leaves a process behind is reported and its orphan killed, so one leaking journey cannot exhaust the machine for every later journey in the run.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "The polling attempts and interval that separate ordinary teardown lag from a real orphan may change."
+   ],
+   "nonRequirements": [
+    "Any product behaviour; zombie (reaped-but-unwaited) processes, which hold no memory and no port."
+   ],
+   "stability": "stable"
+  },
   "scripts/e2e-journal-format.mjs": {
    "contracts": [
     {
@@ -321,6 +337,38 @@
    ],
    "nonRequirements": [
     "Exact feed row height or clock display."
+   ],
+   "stability": "stable"
+  },
+  "scripts/e2e-machine-probe.test.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "A journey that failed while waiting says whether the machine itself was answering, so a starved disk or saturated CPU is named as the cause instead of being read as a product regression, and a healthy machine hands the failure back to the product.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "The sample count, the thresholds that separate a starved machine from a healthy one, and the wording of the verdict."
+   ],
+   "nonRequirements": [
+    "Any product behaviour; any absolute latency figure, which is machine-specific by construction."
+   ],
+   "stability": "stable"
+  },
+  "scripts/e2e-main-window.test.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "A journey whose session attached to an auxiliary window (Quick Capture) moves to the application window instead of reporting the app's content as missing.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Which auxiliary windows exist, and the order the driver enumerates window handles in."
+   ],
+   "nonRequirements": [
+    "Any product behaviour, and any claim about which window the driver attaches to first."
    ],
    "stability": "stable"
   },
@@ -667,6 +715,34 @@
     "Exact print-dialog appearance, paper margins, or font rasterization."
    ],
    "stability": "stable"
+  },
+  "scripts/e2e-guide-site.mjs": {
+   "contracts": [
+    {
+     "class": "core-operation",
+     "userOutcome": "The published Guide served over HTTP opens the read-only app on its home page, page links navigate, Copy page link copies the page's own address, and a block permalink opens that block in context.",
+     "blocking": true
+    },
+    {
+     "class": "stateful-ux",
+     "userOutcome": "Returning to the Guide tab raises no external-change or editing warning, since the read-only app can never edit (GH #549).",
+     "blocking": true
+    },
+    {
+     "class": "core-operation",
+     "userOutcome": "Adding ?static to the address shows the plain static site instead of redirecting to the app.",
+     "blocking": true
+    }
+   ],
+   "acceptableVariations": [
+    "Page wording, Guide content order, layout and timing may change while the named pages and links exist.",
+    "The block highlight may be any visible in-context marker of the addressed block."
+   ],
+   "nonRequirements": [
+    "Exact pixels, fonts, theme, or DOM nesting of the app shell.",
+    "Behaviour of the Guide when opened straight from disk (file://)."
+   ],
+   "stability": "burn-in"
   },
   "scripts/e2e-publish-security.mjs": {
    "contracts": [
@@ -1183,7 +1259,7 @@
     "Exact generated block identities or save debounce duration."
    ],
    "stability": "quarantined",
-   "quarantineReason": "2026-09-04 (Claude): the two harness defects behind the previous quarantine are now FIXED in this file \u2014 (1) openPage() compared a .page-ref's visible text to the bare title, but .page-ref renders OG's [[ ]] decoration inside the anchor whenever :ui/show-brackets? is on, which is the default (src/render/inline.tsx, pinned by src/render/showBrackets.test.tsx); (2) resolveEverywhere() probed for a VISIBLE button labelled 'All mine'/'All theirs', but those buttons carry two responsive labels and CSS shows exactly one, so the probe was really an assertion about pane width, which the full-pane-width Concord default legitimately flipped. STILL QUARANTINED FOR A PRODUCT DEFECT, NOT A HARNESS ONE: with those fixed, the Direct Files leg reaches 'Apply resolution' and the click is a no-op. The capsule stays (count 1, text byte-identical, '2 conflicts', '2 of 2 pre-selected') and the app raises two toasts: \"Couldn't resolve it: Direct Files could not save (reason code: unknown).\" and \"'B3EUseCurrent' still has unresolved conflicts\". Reproduced 3/3 on a clean build; not a permissions problem (graph 755, both page files present and writable). The user cannot complete conflict resolution, and the failure is surfaced as an UNCLASSIFIED reason code. Do NOT spend further attempts on the harness: fix the product first. Entry points: src/components/ConflictResolution.tsx:342 apply(); src/backend.ts:319 DirectSaveFailureError; src-tauri/src/command_error.rs reason_code 'unknown'. Unquarantine once Apply resolution actually saves.",
+   "quarantineReason": "2026-09-04 (Claude): the two harness defects behind the previous quarantine are now FIXED in this file \u2014 (1) openPage() compared a .page-ref's visible text to the bare title, but .page-ref renders OG's [[ ]] decoration inside the anchor whenever :ui/show-brackets? is on, which is the default (src/render/inline.tsx, pinned by src/render/showBrackets.test.tsx); (2) resolveEverywhere() probed for a VISIBLE button labelled 'All mine'/'All theirs', but those buttons carry two responsive labels and CSS shows exactly one, so the probe was really an assertion about pane width, which the full-pane-width Concord default legitimately flipped. STILL QUARANTINED FOR A PRODUCT DEFECT, NOT A HARNESS ONE: with those fixed, the Direct Files leg reaches 'Apply resolution' and the click is a no-op. The capsule stays (count 1, text byte-identical, '2 conflicts', '2 of 2 pre-selected') and the app raises two toasts: \"Couldn't resolve it: Direct Files could not save (reason code: unknown).\" and \"'B3EUseCurrent' still has unresolved conflicts\". Reproduced 3/3 on a clean build; not a permissions problem (graph 755, both page files present and writable). The user cannot complete conflict resolution, and the failure is surfaced as an UNCLASSIFIED reason code. Do NOT spend further attempts on the harness: fix the product first. Entry points: src/components/ConflictResolution.tsx:342 apply(); src/backend.ts:319 DirectSaveFailureError; src-tauri/src/command_error.rs reason_code 'unknown'. Unquarantine once Apply resolution actually saves. 2026-09-23 (Claude, v0.6.985 release): the missing-target branch still expected the N conflicts badge to open the page review directly; since GH #536 (b64b7160) the badge opens the Conflicts overview, so the journey now opens the page's overview row (atomic find-and-click). Linux release run on 0c6197b3 failed there ('conflict entry did not open its review'); quarantine kept pending burn-in.",
    "notes": "B3E changed the intended journey to kill the actual Tine PID with SIGKILL, restart under a fresh driver, inspect exact capsule draft/baseline/graph-page binding, introduce a newer external owner during the outage, and exercise both resolution sides on both backends. The current quarantined run stops at its journal-link harness selector before those assertions. Exact pixels and filesystem timing are non-contractual."
   },
   "scripts/e2e-dirty-editor-replacement.mjs": {

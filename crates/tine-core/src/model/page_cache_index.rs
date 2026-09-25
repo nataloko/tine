@@ -64,6 +64,9 @@ pub(super) enum DirectCreationEvidence {
 pub(super) struct PageCacheBuild {
     pub(super) pages: Vec<ParsedPage>,
     pub(super) failures: Vec<String>,
+    /// Pages read again after the pass's first read, with the structural
+    /// sequence noted before that later read (see `PassReadAt`).
+    pub(super) reread: std::collections::HashMap<PathBuf, u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,14 +115,22 @@ impl From<PageCacheInstallOutcome> for PageBuildOutcome {
 
 pub(super) struct PageBuildFlight {
     pub(super) expected_generation: u64,
+    /// `cache_structural_gen` at the claim, before anything was read: with
+    /// the parsed revisions, it tells a harmless generation move from real
+    /// drift at installation.
+    pub(super) expected_structural: super::graph_drift::PassWatermark,
     outcome: std::sync::Mutex<Option<PageBuildOutcome>>,
     completed: std::sync::Condvar,
 }
 
 impl PageBuildFlight {
-    pub(super) fn new(expected_generation: u64) -> Self {
+    pub(super) fn new(
+        expected_generation: u64,
+        expected_structural: super::graph_drift::PassWatermark,
+    ) -> Self {
         Self {
             expected_generation,
+            expected_structural,
             outcome: std::sync::Mutex::new(None),
             completed: std::sync::Condvar::new(),
         }
@@ -142,31 +153,82 @@ impl PageBuildFlight {
 #[cfg(test)]
 #[derive(Default)]
 pub(super) struct PageBuildTestState {
+    /// Whole-graph passes the index owner ran (validations and fresh builds).
+    pub(super) owner_passes: std::sync::atomic::AtomicUsize,
+    /// Pause one cold parse after it read every page and before it checks
+    /// the pages it read, so a test can land an edit in that window.
+    pub(super) cold_read_done: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
     pub(super) owner_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    /// Delete this page right after the next whole-graph listing, before
+    /// its read: a delete no event reported, landing inside a pass.
+    pub(super) vanish_after_listing: std::sync::Mutex<Option<PathBuf>>,
+    /// Delete this page inside the next graph listing, after the directory
+    /// read names it and before the listing opens it.
+    pub(super) vanish_inside_listing: std::sync::Mutex<Option<PathBuf>>,
+    /// Pause one fast whole-graph parse after it listed the pages and before
+    /// it parses them, so a test can look at the progress bar mid-pass.
+    pub(super) fast_parse_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    /// GH #543: pause one launch survey after it has announced itself and
+    /// before it reads page bytes, so a test can land a query in that window.
+    pub(super) warm_validation_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    /// Pause one launch survey after it has read what it will read and
+    /// before it records its findings, so a test can publish a page it
+    /// already read.
+    pub(super) warm_read_done_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    /// Pause the next warm right before it offers its validation.
+    pub(super) before_warm_enqueue: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    /// Pause the next owner (or inline warm) just before it reports its
+    /// launch completion.
+    pub(super) before_settle: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    pub(super) derived_read_wait: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    pub(super) after_parsed_cache_discard: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    /// Pause one derived read that the parsed cache answered instead of the
+    /// index, after that decision and before the caller reads the cache.
+    pub(super) cache_decline_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    /// Pause one page publication right after it releases the cache lock,
+    /// with its new generation observable, before it returns.
+    pub(super) upsert_published_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
+    /// Pause one public query whose read failed, before it asks for repair.
+    pub(super) failed_read_repair_pause: std::sync::Mutex<Option<Arc<PageBuildTestPause>>>,
     pub(super) joined: std::sync::Mutex<usize>,
     pub(super) joined_changed: std::sync::Condvar,
     pub(super) force_warm_failure: std::sync::atomic::AtomicBool,
     pub(super) drift_before_install: std::sync::atomic::AtomicBool,
+    /// GH #543: open this unchanged page once inside an index-backed derived
+    /// read, after its SQL answer and before its generation check.
+    pub(super) derived_read_open_once: std::sync::Mutex<Option<PathBuf>>,
+    /// Index-backed derived reads answer `None` while this is set, as one
+    /// that met damage does.
+    pub(super) unanswered_indexed_reads: std::sync::atomic::AtomicBool,
+    /// Overrides [`super::derived_reads::DERIVED_READ_PATIENCE`].
+    pub(super) derived_read_patience: std::sync::Mutex<Option<std::time::Duration>>,
+    /// Attempts `indexed_read` made.
+    pub(super) indexed_read_attempts: std::sync::atomic::AtomicUsize,
     pub(super) enumerations: std::sync::atomic::AtomicUsize,
     pub(super) parses: std::sync::atomic::AtomicUsize,
+    /// The part of `parses` made outside an indexing build, counted on its
+    /// own: a difference of two counters read one after the other can come
+    /// out one short, or underflow, while the owner parses between the two
+    /// reads (GH #543, audit R9-07).
+    pub(super) consumer_parses: std::sync::atomic::AtomicUsize,
+    /// Pages a warm repair parsed (one per changed page, never a graph pass).
+    pub(super) repair_parses: std::sync::atomic::AtomicUsize,
     pub(super) installs: std::sync::atomic::AtomicUsize,
     pub(super) censuses: std::sync::atomic::AtomicUsize,
-    /// R6: pages parsed by the warm STREAM (replacements only).
-    pub(super) warm_stream_parses: std::sync::atomic::AtomicUsize,
     /// R6: pages parsed on demand for reference/fuzzy hydration without a
     /// parsed cache.
     pub(super) on_demand_parses: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
-pub(super) struct PageBuildTestPause {
-    pub(super) reached: std::sync::Barrier,
-    pub(super) release: std::sync::Barrier,
+pub(crate) struct PageBuildTestPause {
+    pub(crate) reached: std::sync::Barrier,
+    pub(crate) release: std::sync::Barrier,
 }
 
 #[cfg(test)]
 impl PageBuildTestPause {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             reached: std::sync::Barrier::new(2),
             release: std::sync::Barrier::new(2),
@@ -182,12 +244,14 @@ impl PageCacheBuild {
         Self {
             pages: Vec::with_capacity(capacity),
             failures: Vec::new(),
+            reread: std::collections::HashMap::new(),
         }
     }
 
     pub(super) fn append(&mut self, mut other: Self) {
         self.pages.append(&mut other.pages);
         self.failures.append(&mut other.failures);
+        self.reread.extend(other.reread);
     }
 
     pub(super) fn collect(&mut self, parsed: PageParseResult) -> bool {

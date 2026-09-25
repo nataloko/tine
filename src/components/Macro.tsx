@@ -1,5 +1,5 @@
 import { For, Show, Switch, Match, createEffect, createMemo, createResource, createSignal, useContext, createUniqueId, on, onCleanup, onMount, untrack, type JSX } from "solid-js";
-import { backend, QueryPrintRefusedError, QueryUnavailableError, type QueryNotReadyError } from "../backend";
+import { backend, OperationCancelledError, QueryPrintRefusedError, QueryUnavailableError, type QueryNotReadyError } from "../backend";
 import { isPublishedExport } from "../publishedBackend";
 import { focusedRouter, openRouteInOtherPane } from "../panes";
 import { openPageTarget, openPageAtBlock, openPageTargetInNewTab, openInNewTab } from "../router";
@@ -7,6 +7,7 @@ import { queryExportBudgetBytes } from "../queryExportBudget";
 import { CROSSING_NOTICE, dismissNotice, noticeDismissed, primeNoticeDismissals, openPageInSidebar, openBlockInSidebar, openPageContextMenu, openQueryExport, dataRev, graphEpoch, graphMeta, pageIdentityKey } from "../ui";
 import { blockProperty, doc, formatForPage, formatForBlock, pageByName, resolveGuidePageDto, setBlockProperty, setRaw, undo, undoTopTag, withUndoUnit } from "../store";
 import { resolveBlockBatched } from "../resolveBatch";
+import { readLane } from "../readLane";
 import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { LiveRefGroup } from "./LiveRefGroup";
@@ -75,7 +76,9 @@ import type { PageKind, QueryPublicationRequest, RefGroup } from "../types";
 import { sharedQueryResult, sharedQueryScope } from "../queryResultCache";
 import { graphBinding } from "../persistence";
 import { createReadyQueryResource } from "../createReadyQueryResource";
-import { runQueryWhenCurrent } from "../queryReadiness";
+import { componentLifetime, runQueryWhenCurrent } from "../queryReadiness";
+import { indexFailureOf } from "../lib/indexFailure";
+import { IndexFailedNotice } from "./IndexFailedNotice";
 import { savedDslToFriendlySearch } from "../editor/searchQuery";
 import type { QueryExecution, QueryHit } from "../types";
 import { LinkDepthContext, LinkDepthWarning, MAX_DEPTH_OF_LINKS } from "./linkDepth";
@@ -332,14 +335,19 @@ export function QueryMacro(props: {
   // which used to render "No results" plus a "why empty?" that opened onto an
   // empty panel (2026-09-11, a fresh query while the projection recovered).
   const [parsePending, setParsePending] = createSignal<QueryNotReadyError | null>(null);
+  // A removed block's parse is nobody's: its request never changes, so
+  // without this the retry polled `query_parse` for as long as the index
+  // stayed not ready (GH #543, audit R12-06).
+  const lifetime = componentLifetime();
   const [parsedSnapshot] = createResource(parseRequest, async (request) => {
     setParsePending(null);
     return {
       request,
       reading: await runQueryWhenCurrent(
+        lifetime,
         () => backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties),
         () => parseRequest() === request,
-        (error) => { if (parseRequest() === request) setParsePending(error); },
+        (error) => { if (!lifetime.ended() && parseRequest() === request) setParsePending(error); },
       ),
     };
   });
@@ -607,6 +615,7 @@ export function QueryMacro(props: {
       // directives that a reprint would otherwise discard.
       try {
         const fresh = await runQueryWhenCurrent(
+          lifetime,
           () => backend().parseQuery(request.argument, macroTextDialect(request.name), request.properties),
           () => graphEpoch() === epochAtStart && doc.byId[props.blockId!]?.raw === rawAtStart,
         );
@@ -619,7 +628,12 @@ export function QueryMacro(props: {
         }
         next = { ...next, view: rebased };
       } catch (error) {
-        setPrintError(errorText(error));
+        // The block or graph changed while its reading was fetched: the
+        // reading no longer describes it, so the edit must not be rebased on
+        // it (GH #543, audit R5-04).
+        setPrintError(error instanceof OperationCancelledError
+          ? "The query text changed. Wait for it to refresh, then try this edit again."
+          : errorText(error));
         return false;
       }
     }
@@ -1382,11 +1396,18 @@ export function QueryMacro(props: {
     score: 0,
     row,
   })));
-  const total = () => friendlySearch() !== null
-    ? searchPresentationHits().length
-    : currentView() === "search"
+  /** **One answer, counted once — whatever face it is wearing** (GH #547).
+   *
+   *  The count is a property of the RESULT, not of the presentation, so the
+   *  row family is chosen by what the run returned and never by `currentView()`.
+   *  A page-anchored answer counts its pages in every view: keying the Search
+   *  face off `searchPresentationHits()` counted blocks a page-anchored run
+   *  never produces, so the header read 0 beside a summary group reading 7. */
+  const total = () => pageRows()
+    ? (matchedTotal() ?? pageRows()!.length)
+    : friendlySearch() !== null || currentView() === "search"
       ? searchPresentationHits().length
-      : (pageRows() ? (matchedTotal() ?? pageRows()!.length) : groups()?.reduce((a, g) => a + g.blocks.length, 0) ?? 0);
+      : groups()?.reduce((a, g) => a + g.blocks.length, 0) ?? 0;
   // **Why empty? (Q14, N19; B1).** `query_explain_empty` was decoded and never
   // rendered, so a query that matched nothing said only "No results" — which is
   // the one moment a user most needs to know WHICH conjunct emptied it. Asked
@@ -2139,9 +2160,16 @@ export function QueryMacro(props: {
             </Show>
             <Show when={groupsError()}>
               {(message) => (
-                <div class="query-unsupported" role="alert">
-                  {message().lead} {message().message}
-                </div>
+                <Show
+                  when={indexFailureOf(groupResource.error)}
+                  fallback={
+                    <div class="query-unsupported" role="alert">
+                      {message().lead} {message().message}
+                    </div>
+                  }
+                >
+                  {(failure) => <IndexFailedNotice subject="Queries" failure={failure()} />}
+                </Show>
               )}
             </Show>
             <Show when={groupsPending() ?? parsePending() ?? explanationPending()}>
@@ -2251,42 +2279,54 @@ export function QueryMacro(props: {
                 when={friendlySearch() !== null}
                 fallback={
                   <Show
-                    when={sheetFace()}
+                    when={pageRows()}
                     fallback={
-                      <>
-                        <Show when={currentView() === "search"}>{blockSearchRows()}</Show>
-                        <Show when={currentView() !== "search"}>
-                          {/* `@page`-anchored results are pages, not blocks (K16):
-                              they carry their physical owner and need no document
-                              load, so they render through the Pages renderer —
-                              under the PAGE settings, which is the only reason a
-                              page-anchored query's columns and grouping can show
-                              at all. */}
-                          <Show when={pageRows()}>
-                            <QueryPageResults
-                              hits={pageRowHits}
-                              view={pageResultView}
-                              onOpen={openPageHit}
-                              linkAttrs={pageHitLinkAttrs}
-                              linkClass="query-page-row"
-                            />
-                          </Show>
-                          <Show
-                            when={groups() && groups()!.length > 0}
-                            fallback={<Show when={!pageRows()?.length}>{emptyResultPanel()}</Show>}
-                          >
-                            {blockGroupRows()}
-                          </Show>
+                      <Show
+                        when={sheetFace()}
+                        fallback={
+                          <>
+                            <Show when={currentView() === "search"}>{blockSearchRows()}</Show>
+                            <Show when={currentView() !== "search"}>
+                              <Show
+                                when={groups() && groups()!.length > 0}
+                                fallback={emptyResultPanel()}
+                              >
+                                {blockGroupRows()}
+                              </Show>
+                            </Show>
+                          </>
+                        }
+                      >
+                        <Show
+                          when={groups() && groups()!.length > 0}
+                          fallback={<div class="query-empty">{emptyResultsMessage()}</div>}
+                        >
+                          {blockSheetRows()}
                         </Show>
-                      </>
+                      </Show>
                     }
                   >
-                    <Show
-                      when={groups() && groups()!.length > 0}
-                      fallback={<div class="query-empty">{emptyResultsMessage()}</div>}
-                    >
-                      {blockSheetRows()}
-                    </Show>
+                    {/* `@page`-anchored results are pages, not blocks (K16): they
+                        carry their physical owner and need no document load, so
+                        they render through the Pages renderer — under the PAGE
+                        settings, which is the only reason a page-anchored query's
+                        columns and grouping can show at all.
+
+                        **All four faces, from the one renderer** (GH #547). The
+                        page renderer already draws search, list, table and board;
+                        routing only List to it sent Table and Board to the BLOCK
+                        sheet, which a page-anchored run leaves empty by
+                        construction, so a query with seven matching pages said
+                        "No results" the moment its face changed. Presentation
+                        never changes membership. */}
+                    <QueryPageResults
+                      hits={pageRowHits}
+                      view={pageResultView}
+                      onOpen={openPageHit}
+                      linkAttrs={pageHitLinkAttrs}
+                      linkClass="query-page-row"
+                    />
+                    <Show when={!pageRows()!.length}>{emptyResultPanel()}</Show>
                   </Show>
                 }
               >
@@ -2657,9 +2697,9 @@ export function EmbedMacro(props: { body: string; blockId?: string }): JSX.Eleme
       && pageIdentityKey(sourcePage) === pageIdentityKey(targetPage);
   };
 
-  const [dataResource] = createResource(
-    () => selfPageEmbed() ? null : `${target()} ${graphEpoch()} ${dataRev()}`,
-    async () => {
+  const embedLane = readLane();
+  const embedKey = () => selfPageEmbed() ? null : `${target()} ${graphEpoch()} ${dataRev()}`;
+  const [dataResource] = createResource(embedKey, (key) => embedLane(() => embedKey() === key, async () => {
     const t = target();
     const blockRef = /^\(\(([^)]+)\)\)$/.exec(t);
     if (blockRef) {
@@ -2676,7 +2716,7 @@ export function EmbedMacro(props: { body: string; blockId?: string }): JSX.Eleme
       return p ? { page: p.name, kind: "page" as PageKind, blocks: p.blocks, embedId: undefined } : null;
     }
     return null;
-  });
+  }));
   // An embed whose target could not be resolved shows the embed-missing marker
   // below — the same thing it shows for a target that does not exist.
   const data = () => readOr(dataResource, undefined, "embed target");

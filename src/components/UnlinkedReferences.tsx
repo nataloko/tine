@@ -11,7 +11,8 @@ import {
   referenceLoadErrorMessage,
   type ReferenceLoadError,
 } from "../lib/referenceLoadError";
-import { createReferenceFetcher, referenceIndexPendingMessage } from "../lib/referenceFetch";
+import { createReferenceFetcher, referenceRead, referenceIndexPendingMessage } from "../lib/referenceFetch";
+import { IndexFailedNotice } from "./IndexFailedNotice";
 import type { QueryNotReadyError } from "../backend";
 import {
   collapsedGroupsFor,
@@ -64,13 +65,13 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
   });
   const [indexPending, setIndexPending] = createSignal<QueryNotReadyError | null>(null);
   const fetchReferences = createReferenceFetcher({
-    currentName: () => props.name,
+    currentRead: () => referenceRead(props.name),
     setLoadError,
     setIndexPending,
   });
   const [groupsResource] = createResource(
-    () => props.name,
-    (n) => fetchReferences(n, () => backend().getUnlinkedRefs(n))
+    () => referenceRead(props.name),
+    (read) => fetchReferences(read, () => backend().getUnlinkedRefs(read.name))
   );
   // `createReferenceFetcher` already routes a failure to `loadError` (rendered
   // below), so this covers the read itself rather than replacing that channel.
@@ -135,9 +136,16 @@ export function UnlinkedReferences(props: { name: string }): JSX.Element {
       </Show>
       <Show when={open()}>
         <Show when={loadError()}>
-          <div class="reference-filter-error reference-error" role="alert">
-            {referenceLoadErrorMessage(loadError()!)}
-          </div>
+          <Show
+            when={loadError()!.kind === "index_failed"}
+            fallback={
+              <div class="reference-filter-error reference-error" role="alert">
+                {referenceLoadErrorMessage(loadError()!)}
+              </div>
+            }
+          >
+            <IndexFailedNotice subject="Unlinked References" failure={loadError()!.indexFailure ?? "other"} />
+          </Show>
         </Show>
         <Show when={occurrenceLimit().truncated}>
           <div class="reference-truncation" role="status">

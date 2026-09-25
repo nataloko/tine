@@ -132,6 +132,10 @@ const GUIDE_TEMPLATES: &[GuideTemplate] = &[
         title: "Reference/Platforms and mobile",
         markdown: include_str!("templates/platforms-and-mobile.md"),
     },
+    GuideTemplate {
+        title: "Reference/Command line",
+        markdown: include_str!("templates/command-line.md"),
+    },
 ];
 
 struct GuideAsset {
@@ -256,7 +260,7 @@ pub fn copy_guide_into_graph(graph: &Graph, title: &str) -> io::Result<GuideCopy
     let plan = guide_copy_plan(title)?;
     // Name-only creation needs one current parsed identity snapshot. App-open
     // graphs already have it; keep this public operation correct for cold callers.
-    graph.with_pages(|_| ());
+    graph.try_with_pages(|_| ())?;
     graph.with_graph_text_write_transaction(move || {
         let mut created_pages = Vec::new();
         let mut skipped_pages = Vec::new();
@@ -512,6 +516,21 @@ mod tests {
             .expect("plugins guide is bundled");
         assert!(plugins.markdown.contains("installed disabled"));
         assert!(plugins.markdown.contains("not Logseq or Obsidian plugins"));
+
+        // GH #543 Ctrl-K: results persist while typing, Enter waits for the
+        // fresh answer, and a short search says when older blocks may match.
+        let search = pages
+            .iter()
+            .find(|p| p.title == "Reference/Pages, links, references, and search")
+            .expect("search reference is bundled");
+        assert!(search.markdown.contains("**Enter** waits for them"));
+        assert!(search
+            .markdown
+            .contains("a third character searches them all"));
+        // ADR 0069: short CJK searches are complete, not recent-only.
+        assert!(search
+            .markdown
+            .contains("such a search always covers every block"));
     }
 
     #[test]
@@ -638,6 +657,56 @@ mod tests {
         );
     }
 
+    /// The search Guide's examples of what folds and what does not are what the
+    /// search fold does (decided by Martin 2026-09-24).
+    #[test]
+    fn search_guide_mark_examples_are_what_search_does() {
+        use crate::search_query::canonical_fold;
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.markdown.contains("Search ignores accent marks"))
+            .expect("the search Guide page is registered");
+        for (query, text) in [
+            ("cafe", "café"),
+            ("lodz", "Łódź"),
+            ("Tine", "Ｔｉｎｅ"),
+            ("елка", "ёлка"),
+        ] {
+            assert!(page.markdown.contains(&format!("`{query}` finds `{text}`")));
+            assert_eq!(
+                canonical_fold(query),
+                canonical_fold(text),
+                "{query} finds {text}"
+            );
+        }
+        for (query, text) in [("か", "が"), ("и", "й"), ("क", "कु")] {
+            assert!(page
+                .markdown
+                .contains(&format!("`{query}` does not find `{text}`")));
+            assert_ne!(
+                canonical_fold(query),
+                canonical_fold(text),
+                "{query} must not find {text}"
+            );
+        }
+    }
+
+    /// GH #543: the Guide tells a user opening a large graph that the toolbar
+    /// shows indexing progress and that Tine is usable meanwhile.
+    #[test]
+    fn search_guide_names_the_indexing_progress_bar() {
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.markdown.contains("Search reads the same index"))
+            .expect("the search Guide page is registered");
+        assert!(page
+            .markdown
+            .contains("the toolbar shows how far it has got"));
+        assert!(page
+            .markdown
+            .contains("the rest of Tine stays usable meanwhile"));
+    }
+
     #[test]
     fn files_reference_page_is_registered_linked_and_copyable() {
         let title = "Reference/Files, external edits, and backups";
@@ -651,18 +720,38 @@ mod tests {
         assert!(page.markdown.contains("logseq/.tine-trash"));
         assert!(page.markdown.contains("Watch for external edits"));
         assert!(page.markdown.contains("Snapshots to keep"));
+        assert!(page.markdown.contains("once opening has settled"));
         assert!(page.markdown.contains("Verify synchronized graph"));
         assert!(page.markdown.contains("`logseq/config.edn` is live too"));
         assert!(page.markdown.contains("Plain text (cleaned, as displayed)"));
         assert!(page.markdown.contains("What you should see"));
         assert!(page.markdown.contains("Retry saving"));
+        // GH #535: one page that cannot save no longer blocks every rename. The
+        // Guide says when it still does, or a refused rename reads as arbitrary.
+        assert!(page
+            .markdown
+            .contains("stops the rename only if the rename would change that page"));
+        assert!(page
+            .markdown
+            .contains("Other pages keep their unsaved edits through the rename"));
         // Query export: the whole-page consequence and the size limit must be
         // in the Guide, because the dialog's one checkbox is all the UI says.
         assert!(page.markdown.contains("published-queries/<name>/"));
         assert!(page.markdown.contains("exports **whole pages**"));
         assert!(page.markdown.contains("Query export size limit"));
+        // PDF export is desktop-only and HTML export is not; the Export
+        // section has to say which, or a mobile user reads absence as
+        // breakage (GH #560).
+        assert!(page.markdown.contains("It is offered on desktop only"));
         assert!(page.markdown.contains("Copy complete recovery data"));
         assert!(page.markdown.contains("Try opening again"));
+        assert!(page.markdown.contains("If Tine refuses to save a page"));
+        assert!(page.markdown.contains("Review unsaved"));
+        assert!(page.markdown.contains("opens the **Conflicts** page"));
+        assert!(!page.markdown.contains("Review in page"));
+        assert!(page.markdown.contains("Copy page link"));
+        assert!(page.markdown.contains("Copy block link"));
+        assert!(page.markdown.contains("one pane with one tab"));
 
         let index = GUIDE_TEMPLATES
             .iter()
@@ -766,6 +855,20 @@ mod tests {
         assert!(page
             .markdown
             .contains("A panel says it could not load something"));
+        // GH #594 (index liveness L4/L5): a failed index is named, with the
+        // way out and the codes the panel shows.
+        assert!(page
+            .markdown
+            .contains("References or queries say the search index couldn't be built"));
+        assert!(page.markdown.contains("Tine stopped retrying"));
+        for code in [
+            "file_in_use",
+            "disk_full",
+            "permission_denied",
+            "out_of_memory",
+        ] {
+            assert!(page.markdown.contains(&format!("`{code}`")), "{code}");
+        }
         assert!(page.markdown.contains("Use disk version"));
         assert!(page.markdown.contains("What you should see"));
         assert!(page
@@ -883,18 +986,20 @@ mod tests {
     fn the_guides_task_query_reaches_tasks_on_a_page_other_than_its_own() {
         let dir = scratch("tine-guide-task-query-is-graph-wide");
         let graph = Graph::open(&dir);
+        // RET2: a public Direct query answers from the projection or reports a
+        // typed failure, so the guide fixture attaches and initializes one
+        // exactly as the app does -- attached before the Guide is copied in,
+        // as in the app (GH #543, R8-14) -- rather than relying on a
+        // parsed-graph walk.
+        graph
+            .attach_direct_projection(dir.join("private/projection.sqlite"))
+            .expect("the disposable projection attaches");
         let workflow = copy_guide_into_graph(&graph, "Workflows/Capture and plan your day")
             .unwrap()
             .name;
         let showcase = copy_guide_into_graph(&graph, "Feature showcase")
             .unwrap()
             .name;
-        // RET2: a public Direct query answers from the projection or reports a
-        // typed failure, so the guide fixture attaches and initializes one
-        // exactly as the app does rather than relying on a parsed-graph walk.
-        graph
-            .attach_direct_projection(dir.join("private/projection.sqlite"))
-            .expect("the disposable projection attaches");
         graph.warm_cache();
 
         let result = loop {
@@ -946,6 +1051,35 @@ mod tests {
     /// runs them through `read_scoped_display_settings` — the one reader every
     /// query block goes through — so the sentence is checked against the
     /// behaviour it promises, and a change to either one has to change both.
+    /// GH #542: the Guide's advanced-query example is one Tine runs whole.
+    #[test]
+    fn gh542_guide_advanced_query_example_runs_whole() {
+        let workflow = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Workflows/Find and revisit")
+            .expect("the find-and-revisit workflow is registered");
+        let start = workflow
+            .markdown
+            .find("`[:find ")
+            .expect("the Guide shows an advanced query");
+        let example = &workflow.markdown[start + 1..];
+        let example = &example[..example.find('`').expect("closed code span")];
+        let today = crate::date::JournalDate::today();
+        let (query, _) = crate::query::parse_query_source(example, today);
+        let result = crate::query::resolve_for_execution(
+            &query,
+            &crate::query::ir::ExecutionContext::default(),
+            today,
+        );
+        assert!(result.report().supported, "{example}");
+        assert!(
+            result.report().ignored.is_empty(),
+            "{:?}",
+            result.report().ignored
+        );
+        assert!(workflow.markdown.contains("never fewer"));
+    }
+
     #[test]
     fn q3_guide_scoped_display_example_roundtrips() {
         use crate::query::ir::{Field, FriendlyPageMatchScope, ViewKind};
@@ -1018,6 +1152,16 @@ mod tests {
         assert!(reference.markdown.contains("`both`"));
         assert!(reference.markdown.contains("`tine.page-match-scope`"));
         assert!(reference.markdown.contains("`tine.page-display:: 1`"));
+        // When a half-written page header is reported is a user-visible rule,
+        // not an implementation detail: the reader has to know the unfinished
+        // line is waiting rather than failing (GH #546).
+        assert!(reference
+            .markdown
+            .contains("checked when you finish editing that header"));
+        // An alias completion row names the page it belongs to (GH #558).
+        assert!(reference
+            .markdown
+            .contains("labelled **alias of** its page"));
     }
 
     #[test]
@@ -1656,8 +1800,21 @@ mod tests {
         assert!(page
             .markdown
             .contains("Hardware Back to return first to the PDF"));
+        // A control the mobile build does not offer has to be named here, or
+        // it reads as broken rather than absent (GH #560).
+        assert!(page.markdown.contains("Export to PDF is desktop-only"));
         assert!(page.markdown.contains("experimental 32-bit Windows"));
-        assert!(page.markdown.contains("no public iOS app"));
+        // GH #572: the macOS web-engine floor and its user remedy are documented.
+        // Updating the Safari app does not update the engine other apps get
+        // on older macOS, so the remedy is the macOS version, not Safari.
+        assert!(page.markdown.contains("Safari 15.4 or later"));
+        assert!(page.markdown.contains("macOS 12.3 (Monterey) or later"));
+        assert!(!page
+            .markdown
+            .contains("updating Safari through Software Update"));
+        assert!(page.markdown.contains("testflight.apple.com/join/rpGGpTVW"));
+        assert!(page.markdown.contains("Plugins do not run on iOS yet"));
+        assert!(page.markdown.contains("f-droid.org/packages/page.tine.app"));
         assert!(page.markdown.contains("[[Workflows/Keep context visible]]"));
         assert!(page.markdown.contains("[[Workflows/Extend Tine]]"));
 
@@ -1814,6 +1971,13 @@ mod tests {
             .markdown;
         for phrase in [
             "still being built",
+            "one complete snapshot",
+            "document order",
+            "never show a partly built index",
+            "index it kept from last time",
+            "update by themselves when the comparison finishes",
+            "block picker",
+            "structured queries keep waiting",
             "says it is searching",
             "Retry",
             "nothing matched",
@@ -1921,6 +2085,28 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_line_reference_covers_the_shipped_surface_and_safety_defaults() {
+        let page = GUIDE_TEMPLATES
+            .iter()
+            .find(|template| template.title == "Reference/Command line")
+            .expect("command-line reference is registered")
+            .markdown;
+        for promised in [
+            "tine --help",
+            "tine --version",
+            "tine open GRAPH",
+            "tine capture",
+            "tine export static GRAPH",
+            "tine export live GRAPH",
+            "tine doctor GRAPH",
+            "--replace",
+            "graph-relative",
+        ] {
+            assert!(page.contains(promised), "Guide omitted {promised}");
+        }
     }
 
     #[cfg(unix)]

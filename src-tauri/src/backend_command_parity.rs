@@ -345,6 +345,7 @@ mod tests {
         ("graph.rs", "create_graph"),
         ("graph.rs", "default_graph_parent"),
         ("graph.rs", "finish_direct_cross_page_move"),
+        ("graph.rs", "indexing_progress"),
         ("graph.rs", "inspect_graph_access"),
         ("graph.rs", "load_graph"),
         ("graph.rs", "open_graph_window"),
@@ -593,9 +594,13 @@ mod tests {
             .split("/// Report what a slow")
             .next()
             .unwrap();
+        let direct_mapper_tokens: String = direct_mapper
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
         assert!(
-            direct_mapper.contains("CommandError::tagged(\n            \"save-conflict\"")
-                && direct_mapper.contains("CommandError::tagged(\n        \"direct-save-failure\"")
+            direct_mapper_tokens.contains("CommandError::tagged(\"save-conflict\"")
+                && direct_mapper_tokens.contains("CommandError::tagged(\"direct-save-failure\"")
                 && !direct_mapper.contains("CommandError::from"),
             "DirectSaveError must retain its closed code and epoch in Tagged, never Io/Prose"
         );
@@ -698,7 +703,7 @@ mod tests {
         // whole packet exists to make unwritable.
         assert_eq!(
             (site_count, site_fingerprint),
-            (240, 13_237_046_910_067_947_179),
+            (240, 3_095_691_140_800_970_953),
             "I-9: phase-B mapper sites drifted. Each row is file|enclosing symbol|mapper, \
              sorted, with NO line numbers — so this cannot be pure line drift; a mapper \
              genuinely moved, changed family, appeared or disappeared. Diff these against \
@@ -903,6 +908,185 @@ mod tests {
         false
     }
 
+    /// Why each remaining sync command may run on the main thread. A sync
+    /// `#[tauri::command]` runs there and freezes every window until it returns
+    /// (GH #332 measured 10-16 s; GH #543 R6-02 waited out a whole index
+    /// pass). Anything that walks the graph, waits on the index, a lane or a
+    /// subprocess, or reads a file the call did not size is `async` +
+    /// `spawn_blocking` instead (exemplar: `conflict_inventory` in commands.rs).
+    const SYNC_COMMANDS: &[(&str, &str)] = {
+        const CONFIG: &str =
+            "one config.edn write; fire-and-forget callers rely on main-thread order";
+        const APP_FILE: &str =
+            "one small app-private file; bursty callers rely on main-thread order";
+        const ONE_FILE: &str = "stats, reads, moves or opens one named file";
+        const PAYLOAD: &str = "writes the bytes this call carried";
+        const STATE: &str = "atomics, a registry read or a channel send";
+        const PURE: &str = "no filesystem work beyond a bounded app-private read";
+        &[
+            ("app_architecture", PURE),
+            ("app_platform", PURE),
+            ("apply_spellcheck", STATE),
+            ("approve_external_assets", ONE_FILE),
+            ("cancel_graph_verification", STATE),
+            ("capture_frontend_ready", STATE),
+            ("capture_graph_binding", STATE),
+            ("capture_target", STATE),
+            ("clear_diagnostics", PURE),
+            ("close_graph_window", STATE),
+            ("copy_image_to_clipboard", PAYLOAD),
+            (
+                "create_graph",
+                "writes a fixed-size demo scaffold into a new folder",
+            ),
+            ("debug_info", PURE),
+            ("debug_log", PURE),
+            ("default_graph_parent", ONE_FILE),
+            (
+                "detect_media_editor",
+                "stats a fixed list of install locations",
+            ),
+            ("diagnostic_frontend_event", PURE),
+            ("diagnostic_ipc_event", PURE),
+            ("diagnostic_report", PURE),
+            ("diagnostic_session_active", PURE),
+            ("edit_asset_external", ONE_FILE),
+            ("forget_known_graph", APP_FILE),
+            ("get_app_bool", APP_FILE),
+            ("get_app_string", APP_FILE),
+            ("get_backup_keep", APP_FILE),
+            ("get_capture_enter_files", APP_FILE),
+            ("get_link_first_match", APP_FILE),
+            ("get_smooth_scroll", APP_FILE),
+            ("get_watch_mode", APP_FILE),
+            ("gpu_env", PURE),
+            ("guide_pages", PURE),
+            ("indexing_progress", STATE),
+            ("inspect_graph_access", ONE_FILE),
+            ("install_plugin", PAYLOAD),
+            ("list_known_graphs", APP_FILE),
+            ("load_conflict_capsules", APP_FILE),
+            ("load_notices", APP_FILE),
+            ("load_plugin_registry_cache", APP_FILE),
+            ("load_session", APP_FILE),
+            ("load_workspaces", APP_FILE),
+            ("open_asset", ONE_FILE),
+            ("open_external", STATE),
+            ("read_custom_css", ONE_FILE),
+            ("read_highlights", ONE_FILE),
+            ("read_journal_file", ONE_FILE),
+            ("read_plugin_entry", ONE_FILE),
+            ("read_text_file", "one CSV/TSV file, capped at 10 MiB"),
+            ("rescan_graph_now", STATE),
+            ("retire_conflict_capsule", APP_FILE),
+            ("reveal_known_graph", STATE),
+            ("rollback_pdf_area_image", ONE_FILE),
+            ("save_asset", PAYLOAD),
+            ("save_notices", APP_FILE),
+            ("save_pdf_area_image", PAYLOAD),
+            ("save_session", APP_FILE),
+            ("save_workspaces", APP_FILE),
+            ("set_app_bool", APP_FILE),
+            ("set_app_string", APP_FILE),
+            ("set_capture_enter_files", APP_FILE),
+            ("set_default_home", CONFIG),
+            ("set_default_journal_template", CONFIG),
+            ("set_doc_mode_enter_for_new_block", CONFIG),
+            ("set_favorites", CONFIG),
+            ("set_favorites_page", CONFIG),
+            ("set_guide_announced", CONFIG),
+            ("set_link_first_match", APP_FILE),
+            ("set_logical_outdenting", CONFIG),
+            ("set_plugin_enabled", APP_FILE),
+            ("set_preferred_format", CONFIG),
+            ("set_journal_title_format", CONFIG),
+            ("set_preferred_workflow", CONFIG),
+            ("set_show_brackets", CONFIG),
+            ("set_smooth_scroll", APP_FILE),
+            ("set_start_of_week", CONFIG),
+            ("set_timetracking_enabled", CONFIG),
+            ("set_watch_mode", APP_FILE),
+            ("store_conflict_capsule", APP_FILE),
+            ("store_plugin_registry_cache", APP_FILE),
+            ("stream_asset_path", ONE_FILE),
+            ("take_data_home_fallback_notice", STATE),
+            ("take_identifier_migration_notice", STATE),
+            ("tine_open_devtools", STATE),
+            (
+                "tine_quit",
+                "exits; the exit drain is bounded by EXIT_DRAIN_BUDGET",
+            ),
+            ("trash_asset", ONE_FILE),
+            ("trash_sync_conflict", ONE_FILE),
+            ("uninstall_plugin", ONE_FILE),
+            ("verify_plugin_registry", PURE),
+            ("warm_done", STATE),
+            ("watcher_latency_recent", PURE),
+        ]
+    };
+
+    /// `(name, is async, body)` for every `#[tauri::command]` in `src-tauri/src`.
+    fn every_command() -> Vec<(String, bool, String)> {
+        let mut out = Vec::new();
+        for (_, source) in crate::test_support::rust_module_sources() {
+            let source = crate::test_support::without_cfg_test_items(&source);
+            for (name, body) in tauri_command_bodies(&source) {
+                let head = &source[..source.find(&body).unwrap()];
+                let head = &head[head.rfind("#[tauri::command]").unwrap()..];
+                let signature = &head[..head.find(&format!("fn {name}")).unwrap()];
+                let is_async = signature.split_whitespace().any(|word| word == "async");
+                out.push((name, is_async, body));
+            }
+        }
+        assert!(
+            out.len() > 150,
+            "the command scan found only {} commands -- the scanner broke, not the code",
+            out.len()
+        );
+        out
+    }
+
+    #[test]
+    fn every_sync_command_says_why_it_may_run_on_the_main_thread() {
+        let sync: BTreeSet<String> = every_command()
+            .into_iter()
+            .filter(|(_, is_async, _)| !is_async)
+            .map(|(name, _, _)| name)
+            .collect();
+        let listed: BTreeSet<String> = SYNC_COMMANDS
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect();
+        let unlisted: Vec<&String> = sync.difference(&listed).collect();
+        assert!(
+            unlisted.is_empty(),
+            "these sync #[tauri::command]s run on the main thread and freeze every window \
+             until they return. Make each `async` + `spawn_blocking` (exemplar: \
+             conflict_inventory in commands.rs), or add it to SYNC_COMMANDS with the reason \
+             it is bounded (GH #543, R6-02): {unlisted:?}"
+        );
+        let stale: Vec<&String> = listed.difference(&sync).collect();
+        assert!(
+            stale.is_empty(),
+            "SYNC_COMMANDS lists commands that are no longer sync commands: {stale:?}"
+        );
+    }
+
+    /// An async command runs on a runtime worker; its blocking work belongs in
+    /// `spawn_blocking` (`open_graph_window` once opened a graph inline).
+    #[test]
+    fn async_commands_open_graphs_inside_spawn_blocking() {
+        for (name, is_async, body) in every_command() {
+            let Some(call) = body.find("load_graph_for_label(") else {
+                continue;
+            };
+            assert!(
+                is_async && body[..call].contains("spawn_blocking("),
+                "{name} opens a graph outside spawn_blocking; exemplar: load_graph in graph.rs"
+            );
+        }
+    }
+
     /// Everything the frontend asks for must exist. A name that is not
     /// registered fails at runtime with "command not found", on whatever page
     /// happens to call it.
@@ -984,6 +1168,34 @@ mod tests {
             stale.is_empty(),
             "these REBINDING_COMMANDS entries no longer reach refresh_graph; the \
              frontend discards live graph-scoped state for nothing: {stale:?}"
+        );
+    }
+
+    /// GH #543 (indexing audit IT-06, R2-P1): a settings command does not
+    /// decide to reopen the graph; `Config::reach` does, and
+    /// `state::apply_config_write` reopens through the one config decider
+    /// (`take_in_config_change`, audit R10-07). `refresh_graph` retires the
+    /// index worker and restarts the launch check, so a settings command that
+    /// calls it by hand restarts indexing for a toggle, and reopens a second
+    /// time for a change that reaches the graph. There is no exception:
+    /// `set_journal_title_format` claimed one for a journal-file migration no
+    /// refresh performs (audit R9-15b).
+    #[test]
+    fn settings_commands_leave_reopening_to_the_config_reach() {
+        let reopening = commands_that_reopen_the_graph();
+        let mut settings_that_reopen = BTreeSet::new();
+        for (_, source) in crate::test_support::rust_module_sources() {
+            for (name, body) in tauri_command_bodies(&source) {
+                if body.contains("apply_config_write(") && reopening.contains(&name) {
+                    settings_that_reopen.insert(name);
+                }
+            }
+        }
+        assert_eq!(
+            settings_that_reopen,
+            BTreeSet::new(),
+            "a settings command calls refresh_graph itself; let apply_config_write \
+             take the change in (see set_show_brackets in commands.rs)"
         );
     }
 

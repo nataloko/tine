@@ -23,7 +23,13 @@ import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { hlsPageName } from "./pdf";
 import { leadingMarker } from "./markers";
 import { fuzzyScore } from "./editor/autocomplete";
-import { canonicalFold, matcherMatches, matchHighlights, parseSearchQuery, simpleTerm } from "./editor/searchQuery";
+import { parseSearchQuery } from "./editor/searchQuery";
+import {
+  mockSearchFold,
+  mockSearchHighlights,
+  mockSearchMatches,
+  mockSearchSimpleTerm,
+} from "./mockSearchQuery";
 import { parseJournalWith } from "./journal";
 
 /** The dev preview's stand-in for `query_print`'s refusal (§7.1, I-9): the same
@@ -218,6 +224,8 @@ function mockReferencedPageNames(pages: PageDto[]): string[] {
 
 let _id = 0;
 const nid = () => `mock-${_id++}`;
+/** `onGraphReopened` subscribers: the mock's stand-in for the watcher's `graph-rebound`. */
+const graphReopenedListeners = new Set<() => void>();
 const mockPlugins: InstalledPluginRecord[] = [];
 const mockPluginEntries = new Map<string, Uint8Array>();
 let mockPluginRegistryCache: PluginRegistryCacheEnvelope | null = null;
@@ -268,7 +276,7 @@ const PAGES: PageDto[] = [
       b("A code block:\n```rust\nfn main() {\n    println!(\"hello, tine\");\n}\n```"),
       b("A table:\n| Feature | Status |\n| --- | --- |\n| Outliner | done |\n| Queries | partial |"),
       b("DONE Validate round-trip on the real `shui-graph`"),
-      b("Inline math works too: $E = mc^2$ and references like ((arch-1))."),
+      b("Inline math works too: $E = mc^2$ and references like ((58900000-0000-4000-8000-0000000000b1))."),
       b("```calc\n1 + 2\n2+4\n5 + 4\nx = 12 * 3\nx / 4\n```"),
       b("Open tasks across the graph:"),
       b("{{query (todo TODO DOING)}}"),
@@ -317,7 +325,7 @@ const NAMED: PageDto[] = [
         b("Reads the same markdown graph as OG Logseq."),
       ]),
       b("## Architecture"),
-      b("Rust core owns parsing; the frontend owns the live editing tree.\nid:: arch-1"),
+      b("Rust core owns parsing; the frontend owns the live editing tree.\nid:: 58900000-0000-4000-8000-0000000000b1"),
       b("A PDF asset: [sample.pdf](../assets/sample.pdf)"),
     ],
   },
@@ -1025,8 +1033,7 @@ export function mockBackend(): Backend {
       };
     },
     async setGuideAnnounced(announced: boolean): Promise<void> {
-      mockGuideAnnounced = announced;
-      notifyGraphRebound(); // reaches refresh_graph in the real backend
+      mockGuideAnnounced = announced; // presentation-only: no rebind (GH #543)
     },
     async createGraph(_dir: string): Promise<string> {
       return "/mock/new-graph"; // no real scaffolding in the browser mock
@@ -1035,8 +1042,12 @@ export function mockBackend(): Backend {
       const n = name.toLowerCase();
       return collect((b) => pageRefs(b.raw).some((r) => r.toLowerCase() === n), name);
     },
-    async getBacklinkFilterContext(name: string, targets: BacklinkFilterTarget[]): Promise<BacklinkFilterContext> {
+    async getBacklinkFilterContext(name: string, targets: BacklinkFilterTarget[], search: string): Promise<BacklinkFilterContext> {
       const excluded = name.trim().toLowerCase();
+      // Browser preview only: production matching is native. This adapter keeps
+      // mirroring the shared TypeScript search grammar until the preview can
+      // call Rust directly.
+      const matcher = parseSearchQuery(search);
       const wanted = new Map(targets.map((item) => [
         `${item.kind}\0${item.page.toLowerCase()}\0${item.block_id}`,
         item,
@@ -1058,12 +1069,22 @@ export function mockBackend(): Backend {
             node.children.forEach(subtree);
           };
           subtree(block);
-          entries.push({ ...target, text: text.join("\n"), facets: [...facets.values()] });
+          const original = text.join("\n");
+          entries.push({
+            ...target,
+            facets: [...facets.values()],
+            text_matches: matcher.kind === "empty" || matcher.kind === "invalid"
+              || mockSearchMatches(matcher, original),
+          });
         }
         block.children.forEach((child) => visit(page, child));
       };
       for (const page of all) page.blocks.forEach((block) => visit(page, block));
-      return { entries, truncated: entries.length < wanted.size };
+      return {
+        entries,
+        search_error: matcher.kind === "invalid" ? matcher.error : undefined,
+        truncated: entries.length < wanted.size,
+      };
     },
     async getUnlinkedRefs(name: string): Promise<RefGroup[]> {
       const n = name.toLowerCase();
@@ -1075,6 +1096,9 @@ export function mockBackend(): Backend {
     },
     async warmDone(): Promise<boolean> {
       return true;
+    },
+    async indexingProgress() {
+      return null;
     },
     async getBlockRefCounts(): Promise<Record<string, number>> {
       const counts: Record<string, number> = {};
@@ -1091,14 +1115,14 @@ export function mockBackend(): Backend {
       return collect((b) => blockRefIds(b.raw).includes(uuid));
     },
     async setDefaultHome(): Promise<void> {
-      notifyGraphRebound();
+      // Taken in place: the real backend keeps the Graph (GH #543).
     },
     async deletePage(): Promise<void> {
       // no-op in mock
     },
     async renamePage(): Promise<RenameOutcome> {
       // no-op in mock; nothing is ever quarantined here
-      return { skippedConflictedReferrers: [] };
+      return { skippedConflictedReferrers: [], touched: [] };
     },
     async publishHtml(): Promise<[string, number]> {
       return ["/mock/graph/publish", all.length];
@@ -1390,27 +1414,31 @@ export function mockBackend(): Backend {
     async setPreferredWorkflow(): Promise<void> {
       // no-op in the browser mock
     },
-    // These settings reach `refresh_graph` in the real backend, which installs a
-    // FRESH Graph with an empty editor-activation registry. Not a no-op even
-    // here: a mock that silently omits a contract lets every test that uses it
-    // prove the wrong thing. (GH #254 increment 3, round 15.)
     async setTimetrackingEnabled(): Promise<void> {
-      notifyGraphRebound();
+      // Presentation-only: the real backend keeps the Graph (GH #543).
     },
     async setShowBrackets(): Promise<void> {
-      notifyGraphRebound();
+      // Presentation-only: the real backend keeps the Graph (GH #543).
     },
     async setDocModeEnterForNewBlock(): Promise<void> {
-      notifyGraphRebound();
+      // Presentation-only: the real backend keeps the Graph (GH #543).
     },
     async setLogicalOutdenting(): Promise<void> {
-      notifyGraphRebound();
+      // Presentation-only: the real backend keeps the Graph (GH #543).
     },
     async setPreferredFormat(): Promise<void> {
-      notifyGraphRebound();
+      // Taken in place: the real backend keeps the Graph (GH #543).
     },
+    // This setting reaches the graph in the real backend: the command's config
+    // write reopens it off the main thread, installing a FRESH Graph with an
+    // empty editor-activation registry, and announces that as `graph-rebound`
+    // -- not the command's return (GH #543, audits R9-15b and R10-07). Not a no-op even here: a mock that silently
+    // omits a contract lets every test that uses it prove the wrong thing.
+    // (GH #254 increment 3, round 15.)
     async setJournalTitleFormat(): Promise<void> {
-      notifyGraphRebound();
+      queueMicrotask(() => {
+        for (const listener of [...graphReopenedListeners]) listener();
+      });
     },
     async setDefaultJournalTemplate(): Promise<void> {
       // no-op in the browser mock
@@ -1444,17 +1472,17 @@ export function mockBackend(): Backend {
       return [...map.entries()].map(([k, vs]) => [k, [...vs].sort()] as [string, string[]]);
     },
     async search(query: string, limit: number): Promise<RefGroup[]> {
-      const q = canonicalFold(query.trim());
+      const q = mockSearchFold(query.trim());
       if (!q) return [];
       let n = limit;
-      const groups = collect((b) => canonicalFold(b.raw).includes(q));
+      const groups = collect((b) => mockSearchFold(b.raw).includes(q));
       for (const g of groups) {
         if (g.blocks.length > n) g.blocks = g.blocks.slice(0, n);
         n -= g.blocks.length;
       }
       return groups.filter((g) => g.blocks.length > 0);
     },
-    async runGraphSearch(source: string, pageLimit: number, blockLimit: number, _lane?: string, explain = false, scope?: import("./types").QueryPageScope): Promise<QueryExecution> {
+    async runGraphSearch(source: string, pageLimit: number, blockLimit: number, _lane?: string, explain = false, scope?: import("./types").QueryPageScope, _options?: import("./editor/queryIr").GraphSearchDisplayOptions, _consumer?: import("./editor/queryIr").GraphSearchConsumer): Promise<QueryExecution> {
       // Browser-preview approximation only (ADR 0016). Production matching,
       // diagnostics, and UTF-16 evidence come from Rust's QueryPlan evaluator.
       const matcher = parseSearchQuery(source);
@@ -1466,10 +1494,10 @@ export function mockBackend(): Backend {
           cancelled: false,
         };
       }
-      const bare = simpleTerm(matcher);
+      const bare = mockSearchSimpleTerm(matcher);
       const pageMatches = scope ? [] : all
-        .map((page) => ({ page, score: bare ? fuzzyScore(bare, canonicalFold(page.name)) : 0 }))
-        .filter(({ page, score }) => bare ? score > 0 : matcherMatches(matcher, canonicalFold(page.name), page.name))
+        .map((page) => ({ page, score: bare ? fuzzyScore(bare, mockSearchFold(page.name)) : 0 }))
+        .filter(({ page, score }) => bare ? score > 0 : mockSearchMatches(matcher, page.name))
         .sort((a, b) => b.score - a.score);
       const pages = pageMatches
         .slice(0, pageLimit)
@@ -1481,32 +1509,32 @@ export function mockBackend(): Backend {
             clause_id: 1,
             field: "page_name" as const,
             mode: bare ? "fuzzy" as const : matcher.kind === "regex" ? "regex" as const : "contains" as const,
-            spans: matchHighlights(matcher, page.name),
+            spans: mockSearchHighlights(matcher, page.name),
             score,
           }],
           score,
           match_class: bare
-            ? canonicalFold(page.name) === bare ? "exact" as const
-              : canonicalFold(page.name).startsWith(bare) ? "prefix" as const
-              : canonicalFold(page.name).includes(bare) ? "substring" as const
+            ? mockSearchFold(page.name) === bare ? "exact" as const
+              : mockSearchFold(page.name).startsWith(bare) ? "prefix" as const
+              : mockSearchFold(page.name).includes(bare) ? "substring" as const
               : "fuzzy" as const
             : undefined,
         }));
       const inScope = (group: RefGroup) => {
         if (!scope) return true;
-        const page = all.find((candidate) => candidate.kind === group.kind && canonicalFold(candidate.name) === canonicalFold(group.page));
+        const page = all.find((candidate) => candidate.kind === group.kind && mockSearchFold(candidate.name) === mockSearchFold(group.page));
         if (!page) return false;
         return scope.path
           ? mockPagePath(page) === scope.path
-          : page.kind === scope.pageKind && canonicalFold(page.name) === canonicalFold(scope.name);
+          : page.kind === scope.pageKind && mockSearchFold(page.name) === mockSearchFold(scope.name);
       };
-      const blockMatches = collect((block) => matcherMatches(matcher, canonicalFold(block.raw), block.raw))
+      const blockMatches = collect((block) => mockSearchMatches(matcher, block.raw))
         .filter(inScope)
         .flatMap((group) => group.blocks.map((block) => ({ group, block })));
       const blocks = blockMatches
         .slice(0, Math.max(0, blockLimit))
         .map(({ group, block }) => {
-          const owner = all.find((candidate) => candidate.kind === group.kind && canonicalFold(candidate.name) === canonicalFold(group.page));
+          const owner = all.find((candidate) => candidate.kind === group.kind && mockSearchFold(candidate.name) === mockSearchFold(group.page));
           return {
             entity: "block" as const,
             page: group.page,
@@ -1518,7 +1546,7 @@ export function mockBackend(): Backend {
               clause_id: 1,
               field: "visible_content" as const,
               mode: matcher.kind === "regex" ? "regex" as const : "contains" as const,
-              spans: matchHighlights(matcher, block.raw),
+              spans: mockSearchHighlights(matcher, block.raw),
             }],
           };
         });
@@ -1553,9 +1581,9 @@ export function mockBackend(): Backend {
       ];
     },
     async quickSwitch(query: string, limit: number): Promise<PageEntry[]> {
-      const q = canonicalFold(query.trim());
+      const q = mockSearchFold(query.trim());
       return all
-        .filter((p) => canonicalFold(p.name).includes(q))
+        .filter((p) => mockSearchFold(p.name).includes(q))
         .slice(0, limit)
         .map(mockPageEntry);
     },
@@ -1804,32 +1832,81 @@ export function mockBackend(): Backend {
     async renameFileToPage(): Promise<void> {
       // no-op in the browser mock
     },
-    async listSyncConflicts() {
+    async conflictInventory() {
       // Gated on the same `?conflicts` flag as the journal-day demo, so the
-      // reconcile area stays out of the marketing screenshots by default.
-      if (typeof location !== "undefined" && !/[?&]conflicts\b/.test(location.search)) return [];
-      return [
-        {
-          path: "pages/Project Plan.sync-conflict-20260705-141233-A2B2C3D.md",
-          base_name: "Project Plan",
-          base_path: "pages/Project Plan.md",
-          kind: "page" as const,
-          tag: "sync-conflict-20260705-141233-A2B2C3D",
-          preview: "Milestones for the launch",
-        },
-      ];
-    },
-    async listVcsMarkerConflicts() {
-      // Same `?conflicts` demo flag as listSyncConflicts above.
-      if (typeof location !== "undefined" && !/[?&]conflicts\b/.test(location.search)) return [];
-      return [
-        {
-          path: "pages/Tine.md",
-          name: "Tine",
-          kind: "page" as const,
-          markers: ["<<<<<<<", "=======", ">>>>>>>"],
-        },
-      ];
+      // reconcile area stays out of the marketing screenshots by default. The
+      // queue is derived from exactly the two listings, as in core.
+      if (typeof location !== "undefined" && !/[?&]conflicts\b/.test(location.search)) {
+        return { sync_conflicts: [], vcs_markers: [], queue: [] };
+      }
+      return {
+        sync_conflicts: [
+          {
+            path: "pages/Project Plan.sync-conflict-20260705-141233-A2B2C3D.md",
+            base_name: "Project Plan",
+            base_path: "pages/Project Plan.md",
+            kind: "page" as const,
+            tag: "sync-conflict-20260705-141233-A2B2C3D",
+            preview: "Milestones for the launch",
+          },
+        ],
+        vcs_markers: [
+          {
+            path: "pages/Tine.md",
+            name: "Tine",
+            kind: "page" as const,
+            markers: ["<<<<<<<", "=======", ">>>>>>>"],
+          },
+        ],
+        queue: [
+          {
+            id: "copy:pages/Project Plan.sync-conflict-20260705-141233-A2B2C3D.md",
+            source: "sync-copy" as const,
+            page_name: "Project Plan",
+            page_path: "pages/Project Plan.md",
+            kind: "page" as const,
+            sides: [
+              { role: "mine" as const, label: "This device", path: "pages/Project Plan.md" },
+              {
+                role: "theirs" as const,
+                label: "sync-conflict-20260705-141233-A2B2C3D",
+                path: "pages/Project Plan.sync-conflict-20260705-141233-A2B2C3D.md",
+              },
+              { role: "base" as const, label: "Last agreed version" },
+            ],
+            block_conflicts: 4,
+          },
+          {
+            id: "markers:pages/Tine.md",
+            source: "vcs-markers" as const,
+            page_name: "Tine",
+            page_path: "pages/Tine.md",
+            kind: "page" as const,
+            sides: [
+              { role: "mine" as const, label: "HEAD" },
+              { role: "theirs" as const, label: "feature/concord" },
+            ],
+            block_conflicts: 1,
+            markers: ["<<<<<<<", "=======", ">>>>>>>"],
+          },
+          {
+            id: "journal:journals/2026_06_26.org",
+            source: "duplicate-journal" as const,
+            page_name: "Friday, 26-06-2026",
+            page_path: "journals/2026_06_26.org",
+            kind: "journal" as const,
+            sides: [
+              { role: "mine" as const, label: "2026_06_26.org", path: "journals/2026_06_26.org" },
+              {
+                role: "theirs" as const,
+                label: "Friday, 26-06-2026.org",
+                path: "journals/Friday, 26-06-2026.org",
+              },
+            ],
+            block_conflicts: 2,
+          },
+        ],
+      };
     },
     async syncConflictDiff() {
       const v = (text: string) => ({ uuid: "", text, child_count: 0 });
@@ -1925,59 +2002,6 @@ export function mockBackend(): Backend {
     },
     async resolveLiveSaveConflict(page) {
       return { ...page, rev: "mock-live-resolved" };
-    },
-    async conflictQueue() {
-      // Same `?conflicts` demo flag as the two listings above; the queue is
-      // derived from exactly them, so the demo stays consistent.
-      if (typeof location !== "undefined" && !/[?&]conflicts\b/.test(location.search)) return [];
-      return [
-        {
-          id: "copy:pages/Project Plan.sync-conflict-20260705-141233-A2B2C3D.md",
-          source: "sync-copy" as const,
-          page_name: "Project Plan",
-          page_path: "pages/Project Plan.md",
-          kind: "page" as const,
-          sides: [
-            { role: "mine" as const, label: "This device", path: "pages/Project Plan.md" },
-            {
-              role: "theirs" as const,
-              label: "sync-conflict-20260705-141233-A2B2C3D",
-              path: "pages/Project Plan.sync-conflict-20260705-141233-A2B2C3D.md",
-            },
-            { role: "base" as const, label: "Last agreed version" },
-          ],
-          block_conflicts: 4,
-        },
-        {
-          id: "markers:pages/Tine.md",
-          source: "vcs-markers" as const,
-          page_name: "Tine",
-          page_path: "pages/Tine.md",
-          kind: "page" as const,
-          sides: [
-            { role: "mine" as const, label: "HEAD" },
-            { role: "theirs" as const, label: "feature/concord" },
-          ],
-          block_conflicts: 1,
-          markers: ["<<<<<<<", "=======", ">>>>>>>"],
-        },
-        {
-          id: "journal:journals/2026_06_26.org",
-          source: "duplicate-journal" as const,
-          page_name: "Friday, 26-06-2026",
-          page_path: "journals/2026_06_26.org",
-          kind: "journal" as const,
-          sides: [
-            { role: "mine" as const, label: "2026_06_26.org", path: "journals/2026_06_26.org" },
-            {
-              role: "theirs" as const,
-              label: "Friday, 26-06-2026.org",
-              path: "journals/Friday, 26-06-2026.org",
-            },
-          ],
-          block_conflicts: 2,
-        },
-      ];
     },
     async vcsMarkerConflictDiff(path: string) {
       if (path !== "pages/Tine.md") return null;
@@ -2089,10 +2113,17 @@ export function mockBackend(): Backend {
     async onGraphConfigChanged(): Promise<() => void> {
       return () => {};
     },
+    async onGraphReopened(cb: () => void): Promise<() => void> {
+      graphReopenedListeners.add(cb);
+      return () => graphReopenedListeners.delete(cb);
+    },
     async onQueryProjectionChanged(): Promise<() => void> {
       return () => {};
     },
     async onGraphWatchError(): Promise<() => void> {
+      return () => {};
+    },
+    async onGraphUnreadablePages(): Promise<() => void> {
       return () => {};
     },
     async getBackupKeep(): Promise<number> {
@@ -2123,6 +2154,9 @@ export function mockBackend(): Backend {
       return [];
     },
     async restoreBackup(): Promise<void> {
+      notifyGraphRebound();
+    },
+    async retryIndex(): Promise<void> {
       notifyGraphRebound();
     },
     async loadSession(): Promise<string | null> {

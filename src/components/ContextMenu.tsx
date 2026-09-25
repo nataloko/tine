@@ -1,4 +1,3 @@
-import { renameFlushFailureMessage } from "../persistence";
 import { For, Show, Switch, Match, createEffect, createSignal, onCleanup, type JSX } from "solid-js";
 import {
   contextMenu,
@@ -22,8 +21,9 @@ import {
 } from "../ui";
 import { openPage, openPageTarget, openPageTargetInNewTab, openPageAtBlock, openInNewTab, pageTargetMatchesLoaded, type PageTarget } from "../router";
 import { activePaneRoutes, removePageTargetAcrossPanes } from "../panes";
-import { refreshAfterRename, renameOrMergePage } from "../graph";
+import { prepareRename, refreshAfterRename, renameOrMergePage } from "../graph";
 import { backend } from "../backend";
+import { isMobilePlatform } from "../nativeChrome";
 import { carryDay } from "../carry";
 import { journalTitle } from "../journal";
 import { BLOCK_COLOR_NAMES, BLOCK_COLOR_SWATCH } from "../blockColors";
@@ -41,7 +41,6 @@ import {
   setSelectionHeading,
   setCollapsedDeep,
   dtoSubtreeMarkdown,
-  flushAll,
   flushPage,
   isDirty,
   deletePage,
@@ -80,6 +79,8 @@ import { copyBlockOutline, writeClipboardText } from "../clipboard";
 import type { PageKind } from "../types";
 import { registerTransientLayer } from "../transientLayers";
 import { beginPageDeleteTrace } from "../pageDeleteTrace";
+import { isPublishedExport } from "../publishedBackend";
+import { publishedPermalinkUrl } from "../publishedPermalink";
 
 // Copy a block reference/embed — but only after the block's id:: is durably on
 // disk. ensureBlockId returns null if the save couldn't land (conflict/error), in
@@ -977,6 +978,16 @@ function PageMenu(props: {
     { id: "open-new-tab", label: "Open in new tab", run: () => openPageTargetInNewTab(target()) },
     { id: "favorite-toggle", label: fav() ? "Remove from favorites" : "Add to favorites", run: () => toggleFavorite(props.name, props.pageKind) },
     { id: "copy-page-ref", label: "Copy page ref", run: () => { void writeClipboardText(`[[${props.name}]]`); pushToast("Copied page ref", "success"); } },
+    ...(isPublishedExport()
+      ? [{
+          id: "copy-page-link",
+          label: "Copy page link",
+          run: () => {
+            void writeClipboardText(publishedPermalinkUrl({ kind: "page", page: props.name }));
+            pushToast("Copied page link", "success");
+          },
+        }]
+      : []),
     {
       id: "copy-export",
       label: "Copy / export as…",
@@ -1006,7 +1017,10 @@ function PageMenu(props: {
           });
       },
     },
-    { id: "export-pdf", label: "Export to PDF…", run: () => openPdfExport(props.name) },
+    // Not offered on mobile: no mobile WebView can print (GH #560, see openPdfExport).
+    ...(isMobilePlatform
+      ? []
+      : [{ id: "export-pdf", label: "Export to PDF…", run: () => openPdfExport(props.name) }]),
     ...(props.fileActions && !pageByName(props.name)?.guide
       ? [
           { id: "show-in-folder", label: "Show in folder", run: () => void runFileAction(true) },
@@ -1120,21 +1134,27 @@ function RenamePage(props: {
     props.close(false);
     if (!next || next === from) return;
     try {
-      // Persist ALL unsaved edits first — the rename reads every referencing page
-      // from disk to rewrite its `[[refs]]`, so a dirty edit on ANY page would be
-      // read stale and lost.
-      if (!(await flushAll())) {
-        pushToast(renameFlushFailureMessage(), "error", { sticky: true });
+      // Save every pending edit first: the rename reads referring pages from
+      // disk to rewrite their `[[refs]]`. An edit that cannot be saved blocks
+      // the rename only if the rename would touch it (GH #535).
+      const prepared = await prepareRename(from);
+      if (!prepared.ok) {
+        pushToast(prepared.message, "error", { sticky: true });
         return;
       }
-      const outcome = await renameOrMergePage(from, next, props.path);
-      if (outcome === "cancelled") return;
-      // Backend rewrote refs across pages via the self-write guard (no watcher
-      // reload) → in-memory pages are stale; reset + reload so a stale save can't
-      // revert the rename.
-      refreshAfterRename(from, next, { name: from, pageKind: kind, ...(props.path ? { path: props.path } : {}) });
+      const result = await renameOrMergePage(from, next, props.path, prepared.unsavedPaths);
+      if (result.status === "cancelled") return;
+      // The backend rewrote refs through the self-write guard (no watcher
+      // reload): refresh the pages it touched so a stale save can't revert the
+      // rename.
+      void refreshAfterRename(
+        from,
+        next,
+        { name: from, pageKind: kind, ...(props.path ? { path: props.path } : {}) },
+        result.status === "renamed" ? result.touched : null,
+      );
       openPage(next, kind);
-      pushToast(outcome === "merged" ? `Merged into “${next}”` : `Renamed to “${next}”`, "success");
+      pushToast(result.status === "merged" ? `Merged into “${next}”` : `Renamed to “${next}”`, "success");
     } catch (e) {
       pushToast(`Rename failed: ${String(e)}`, "error");
     }
@@ -1189,6 +1209,16 @@ function blockActions(id: string, x: number, y: number): { label: string; run: (
       { label: "Open in sidebar", run: () => openBlockInSidebar(persistentBlockRef(id)) },
       { label: "Zoom into block", run: () => zoomInto(id) },
       { label: "Open in new tab", run: () => openBlockInNewTab(id) },
+      ...(isPublishedExport()
+        ? [{
+            label: "Copy block link",
+            run: () => {
+              const ref = persistentBlockRef(id);
+              void writeClipboardText(publishedPermalinkUrl({ kind: "block", block: ref.uuid }));
+              pushToast("Copied block link", "success");
+            },
+          }]
+        : []),
       { label: "Copy block", run: () => { const text = blockSubtreeMarkdown(id, 0, true, copyStripCollapsed()); void copyBlockOutline("copy", text, buildClipboardPayload([id])); pushToast("Copied block", "success"); } },
       {
         label: "Copy / export as…",

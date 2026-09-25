@@ -1,6 +1,5 @@
 // Small global UI state: theme, left sidebar, and the quick-switcher modal.
-import { createMemo, createSignal, useContext } from "solid-js";
-import { notifyGraphRebound } from "./modeHooks";
+import { batch, createMemo, createSignal, useContext } from "solid-js";
 import { isPublishedExport } from "./publishedBackend";
 import { graphBinding } from "./persistence";
 import type {
@@ -23,6 +22,7 @@ import {
 } from "./backend";
 import { pageIdentityKey } from "./pageIdentity";
 import { failureShape } from "./failureShape";
+import { isMobilePlatform } from "./nativeChrome";
 import { membershipChanged, resetFavoritesLayout, setMembershipSink, storedFavoritesLayout } from "./favoritesStore";
 import { reconcileLayout } from "./favoritesLayout";
 // Zoom is route state; these are call-time only, so the ui↔router cycle is safe.
@@ -323,20 +323,12 @@ export function changeJournalTitleFormat(fmt: string) {
   setGraphMeta({ ...m, journal_page_title_format: next });
   setJournalTitleFormat(next);
   bumpGraphEpoch(); // immediate: re-render open journal titles with the new format
-  // The backend rewrites config.edn AND reopens the graph (so its journal_format
-  // + the title-named-journal migration take effect). Bump again once that's done
-  // so the feed reloads against the refreshed backend — otherwise a reload racing
-  // the reopen could re-query the old format.
+  // The backend writes config.edn; the format reaches the graph, so the
+  // backend reopens it once and announces `graph-rebound` (applyGraphReopened),
+  // which rebinds and repaints against the reopened graph. No journal file is
+  // renamed (GH #543, audits R9-15b and R10-07).
   void backend()
     .setJournalTitleFormat(next)
-    .then(() => {
-      bumpGraphEpoch();
-      // The reopen may have MIGRATED journal filenames, so this is a genuine
-      // rebind and not just a repaint: anything still in flight against the old
-      // binding is now aimed at paths that may not exist.
-      notifyGraphRebound();
-      void refreshJournalConflicts(); // the queue surfaces any day the migration couldn't merge
-    })
     .catch(() => {});
 }
 
@@ -355,12 +347,17 @@ export const [journalConflicts, setJournalConflicts] = createSignal<JournalConfl
  *  kept here only until this day had a surface of its own. The Settings list
  *  stays as the fallback, exactly as Backups does for sync copies. */
 export async function refreshJournalConflicts(): Promise<void> {
+  // The listing walks journals/ off the main thread, so overlapping refreshes
+  // can answer out of order; only the newest may publish (GH #543, R6-02).
+  const generation = ++journalConflictRefreshGeneration;
   try {
-    setJournalConflicts(await backend().listJournalConflicts());
+    const conflicts = await backend().listJournalConflicts();
+    if (generation === journalConflictRefreshGeneration) setJournalConflicts(conflicts);
   } catch {
     /* best-effort */
   }
 }
+let journalConflictRefreshGeneration = 0;
 
 // --- sync-tool conflict copies (Syncthing/Dropbox `*.sync-conflict-*` files).
 // Excluded from the page list; surfaced here so the user can review + merge them
@@ -582,9 +579,6 @@ export function conflictObjectFor(
     || (conflict.source === "live-save" && name !== undefined && conflict.page_name === name)
   );
 }
-// Where the badge left off, so repeated clicks WALK the queue instead of parking
-// on its first item. Transient session state: the queue itself is derived.
-let conflictCursor = 0;
 const artifactArrivalToasts = new Map<number, Set<string>>();
 // Inventory calls include several awaited filesystem walks. Only the newest
 // refresh episode may publish: a conflicts-changed scan begun before Apply can
@@ -614,7 +608,6 @@ export function settleArtifactConflict(id: string): void {
   if (!settled) return;
   ++artifactConflictRefreshGeneration;
   replaceArtifactConflictQueue(artifactConflictQueue.filter((conflict) => conflict.id !== id));
-  resetConflictCursor();
   switch (settled.source) {
     case "sync-copy": {
       const copy = settled.sides.find((side) => side.role === "theirs")?.path;
@@ -633,19 +626,6 @@ export function settleArtifactConflict(id: string): void {
     }
   }
   retireSettledArtifactArrivalToasts(artifactConflictQueue);
-}
-/** The next conflict to visit, cycling. `undefined` when the queue is empty. */
-export function advanceConflictCursor(): ConflictObject | undefined {
-  const queue = conflictQueue();
-  if (!queue.length) return undefined;
-  conflictCursor = conflictCursor % queue.length;
-  const next = queue[conflictCursor];
-  conflictCursor = (conflictCursor + 1) % queue.length;
-  return next;
-}
-/** Reset the walk (a fresh queue makes the old position meaningless). */
-export function resetConflictCursor(): void {
-  conflictCursor = 0;
 }
 
 /** Re-derive the queue when an external change touched a page that is IN it.
@@ -678,27 +658,15 @@ export async function refreshConflictQueueIfTouched(
 export async function refreshSyncConflicts(notify: "new" | false = false): Promise<void> {
   const generation = ++artifactConflictRefreshGeneration;
   try {
-    const c = await backend().listSyncConflicts();
-    if (generation !== artifactConflictRefreshGeneration) return;
-    setSyncConflicts(c);
-  } catch {
-    /* best-effort */
-  }
-  try {
-    const m = await backend().listVcsMarkerConflicts();
-    if (generation !== artifactConflictRefreshGeneration) return;
-    setVcsMarkerConflicts(m);
-  } catch {
-    /* best-effort */
-  }
-  try {
     const previousIds = new Set(artifactConflictQueue.map((conflict) => conflict.id));
-    const before = conflictQueue().map((c) => c.id).join("\u0000");
-    const queue = await backend().conflictQueue();
+    // One call: the marker scan reads every page, and asking for the two
+    // listings and the queue separately read them twice (GH #543).
+    const { sync_conflicts, vcs_markers, queue } = await backend().conflictInventory();
     if (generation !== artifactConflictRefreshGeneration) return;
+    setSyncConflicts(sync_conflicts);
+    setVcsMarkerConflicts(vcs_markers);
     replaceArtifactConflictQueue(queue);
     retireSettledArtifactArrivalToasts(queue);
-    if (queue.map((c) => c.id).join("\u0000") !== before) resetConflictCursor();
     if (notify === "new") {
       const arrived = queue.filter((conflict) =>
         conflict.source === "sync-copy" && !previousIds.has(conflict.id)
@@ -725,10 +693,30 @@ export async function refreshSyncConflicts(notify: "new" | false = false): Promi
       }
     }
   } catch {
-    // Best-effort like the two listings above: a missing queue means no badge,
-    // never a broken app. The Settings fallback surface still works.
-    if (generation === artifactConflictRefreshGeneration) replaceArtifactConflictQueue([]);
+    // Best-effort: a missing inventory means no badge, never a broken app. The
+    // listings and the queue are one answer, so they go together: a banner
+    // with no queue entry behind it cannot be resolved (audit R9-12).
+    if (generation === artifactConflictRefreshGeneration) clearArtifactConflicts();
   }
+}
+
+function clearArtifactConflicts(): void {
+  setSyncConflicts([]);
+  setVcsMarkerConflicts([]);
+  replaceArtifactConflictQueue([]);
+  retireSettledArtifactArrivalToasts([]);
+}
+
+/** Every conflict listing belongs to the graph it was read from. Opening a
+ *  graph clears them and drops any answer still in flight from the old one, so
+ *  graph A's marker banner never shows on graph B's page at the same path while
+ *  B's inventory is still being read (GH #543, audit R9-12; I-20). Live save
+ *  conflicts are per graph already: `restoreLiveSaveConflicts` replaces them. */
+export function resetGraphConflicts(): void {
+  ++artifactConflictRefreshGeneration;
+  ++journalConflictRefreshGeneration;
+  clearArtifactConflicts();
+  setJournalConflicts([]);
 }
 
 let paneFocusSetter: ((paneId: string, rememberLayout?: boolean) => void) | undefined;
@@ -1110,6 +1098,26 @@ export function bumpPageInventoryRev() {
 // name-resolves-to-a-page answer keys on BOTH revisions. Bumped only when the
 // alias map actually changes, so an ordinary keystroke save costs nothing.
 export const [aliasRev, setAliasRev] = createSignal(0);
+// The launch index check finished (`warm-cache-done`). Until then an answer may
+// come from the index as the last session left it; surfaces that show one and
+// do not otherwise refresh on `dataRev` (the reference panels, Ctrl+K) ask
+// again once when this moves (GH #550, launch design D4).
+export const [indexCorrectionRev, setIndexCorrectionRev] = createSignal(0);
+export function bumpIndexCorrectionRev() {
+  setIndexCorrectionRev((n) => n + 1);
+}
+/** The launch index check landed (`warm-cache-done`): every surface that may
+ *  have shown an answer from the index as the last session left it asks
+ *  again. Reference panels and Ctrl+K key on `indexCorrectionRev`, the page
+ *  list and page identities on `pageInventoryRev`, and query blocks, aliases,
+ *  referenced names and block-ref counts on `dataRev` (launch design D4). */
+export function correctLaunchAnswers() {
+  batch(() => {
+    bumpIndexCorrectionRev();
+    bumpPageInventoryRev();
+    bumpDataRev();
+  });
+}
 export function bumpAliasRev() {
   setAliasRev((n) => n + 1);
 }
@@ -1906,14 +1914,24 @@ export function removeDeletedBlocksFromSidebar(uuids: ReadonlySet<string>) {
 }
 
 /** Drop restored block items whose block can't be resolved (its in-memory uuid
- *  changed across the restart). Page items are left untouched. */
+ *  changed across the restart). Page items are left untouched.
+ *
+ *  Only the current binding's definitive "no such block" removes an item. A
+ *  failed read (a transient IPC error, a stale binding, a read refused during
+ *  a graph switch) says nothing about the block, and the removal is persisted,
+ *  so treating it as "gone" deleted the user's pin for good (GH #543, audit
+ *  R6-08). */
 export async function pruneSidebarBlocks(): Promise<void> {
   const blocks = rightSidebar().filter((i): i is SidebarBlock => i.kind === "block");
   if (!blocks.length) return;
-  const resolved = await Promise.all(
-    blocks.map((b) => backend().resolveBlock(b.uuid).catch(() => null))
-  );
-  const dead = new Set(blocks.filter((_, i) => !resolved[i]).map((b) => b.uuid));
+  const binding = graphBinding();
+  // One command for every pin: one resolve_block each waited in the backend
+  // side by side through the launch index pass (GH #543, audit R11-10).
+  const alive = await backend()
+    .resolveBlocks(blocks.map((b) => b.uuid))
+    .then((found) => blocks.map((_, i) => Boolean(found[i])), () => blocks.map(() => true));
+  if (graphBinding() !== binding) return;
+  const dead = new Set(blocks.filter((_, i) => !alive[i]).map((b) => b.uuid));
   if (dead.size) {
     setRightSidebar(rightSidebar().filter((i) => i.kind !== "block" || !dead.has(i.uuid)));
   }
@@ -2186,6 +2204,18 @@ export function closeSwitcher() {
 // collects options and calls exportPagePdf.
 export const [pdfExportPage, setPdfExportPage] = createSignal<string | null>(null);
 export function openPdfExport(name: string) {
+  // A mobile WebView cannot print, so the export silently did nothing (GH #560).
+  // Android's renderer disables scripted printing outright
+  // (AwPrintRenderFrameHelperDelegate::IsScriptedPrintEnabled returns false);
+  // on iOS WebKit does forward window.print() to the UI process, but only into
+  // the private WKUIDelegate SPI `_webView:printFrame:`, which wry does not
+  // implement. Neither path throws, so print.ts's `win.print()` returned
+  // normally, `afterprint` never fired, and the dialog led nowhere. This is the
+  // one funnel for every entry point (page context menu, command, keybinding).
+  if (isMobilePlatform) {
+    pushToast("PDF export needs the desktop app: a mobile WebView cannot print.", "info");
+    return;
+  }
   setPdfExportPage(name);
 }
 export function closePdfExport() {

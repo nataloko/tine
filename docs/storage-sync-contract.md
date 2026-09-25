@@ -47,6 +47,14 @@ and preserves the newer bytes for another review. The native and browser review
 adapters share this rule, covered by
 `rehydrates a durable live conflict and applies the currently reviewed disk revision`
 and `concord_live_save_conflict_capsule_survives_restart_and_rechecks_disk`.
+The process-local one-shot token is only a preference, never a precondition
+for a review: a capture whose token a watcher event already revoked is taken
+from the current disk snapshot, and a capsule without a stored disk revision
+whose token is gone (after a restart, or a Managed-era `conflict_epoch = -1`)
+is reviewed on that same durable path (GH #490,
+`gh490_a_conflict_whose_authority_was_revoked_is_still_captured_and_reviewable`,
+`gh490_a_restored_captureless_capsule_is_reviewed_against_the_disk`). This
+authorizes nothing new, because Apply still rechecks the displayed revision.
 This state is recovery material only: it grants no graph authority, and no
 byte is written into the user's graph.
 
@@ -90,6 +98,38 @@ writable WAL uses `synchronous=NORMAL` and fresh schema DDL is one atomic transa
 transaction commits are not authority or individual durability barriers, because
 the file is a disposable cache (§3 invariant 3).
 
+**Tables of the projection (schema 31).** This list is the schema of record:
+`crates/tine-core/tests/contract_docs.rs` asserts it equals `sqlite_master`
+of a freshly initialized projection, so a table cannot appear or disappear
+without this contract saying so. FTS5 shadow tables are listed with their
+virtual table.
+
+- `names` — dictionary spelling/key pairs shared by named graph facts.
+- `pages` — page identity, routing, session position and page-result metadata.
+- `page_text` — raw visible page preamble, keyed by `page_id`.
+- `blocks` — block structure, public result identity and ordering/result metadata.
+- `block_text` — a block's raw source content.
+- `block_planning` — `[#A]`, `SCHEDULED:` and `DEADLINE:` facets, never conditioned on a task marker.
+- `tasks` — the task marker of every block that has one.
+- `properties` — property rows per owner (page or block), by ordinal.
+- `property_atoms` — each property element flattened, de-duplicated by `atom_key`.
+- `tags` — tag rows per owner, keyed by `refs::page_key(tag)`.
+- `block_path_refs` — a block's reference closure: own refs, every ancestor's, and the page's name.
+- `reference_postings` — dictionary-keyed postings that back navigation names, referrers and own-reference probes.
+- `reference_alias_declarations` — `alias::` declarations per source page.
+- `query_projection_state` — the image revision a query snapshot validates (`query_revision`).
+- `direct_source_revisions` — the source revision keyed by the public path each page's rows were lowered from.
+- `search_fts`, `search_fts_config`, `search_fts_data`, `search_fts_docsize`, `search_fts_idx` — the contentless trigram FTS5 table and its shadow tables. Its rowid is the disjoint page/block entity coordinate, so no owner map exists.
+- `short_word_fts`, `short_word_fts_config`, `short_word_fts_data`, `short_word_fts_docsize`, `short_word_fts_idx` — the contentless short-word FTS5 table (ADR 0069) and its shadow tables: the unigrams and bigrams of each CJK run of the same folded text, keyed by the same rowids. An entity with no CJK text has no row.
+
+**Index completeness belongs to projection publication.** An admitted projection
+snapshot contains the search index maintained in the same page transaction as
+its source rows. There is no separate FTS build phase or outbox. The graph's
+projection-readiness boundary remains responsible for admitting snapshots;
+removing the redundant index-phase probe does not admit an incomplete graph.
+Aliases are represented by `reference_alias_declarations`; the redundant
+alias-binding table and the remaining Managed identity tables are absent.
+
 **Path refs and property atoms are one producer, not two.** `block_path_refs`
 holds each block's reference closure — its own normalized refs, every
 ancestor's, and the page's own normalized name — and `property_atoms` holds each
@@ -109,29 +149,41 @@ the tree walk still evaluates its date. The `scheduled_day`/`deadline_day`
 columns hold the `yyyymmdd` ordinal and are NULL when the timestamp text is not
 a calendar day, so a malformed date keeps its presence and loses only its day.
 
-**The query columns are the exact visible text.** `block_text.query_visible` is the
-block's visible text byte for byte and `blocks.query_visible_folded` is that
-text canonically folded. Content predicates read the folded query text. The
-`searchable_text` and its FTS stay whitespace-collapsed for the existing search
-consumers and are not a substitute: a phrase query has to be able to tell `a  b`
-from `a b`. Both columns are populated at WRITE time by the producer, never by
-parsing or hydrating rows during a query.
+**Raw text is the exact-query authority; the index is only a candidate
+superset.** `block_text.content` and `page_text.preamble` are the only retained
+text copies. The producer feeds `canonical_fold(exact visible text)` (with
+whitespace preserved) into the contentless, case-sensitive trigram
+`search_fts`, and the unigrams and bigrams of that fold's CJK runs
+(`candidate::short_word_tokens`, the router's own script predicate) into
+`short_word_fts`, which answers the one- and two-character needles trigrams
+cannot; no folded or visible text body is stored beside the raw input.
+Block predicates frame `(block_text.content, pages.path)` and derive exact
+visible text through `DocBlock::preamble` inside an operation-owned callback.
+Candidate membership can therefore be lossy, while equality, LIKE, regex,
+Friendly ranking, evidence, and sort fallbacks all use one exact projection.
+Page rows remain in the same disjoint entity-rowid space so preamble and title
+candidates are never lost.
 
-**Query rows stay narrow (schema 26).** `query_block_results`
-stores public result identity, tree preorder, construction estimate and tag/
-property counts without duplicating raw payload. `block_own_refs` stores own
-normalized reference names; `query_page_order` stores Direct session positions.
-All are rebuildable facts in the page transaction with explicit FK-off cleanup.
-Direct full reconciliation reuses projected facts for unchanged source revisions
-and reconciles only the inventory-order table. Identical order performs no order
-writes. Live page deltas capture retained/append/remove positions before queue
-coalescing. The shared runtime-ID helper reproduces fresh-session IDs from page
+**Query metadata stays on its physical owner (schema 31).** `blocks` stores
+public result identity, tree preorder, construction estimate and tag/property
+counts without duplicating raw payload. `pages` stores the corresponding page
+estimate and property count. A posting's `own` bit
+answers a block-own-reference probe without a second relation. These are
+rebuildable facts in the page transaction with explicit FK-off cleanup.
+**Page order is a function of the page, not of history** (GH #543): every
+Direct read orders pages by graph-relative `path`, byte order
+(`COLLATE BINARY`), and the parse path enumerates pages in the same order, so a
+page created this session takes its path's place, not the end. A fresh build
+still stores `pages.position` in that order because storage's schema requires
+it; page deltas pass none, nothing reads it, and tine-core tracks no positions.
+The shared runtime-ID helper reproduces fresh-session IDs from page
 path and structural order; live identity mappings and metadata-backed result
-consumption are subsequent packets. Removing
-global parsing from warm startup, streaming cold initialization, and result
-consumption remain subsequent work; DB reuse alone does not claim fast end-to-end
-startup. Direct source-revision table shape includes the schema26 marker so
-older projection readers reject the newer disposable cache and rebuild it.
+consumption are subsequent packets. Removing global parsing from warm startup
+and result consumption remains separate from cold reconstruction: a cold,
+stale, damaged or config-changed image is built from one captured parsed
+snapshot in an unpublished stage. DB reuse alone does not claim fast
+end-to-end startup. A projection of any other schema (schema 30 included)
+fails `validate_schema`'s DDL census and is rebuilt as a disposable cache.
 
 `pages` holds identity and routing;
 `page_text` owns preamble and search text. `blocks` holds structure, metadata
@@ -144,14 +196,13 @@ Projection-only filtering does not load these payload tables.
 **The result read is a descriptor read plus payload batches, and a damaged one
 fails.** One ready query's public result is constructed from ONE owned read
 snapshot, in two stages. The DESCRIPTOR read wraps the compiler's selected-id
-relation and adds only ordering and result metadata — `query_block_results`,
-the page's display fields, `blocks.order_key`, and `query_page_order.position`
+relation and adds only ordering and result metadata — the selected `blocks`
+row, the page's display fields, `blocks.order_key`, and `pages.path`
 — with no raw text, tag or property payload; every join in it is
-LEFT, so a missing `query_block_results`, `blocks` or `pages` row, a Direct
-result page with no `query_page_order` position, a `query_block_results.page_id`
-that does not own its block's page, or a `pages.text_kind` outside the two
+LEFT, so a missing `blocks` or `pages` row, a selected block whose `blocks.page_id`
+does not match its result page, or a `pages.text_kind` outside the two
 written values FAILS the read rather than dropping a selected descriptor. Cross-
-page order is `query_page_order.position`, then `query_block_results.preorder`
+page order is `pages.path` (byte order), then `blocks.preorder`
 within a page. The PAYLOAD read then runs for ADMITTED ids only, in batches of
 128 bound ids and exactly three statements per batch — block/text/task/planning
 facets, then `tags` by owner and ordinal, then `properties` by owner and ordinal
@@ -162,11 +213,11 @@ actually built; any violation abandons the WHOLE result with no partially
 substituted rows. A read that fails this way is a rebuild request, never a
 shorter answer (D-3).
 
-**A tag key is a page key.** `tags.tag_key` is `refs::page_key(tag)` — the same
-key page identity uses — because `#x` is OG's `[[x]]`; `tags_lookup_idx` leads
-with it. `pages.journal_day` is the journal page's `yyyymmdd`, derived from the
-page's own file stem under the graph's `:file/name-format` and journal formats,
-and NULL for every other page.
+**A tag key is a page key.** `tags.name_id` points to the `names.key` produced by
+`refs::page_key(tag)` — the same key page identity uses — because `#x` is OG's
+`[[x]]`; `tags_lookup_idx` leads with `name_id`. `pages.journal_day` is the
+journal page's `yyyymmdd`, derived from the page's own file stem under the
+graph's `:file/name-format` and journal formats, and NULL for every other page.
 
 **The projection has a statement seam; nothing else does.**
 `PhysicalProjectionQueryReader` runs caller-supplied SQL against the graph
@@ -203,7 +254,7 @@ one read transaction pinned for the job's whole descriptor-and-payload read so
 every row it returns describes one projection state. The projection admits at
 most `DEFAULT_QUERY_JOB_CAPACITY` jobs at once and **capacity is acquired before
 the snapshot**, so a waiting job pins no WAL pages; the snapshot is validated
-against the exact graph cache generation before and after SQLite establishes
+against the exact current graph cache generation before and after SQLite establishes
 the transaction, and a job whose generation moved is `NotReady`, never a stale
 answer. Every admitted job registers its interrupt handle with the owner, and
 **the worker drains every job before a rebuild touches the file**: it cancels
@@ -213,33 +264,55 @@ to be reset or replaced (in-scope: a torn projection rebuilt under a live
 reader). Closing the projection refuses every later admission. Cancellation is
 a typed dispatch answer, not a failed read: it schedules no recovery or retry.
 
-**Result identity follows who lowered the row.** `query_block_results.result_id`
+**Result identity follows who lowered the row.** `blocks.result_id`
 is the runtime id the lowering process assigned. The projection tracks
 `session_pages` — exactly the pages whose stored ids are LIVE in this process:
-a full snapshot's replacements and each live save's page add to the set; a
-structural relowering (a warm-stream replacement parsed in isolation) and a
-deletion remove the page; dropping the parsed cache clears the set, because
-the ids it held are no longer reachable. The set is captured with each
-snapshot. A row on a session page answers with its stored id; every other row
-(a warm reopen lowers none of them) answers with the structural runtime id the
-shared helper reproduces from page path and structural order, which is the id
-a fresh parse assigns it.
+a captured full snapshot's replacements and each live save's page add to the
+set; a deletion removes the page. Parsed-cache eviction does not erase the
+session identity owner. The set is captured with each snapshot. A row on a
+session page answers with its stored id; every other row (a clean reopen lowers
+none of them) answers with the structural runtime id the shared helper
+reproduces from page path and structural order, which is the id a fresh parse
+assigns it.
 
-**Warm validation from bytes, never from a parsed graph.** Opening a Direct
-Files graph validates the projection against the walk inventory and each
-page's exact content revision computed from file bytes, parsing nothing. An
-unchanged graph is READY with no parsed cache and nothing retained. A changed,
-missing, damaged or config-mismatched projection names its replacement pages
-and the caller streams them through a bounded high-water queue, parsing each
-page in isolation and retaining none. Live saves and deletions enqueue their
-delta whether or not a parsed cache exists, but readiness is published only
-after this session has validated the complete inventory once (a full
-snapshot, a clean warm, or a closed stream) — a delta alone never publishes an
-inventory this process has not compared to disk. The `query_page_order` table
-is reconciled by the worker from the queue's own page order whenever a stream
-closes or a delta arrives without a position. In-scope scenario: an external
-edit between two sessions, followed by a save of a different page before the
-warm completes.
+**Reconciliation from bytes, never from a parsed graph** (GH #543). The index
+keeps one invariant: for every page it holds the newest change this session
+made or observed. Each change is a *mark* carrying the generation of the edit
+that made it; a mark older than what the image already holds for that page, or
+than a mark already queued for it, is dropped. Every producer — saves,
+deletions, renames, merges, journal migration, the watcher, page opens —
+records a mark at its generation, and a page open whose bytes the index
+already holds records none. Opening a Direct Files graph runs one *survey*: it
+reads each listed file's exact content revision from bytes and compares it with
+the revision the image stores, parsing nothing for an unchanged page. An
+unchanged graph is READY with no parsed cache and nothing retained. When at most
+a quarter of the pages changed, appeared or disappeared, exactly the changed
+pages are parsed and recorded as marks at the survey's generation, and the
+worker lowers them like any edit. A stored page no longer listed is deleted only
+after a read under the graph-text identity gate finds it gone, so a save that
+retires and republishes a file is never taken for a deletion; a file that
+exists but cannot be read keeps its rows. A larger change, or a missing,
+damaged or config-mismatched image, is rebuilt from one captured parsed
+snapshot in an unpublished same-directory stage, in bounded batches; a full
+snapshot is accepted only while a fresh image is owed, and the pages it could
+not read keep the rows the replaced image had for them. Every survey finding —
+a mark, a confirmed deletion (including one confirmed after readiness, when a
+writer held the identity gate at launch), an owed fresh build — moves the cache
+generation as any other change does, so no answer memoized at the survey's
+starting generation (the page list, name lookups, the effective identity index)
+outlives what the survey found. In-scope scenarios:
+Syncthing or another device delivering pages between two sessions; an external
+editor saving during launch.
+Live saves and deletions record their mark whether or not a parsed cache
+exists, but readiness is published only after this session has compared the
+complete inventory with the image once (a survey or a fresh build) — a delta
+alone never publishes an inventory this process has not compared to disk. A
+worker turn that fails on an intact image returns its marks to the queue, which
+re-lowers exactly the pages it may have half-written; a turn whose writes
+violate a constraint met rows that contradict each other, which `quick_check`
+does not see, and rebuilds the image once per projection. In-scope scenario: an
+external edit between two sessions, followed by a save of a different page
+before the survey completes.
 
 **One parse config, or a re-lowering.** Six graph-config facts decide those
 derived rows — `:property/separated-by-commas`, `:ignored-page-references-keywords`,
@@ -262,9 +335,10 @@ the live target is absent and exactly one artifact claims it, that exact inode
 is restored with no-replace. Multiple claims for an absent target remain in
 place for explicit recovery; when a live target exists, every artifact is moved
 unchanged to typed conflict trash. Every move rechecks the artifact's physical
-identity and single-link status immediately before publication. A suffix
-lookalike, symlink or reparse point, multiply linked file, ambiguous claimant,
-or failed identity recheck is never deleted or selected as authority.
+identity immediately before publication. A suffix lookalike, symlink or
+reparse point, ambiguous claimant, or failed identity recheck is never deleted
+or selected as authority. A second hard link does not disqualify an artifact
+(GH #555): the move keeps the inode, so every other name keeps its bytes.
 
 Every Direct Files create, live-name retirement, staged publication, recovery
 restore, and recovery set-aside is one exact-byte name transition
@@ -299,17 +373,83 @@ and mints a conflict from the retained snapshot. There is no separate
 pre-retirement full-file reread; creates and unpinned auxiliary writes keep
 their independent recheck rules.
 
-One background SQLite owner accepts either an already-resident
-`PageEntry + Arc<Document>` snapshot or the bounded warm stream. The database
-retains each page's exact caller-owned content revision together with the Direct
-fact-extractor version as disposable adapter metadata. Bumping that extractor
-version forces one background re-lowering when unchanged source bytes acquire
-new physical facts. Warm validation compares the complete byte-derived source
-inventory, parses only changed or missing pages in bounded batches and retains
-no parsed graph; a clean reopen lowers none. One-page cache upserts and deletes
-enqueue coalesced page deltas. The editor, watcher, and save paths never wait
-for SQL. Indexed reads are admitted only when the worker has published the
-exact current graph cache generation. One app-private sidecar lease permits
+One background SQLite owner accepts captured `PageEntry + Arc<Document>`
+snapshots and ordinary coalesced page deltas. The database retains each page's
+exact caller-owned content revision together with the Direct fact-extractor
+version as disposable adapter metadata. A clean warm inventory validates those
+revisions without parsing or lowering anything. A cold, stale, damaged or
+config-mismatched image is reconstructed from one captured parsed snapshot in
+a newly created, unpublished same-directory SQLite file. The worker lowers the
+snapshot in bounded batches, finalizes and checks it, drains old reader jobs and
+the active writer, checkpoints the old WAL, and asks `tine-storage` to
+atomically replace the destination. Core never renames or copies the database
+bytes itself. The unpublished connection alone uses journal and synchronous
+mode OFF; the serving writer is reopened WAL/NORMAL with the resting page-cache
+budget, temporary files in memory, and SQLite's inline autocheckpoint off (the
+WAL is capped at 64 MB when it resets). After a turn commits, if the WAL has
+reached 4 MB, a background thread runs `PRAGMA wal_checkpoint(PASSIVE)` on a
+connection of its own; when every frame is copied, the same connection empties
+the WAL with a non-waiting `wal_checkpoint(TRUNCATE)`. A reader or writer on the
+WAL makes that a no-op, and the thread retries every 250 ms, up to 20 times,
+without counting as running between attempts. A copied WAL left behind at exit
+would otherwise be copied again by the next open, since only the shared-memory
+index records what was copied (13-23 s per reopen on a hosted Windows disk). A
+drain waits for a running checkpoint before a replacement image is published,
+and a retry never resumes once a fresh build is running. No checkpoint or fsync
+of the image runs inside a turn (GH #543).
+
+The bounded batches stream through one storage-owned fresh-build transaction.
+Its ordinary secondary indexes are absent for every base chunk; the fresh-only
+append invariant admits disjoint new pages and reuses the same name interning,
+integer-coordinate allocation, row/FTS insertion, reference and alias
+machinery as ordinary apply without running replacement cleanup or name
+reclamation against an unindexed accumulated graph. Storage creates the
+secondary indexes exactly once, then applies the captured tail delta and final
+inventory with those indexes live before the single build commit. Final
+optimize completes inside that transaction and integrity checking completes
+before the connection closes. Only
+the resulting closed finalized-stage token can invoke publication through the
+directory capability bound to the stage's exact regular-file identity at
+construction; callers cannot substitute a same-basename second directory. An
+append error, repeated page/block identity, cancellation, failed finish, or abandoned
+token removes the OFF-mode stage. On the serving writer a worker turn is one
+transaction however many batches it lowers: a stopped or failed turn commits
+nothing and its marks re-lower every page, and a reader never sees part of a
+turn.
+
+Cancellation is checked between build batches and immediately before the
+storage publication boundary. A stop or failure before that boundary discards
+the exact owned stage and leaves the old image intact. Once the storage name
+operation begins, its result owns the outcome: a complete newly installed
+destination is never deleted by a later open, durability or injected failure,
+and a stopped owner publishes no readiness. The next owned open/build removes
+only exact stage names (UUID plus known SQLite sidecars), never unrelated
+prefix matches. A source capture missing an unreadable live page cannot replace
+a healthy complete image; the old coherent image remains until reconstruction
+from a complete capture succeeds.
+
+One-page cache upserts and deletes still enqueue coalesced WAL transactions.
+The editor, watcher, and save paths never wait for SQL. Ordinary pending deltas
+may serve the older complete committed image; readiness at the exact current
+graph generation waits for reconciliation. Replacement construction admits no
+partial staged image. A parsed cache that `with_pages` installs after a
+SQL-only reopen is not offered to the index: a full capture is taken only when
+a fresh image is owed. A whole-graph derived read (page inventory, aliases,
+icons, journal days, block-ref counts) with no parsed cache waits while a survey,
+a turn in progress, or an edit queued on a validated image is coming, and
+parses the graph only when none is. Every such read asks through
+`Graph::indexed_or_fallback`: when the index leaves its answer to an installed
+parsed cache, the cache is read right after that decision, and a cache a
+rename, merge or delete discarded in between sends the read back to the index,
+which waits for that change's delta rather than parse. Once the app replaces a graph (a switch or
+a refresh) it retires it, only after every step that can fail, so a failed
+refresh leaves the bound graph serving: a display read still running on it (page list,
+aliases, icons, journal days, block-ref counts, templates, backlink filters)
+stops waiting, parses nothing, memoizes nothing, and is asked again of the
+replacement; reads that act on their answer keep their full answer. A rebuild, failed write, or idle image this
+session has never validated stays unavailable until repair. Under
+`TINE_DEBUG=1` (or `--debug`) the projection records bounded lifecycle facts on
+the runtime diagnostic channel; without the flag none are emitted. One app-private sidecar lease permits
 only one graph instance to publish into a projection database at a time, which
 prevents an older instance from replacing facts behind another instance's
 locally-ready generation watermark. A public query against a missing, stale,
@@ -317,6 +457,16 @@ corrupt, incompatible, leased or unwritable projection follows the typed
 dispatch and bounded repair rules below; the remaining parser-owned navigation
 and search consumers may use their existing fallback. Neither case blocks
 graph open, save or external file observation.
+
+Before projection readiness, only Ctrl-K text search and the `((` picker may
+answer from one already-captured parsed snapshot. They use the shared
+membership, folding, matcher and evidence logic, preserve current-page scope,
+and emit block-text matches in unranked document order under the existing
+limits. Ctrl-K page names and aliases retain the existing exhaustive evaluator,
+ranking and exact-name retention over that same snapshot. They never cold-parse
+from a query callback. Inline Friendly, saved/structured queries and other
+projection-only surfaces keep their typed Indexing response; reference panels
+retain their separate established fallback contract.
 
 The switched read families are literal fuzzy-search candidate
 selection (including the `((` picker), and the original-case referenced-page
@@ -490,11 +640,11 @@ the anonymized corpus, with controls recorded in `RECEIPT-db1.md` (under 1% for 
 `(page_id, name, text_kind, journal_day, path)`. A row that does not have its
 required shape is a failed read, never an empty answer. The lowered selection
 statement itself has no ordering metadata. Its descriptor wrapper does: Direct
-block answers carry `query_page_order.position` and
-`query_block_results.preorder` and end with `ORDER BY` on those columns; the
-page wrapper carries the same page position. Missing Direct order metadata
-fails the read, because silently moving a page would change which rows survive
-a bounded budget.
+block answers carry `pages.path` and
+`blocks.preorder` and end with `ORDER BY` on those columns; the
+page wrapper orders by the same page path. Missing Direct order metadata
+fails the read (a result with no page row), because silently moving a page would
+change which rows survive a bounded budget.
 
 Page results carry physical graph-relative `path`, name, kind, optional journal
 day and authored ordered properties. Their shared descriptor wrapper applies
@@ -502,7 +652,7 @@ the complete saved sort and `COUNT(*) OVER()` before its row limit. Unicode
 text sorting reuses Rust lowercase through operation-owned rank callbacks;
 numeric-looking property values remain lexical. Explicit sort ties use physical
 path, while unsorted reads retain Direct inventory order.
-`query_page_results` supplies raw construction estimates and property counts;
+`pages` supplies raw construction estimates and property counts;
 only admitted owners receive property payload reads, in batches of 128, with
 ownership, ordinal, count and estimate validation. Both row and byte limits
 apply. `total` counts admitted pages before sampling; optional `matched_total`
@@ -525,16 +675,28 @@ new generation.
 **A failed read repairs once, then reports the SQL outcome.** The in-scope
 scenarios are §3.1's: a torn or truncated projection file after a crash or power
 loss, a disk error, a resource limit, or a projection whose page set has drifted
-from the current graph generation. Because the projection is disposable,
-`dispatch_direct_query` requests a rebuild only after the failed job and its
+from the current graph generation. Only damage owes a new image, and one
+decider says when (`failure_owes_new_image`, GH #543 class K1): a statement
+SQLite refuses owes one only if the image fails its schema check or
+`quick_check` (memoized per ready generation); rows a read finds contradicting
+each other (`InvalidSnapshot`, damage `quick_check` cannot see) owe one, once
+per projection -- a contradiction on the rebuilt image is a lowering defect no
+rebuild fixes; a worker turn that fails owes one only if it was building one or
+the image is damaged, and on an intact image it rolled back and owes a
+validation instead. Because the projection is disposable,
+`dispatch_direct_query` requests the rebuild only after the failed job and its
 owned snapshot have dropped, then retries the SQL route once. The worker drains
 all old query jobs before it resets the file. If a complete parsed snapshot is
 already resident, recovery may enqueue it; otherwise recovery validates a
-complete source inventory from bytes and streams bounded per-page replacements,
-without constructing or retaining a whole parsed graph. Clearing readiness
-alone would strand the projection until another edit. Cancellation is excluded
-from repair because the drain or close deliberately removed the snapshot's
-subject.
+complete source inventory from bytes and then captures one parsed snapshot for
+an unpublished bounded-batch reconstruction. Clearing readiness alone would
+strand the projection until another edit. Cancellation is excluded from repair
+because the drain or close deliberately removed the snapshot's subject. A failed
+read that arrives while a fresh build already owns the image's replacement --
+one running, or a queued rebuild with its payload -- requests nothing: that
+build replaces the image the read failed on, and the query epoch moves only
+when it publishes, so a sibling read admitted before it would otherwise queue a
+second complete build behind it.
 
 Production queries construct no candidate-page plan and apply no
 selectivity cutoff. A simple query is parsed once; invalid input returns its
@@ -657,16 +819,32 @@ about the running device; the receipt wins.** The same `EINVAL` is reachable off
 Android on any filesystem without `rename2` flags (FAT/exFAT removable media,
 some FUSE and network mounts).
 
-Every graph-tree name transition therefore takes the platform primitive and
-nothing else, on every platform, through `model::rename_projection_noreplace`.
-Graph text is sole-authority data: a two-step publication (reserve the
-destination with an exclusive create, then rename onto the reservation) could
-leave a reserved-but-empty file at a live graph name after a crash, with no
-second copy to rebuild it from. On a filesystem without the flag, a Direct
-Files create or save fails rather than publishing non-atomically, and the error
-names the refused call. Managed Storage's reconstructible projection used that
-reservation fallback, with a per-device memo of the answer; both were removed
-with it (ADR 0066).
+Every graph-tree name transition takes the platform primitive first, on every
+platform, through `model::rename_projection_noreplace` (same directory) or
+`model::rename_graph_text_noreplace` (across directories). Graph text is
+sole-authority data: a two-step publication (reserve the destination with an
+exclusive create, then rename onto the reservation) could leave a
+reserved-but-empty file at a live graph name after a crash, with no second copy
+to rebuild it from, so there is no reservation fallback.
+
+When the platform refuses the **flag itself** — the rename's own `EINVAL`,
+`ENOSYS` or `EOPNOTSUPP`/`ENOTSUP` on Linux, Android, macOS or iOS; never
+`EEXIST`, never another I/O error, never Windows — the transition checks that
+the destination name is absent and then renames plainly (Martin, 2026-09-24,
+decision B1, GH #538). An occupied destination is still `AlreadyExists` with
+nothing moved, and a plain rename keeps the same crash atomicity as the flagged
+one. What this gives up, on such storage only, is atomicity of the absence
+check: an external writer that creates the destination name in the
+microseconds between the check and the rename is replaced (scenario:
+external-editor race or sync delivery on flag-refusing storage). Every caller's
+destination is either a unique Tine-private name no one else creates (the
+retire step) or a live name the caller has just vacated or proved absent.
+Before this decision such storage failed every Direct Files create, save and
+rename (Android 11-14 without the 2024 MediaProvider update; NFS). Pinned by
+`gh538_flag_refusing_storage_creates_saves_and_renames_pages` and
+`gh538_flag_refusing_storage_never_replaces_an_occupied_name`. Managed
+Storage's reconstructible projection used the reservation fallback, with a
+per-device memo of the answer; both were removed with it (ADR 0066).
 
 ### 2.10d When the graph filesystem folds two page names into one file
 
@@ -832,7 +1010,9 @@ prefix is historical; scenario IDs stay stable.
 
 | Scenario ID | In-scope failure | Required response |
 | --- | --- | --- |
-| `MS-REF-UNSAFE-FS-KIND` | Sync delivery, filesystem damage, or an external tool replaces an expected directory/regular file with a symlink, special file, reparse point, or unexpected hard-link alias | Refuse access through the substituted entry without following it |
+| `MS-REF-UNSAFE-FS-KIND` | Sync delivery, filesystem damage, or an external tool replaces an expected directory/regular file with a symlink, special file, or reparse point | Refuse access through the substituted entry without following it |
+| `MS-REF-GRAPH-TEXT-ALIAS` | Sync delivery, a deduplicating tool, or the user leaves two GRAPH-TEXT paths on one inode. Publication is temp + no-clobber rename, so a save through one name installs a new inode there and the other page silently keeps the old bytes while Tine reports the save as done | Refuse where an index or inventory can name the sibling: page creation (`validate_graph_text_resource_alias`), the rename transaction's whole-graph inventory, and an exact watcher delta (`resources.len() != 1` in `validate_graph_text_admission_delta`, which falls back to a rebuild). A MOVE (rename source, editor recovery) keeps the inode and so cannot cause the divergence; it checks no link count. An ordinary resave does **not** refuse (GH #571, Martin 2026-09-21): it is target-local by contract (GH #267) and must not build the index, and a raw count there refused every annexed or deduplicated graph |
+| `DIRECT-REF-CREATE-UNREADABLE-OWNER` | Sync delivery, an interrupted external write, or malformed imported Markdown/Org leaves a page file Tine cannot read or parse, so its effective name is unknown; creating a page of that name would give one name two files | Refuse name-only creation only for a name that failed file could be: its file-name name, a name its bytes, folded as page names are, contain, or the journal a date `title::` names (`failures_that_could_own`). A failure naming no single file, or a file unreadable now, could be any page and refuses every name-only creation; a listing skip for an entry that is not a regular file (a FIFO, a socket) is no page and refuses nothing. Name the file in the error. Every other creation, save and the watcher proceed: a content rejection is reconciled state recorded in `page_index_failures` and announced once (`graph-unreadable-pages`), not a cycle failure to retry. The record is disk truth, not parsed-cache state (`model::unreadable_pages::UnreadablePages`): only per-path observations under the cache write lock change it (a read or move notes readable/unreadable, a delete or vanished file retires), a pass that read the whole graph unchanged replaces it, and the launch survey merges by path through `drift_since`, the newer observation winning. A cache discard never clears it |
 | `MS-REF-BOUNDS` | Honest corruption or malformed imported input exceeds explicit memory, depth, count, or byte bounds | Reject before unbounded allocation or traversal and report the bounded class |
 | `APP-REF-PLUGIN-IMMUTABLE-COLLISION` | Two honest concurrent installs, or a crash-recovered retry racing a completed install, present different bytes for the same plugin id and version | Keep the no-clobber winner byte-exact and refuse the other install as `immutable plugin version ... different bytes`; never overwrite or merge the package |
 
@@ -848,6 +1028,9 @@ hardening; it is unpaid latency, and later a source of availability bugs.
 | `fsync` before reading a projection evidence file | `model::sync_and_read_projection_regular` | — | A read through the same process's page cache returns the bytes the writer wrote whether or not they are on the platter. Flushing cannot change the result and cannot detect corruption. | Plain bounded read (`read_projection_regular`) |
 | `fsync` before opening-and-reading a projection file | `model::sync_open_and_read_projection_regular` | — | As above. On Windows it additionally forced a write-capable open for a read. | `open_and_read_projection_regular` |
 | `fsync` before re-reading a retained quarantine handle | `model::sync_and_reread_retained_projection_file` | — | As above; the handle is the one this process just wrote through. | `reread_retained_projection_file` |
+| Blanket `file.link_count != 1` refusal on the save path | `model::graph_text_errors::validate_graph_text_single_link`, reached from the exact-target read/validate helpers and from every stage of `graph_text_atomic_replace_bound` | `MS-REF-UNSAFE-FS-KIND`, as "unexpected hard-link alias" | A raw link count cannot tell the real scenario (a second GRAPH-TEXT path, now `MS-REF-GRAPH-TEXT-ALIAS`) from a link that is none of Tine's business: git-annex's `annex.thin` mode links every page into `.git/annex/objects/...`, which graph-text scope never descends into, and users hard-link or deduplicate pages outside the graph. So it refused every save on such a graph (GH #571, GH #555) while the scenario it claimed to defend needs the identity index to detect at all | `validate_graph_text_resource_alias` on page creation and the resource reverse group on the rename inventory and exact deltas; the resave allows it (GH #267 keeps that path index-free) |
+| Raw link-count refusal on a MOVE and on exact watcher deltas | `graph_text_move_noreplace_validated` (rename source), `graph_text_move_editor_recovery_noreplace` and the checked-open recovery sweep, `prepare_graph_text_file_upsert_with_batch_charges` and `validate_graph_text_admission_delta` | `MS-REF-GRAPH-TEXT-ALIAS` | A move keeps the inode, so no name diverges; and a complete build already admits a link outside graph-text scope, so a delta that refused it disagreed with the build. The effect was an annexed graph that could save but not rename (GH #571, GH #555), a checked open that refused the whole graph over a linked recovery artifact, and a warm identity index discarded on every external edit | Nothing for the move; the resource reverse group for a second graph-text name |
+| Refusing every name-only creation while any page failure is recorded, and failing the watcher cycle on a content rejection | `direct_creation_evidence` / `indexed_creation_evidence` (any `failures` refused), and `sync_file` returning the rejection as an error | `DIRECT-REF-CREATE-UNREADABLE-OWNER` | An unreadable page can hide only a name it can carry; a page whose file name is another's and whose text never contains the requested name is not that page. The blanket form made one unparseable page block every new page for the session, and the watcher retried the deterministic rejection forever, withholding its observation acknowledgement and telling the user it "will keep retrying" | The possible-owner refusal in that row; the rejection is recorded and announced once |
 | `fsync` of every **ancestor** of a projection target's parent chain | `model::sync_projection_chain` (then a leaf-to-root loop), reached from ~30 write/rename/preflight call sites | — | The operation changes entry lists in the chain leaf only. An ancestor Tine created in this operation is already flushed by `create_projection_chain_component` at creation; an ancestor it did not create already has a durable entry in its own parent, and no in-scope scenario (crash/power loss, torn write, disk error, sync delivery, external-editor race, honest concurrent instance, honest multi-device divergence, malformed import) can un-durable an entry already on stable storage. See §2.10a-i for the one out-of-ownership case it did cover. | One barrier on the chain leaf, plus the existing per-creation barrier |
 
 The removed barriers are replaced by nothing because nothing needed them;

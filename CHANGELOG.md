@@ -8,10 +8,471 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.986] - 2026-09-25
+
+### Fixed
+
+- On Android 11 to 14 shared storage, creating, saving and renaming pages
+  failed with "Invalid argument (os error 22)", because the storage refuses
+  the rename that is guaranteed never to overwrite a file. Tine now checks
+  that the name is free and renames without the guarantee on storage that
+  refuses it. The same applies to network drives (NFS) that refuse it
+  (GH #538).
+- Renaming a page that many pages link to, or a sync tool changing many
+  files at once, no longer holds up searches and references while Tine updates
+  its index. The update is written as one transaction instead of one per 32
+  pages, and copying the index's log into the index file moved off the update
+  onto a background thread. On a 10,000-page graph a rename now writes about
+  a third as much (603 to 200 MB) and finishes in half the time; on Windows,
+  where each of those copies flushed the disk, a rename took about a minute
+  (GH #543). Once copied, the log is emptied, so the next launch does not
+  copy it again. Internal: tine-storage v0.28.2.
+- Typing in a block no longer resends the list of every linked page name to
+  the editor after each save when no link changed: a precision loss in the
+  check made it resend all of it, 307 KB on a 10,000-page graph (GH #543).
+- A save refused to protect data in the file, such as a page with unresolved
+  merge markers or a page-header property moved into the outline, is now
+  reported once and not retried. v0.6.985 said this was fixed, but the app
+  still received the refusal as `unknown` and retried it (GH #535, GH #546).
+- When a save fails because the device refuses a file operation, the message
+  now names the operation and the system's error number, so a report or
+  screenshot tells which step failed (GH #538, GH #590).
+
+- Search no longer treats letters that differ by a mark as the same letter
+  where the mark makes a different letter or syllable: `か` no longer finds
+  `が`, `и` no longer finds `й`, and in Hindi, Thai or Tibetan a vowel sign
+  or virama is no longer dropped, so `क` no longer finds `कु`. Accents still
+  fold as before (`cafe` finds `café`, `γεια` finds `γειά`), `елка` finds
+  `ёлка`, and `lodz` now finds `Łódź` (likewise ø, đ, ħ, ŧ). The first launch
+  after this update re-indexes the graph once.
+- A Ctrl+K search of one or two Chinese, Japanese or Korean characters, such
+  as `会议` or `東京`, now reads an index of those short words and visits only
+  the matching blocks. Before, it scanned every block, which for a rare word
+  took about 1.5 s per keystroke on a 10,000-page graph. Unlinked References
+  of a one- or two-character page name and `content match` queries use the
+  same index. It is built during the same one-time re-index as the change
+  above (GH #543). Internal: tine-storage v0.28.0, projection schema 31.
+- Reopening a graph no longer makes Ctrl+K, Linked and Unlinked References,
+  query blocks, the page list and block reference counts wait while Tine
+  compares the graph on disk with its search index. Until that comparison
+  finishes they answer from the index as you left it, and they update by
+  themselves when it finishes, so a page edited in another app while Tine was
+  closed shows up then. Edits you make meanwhile show up at once. Actions
+  that depend on the answer, such as creating, renaming or deleting a page,
+  inserting a template or exporting, still wait for the comparison (GH #550).
+- Reopening a graph no longer waits for a full check of the search index
+  before Ctrl+K, references and queries answer: that check took over a second
+  on a 10,000-page graph at every launch. The index is now checked in the
+  background, and only after the computer or phone restarted or once a week;
+  a phone closing Tine in the background never causes a check or a rebuild.
+  Damage the check finds still rebuilds the index (GH #550).
+- A block reference whose target cannot be found now shows its full
+  `((…))` text, as Logseq does, instead of the first eight characters of its
+  id. This includes `(((uuid)))`, which Logseq and Tine both read as a
+  reference to the id `(uuid`; write `( ((uuid)))` or `[label](((uuid)))` to
+  show a reference in parentheses (GH #589).
+- Linked and Unlinked References no longer lose blocks from pages you edited
+  before restarting Tine. A block you added or moved on a page in one session
+  went missing from other pages' reference panels after a relaunch, and stayed
+  missing until that page was edited again. Looking such a block up by its
+  id after a relaunch works again too. The first launch after this update
+  re-indexes the graph once (GH #594).
+- When the search index cannot be built, Linked and Unlinked References and
+  query blocks now say so instead of staying empty or "indexing" for the rest
+  of the session. Tine tries a failing build at most three times; after that
+  those panels show "couldn't be built" with a short code, a **Retry** button
+  and **Create diagnostic report**, and a relaunch tries again. Each failed
+  attempt is recorded in the diagnostic report as a fixed code with no graph
+  content. While the index is still building, Linked References shows
+  "indexing…" instead of hiding, and reads that can fall back to the pages
+  themselves, such as the page list, wait at most a minute for the index.
+  A page Tine cannot read, or one deleted while Tine was not watching, no
+  longer makes Linked or Unlinked References read every page in the graph
+  (GH #594).
+- **Ctrl+K** answers a one- or two-character search in a large graph in a
+  fraction of the time: such a search now reads only the most recent blocks
+  and says **More matches exist** when older ones may match too, where it
+  could take over a second on a 10,000-page graph. A search in Chinese,
+  Japanese or Korean, where one or two characters are a whole word, still
+  searches every block. While the index is first being built, Ctrl+K answers
+  from the pages up to several times faster, and it switches to the index
+  sooner once the index is ready. While you type, the
+  previous results stay on screen until the new ones arrive instead of
+  blanking on every key, and **Enter** waits for the new results. With
+  `--debug`, the log says whether each search was answered by the index or
+  by scanning pages, and how long it took (GH #543).
+- On a Mac, Tine now declares macOS 12.3 (Monterey) as its minimum, and the
+  startup message for a too-old web engine no longer says to update Safari: on
+  older macOS, updating the Safari app does not update the engine other apps
+  use, so the advice could not work (GH #572).
+- On Windows and macOS, a page whose name differs from its file name only in
+  case (for example **Contents** stored as `contents.md`) opens and can be
+  edited again. It failed with "could not be activated for editing" when
+  opened as the home page, from search or from the sidebar, and it could
+  appear twice in search. A file renamed by case only outside Tine, for
+  example by another device, is now listed once under its new name, and a
+  tab or Recent entry saved under the old spelling opens again (GH #597).
+
+## [0.6.985] - 2026-09-24
+
+### Changed
+
+- The search index now keeps every page current by one rule: each change
+  carries the moment it was made, and an older change never overwrites a newer
+  one. At launch Tine compares each file with the index without parsing
+  unchanged pages, so after pages change elsewhere or while Tine was closed,
+  only the changed, added or deleted pages are re-indexed; a larger change
+  still rebuilds it once. A cold, stale, damaged or configuration-changed
+  index is rebuilt in an unpublished file and appears only when complete. An
+  index holding inconsistent entries is rebuilt once instead of retrying
+  forever. Query results now list pages in file-path order, so a page created
+  this session takes its place instead of appearing last. The fixes below
+  marked GH #543 condense 118 individual entries; the full list is in
+  `docs/releases/v0.6.985-gh543-details.md` (GH #543).
+- The Guide's platform pages now describe the iOS TestFlight beta (themes
+  work, plugins do not run yet) and F-Droid updates for Android.
+- Spell-check language names in Settings now use the standard
+  "Language (Region)" form, e.g. "English (United States)" and "Spanish
+  (Mexico)" instead of "American English" and "Mexican Spanish", so regional
+  variants of one language sort together. Contributed by mikob (GH #580).
+- Diagnostic reports now record when Tine was closed through the
+  unsaved-changes warning with the user choosing to discard, with the reason
+  (a failed save or one still running) and the number of affected pages, but
+  no page names. Before, such a session read as an ordinary clean exit
+  (GH #540).
+- Internal: compact-projection P1 moved tine-storage through v0.25.0 and
+  v0.26.0. v0.25.0 deletes the Managed
+  Storage half of the crate (durable batches, local journals, sealed digests,
+  the oplog frontier and the managed layout — 32,640 → 11,863 source lines).
+  The crate became the Direct Files durability and SQLite projection crate;
+  nothing Tine used moved. At that stage, the projection schema was unchanged
+  at version 29, so no rebuild was triggered. v0.26.0 then trims the crate's
+  public surface to the methods Tine's Direct Files path calls (no user-visible
+  change).
+- Internal: Tine now pins tine-storage v0.27.0 and projection schema 30. The
+  compact schema removes redundant cache data and uses one integer coordinate
+  space for pages and blocks; an existing schema-29 projection is rebuilt once
+  from the Markdown/Org graph, without changing graph files.
+- Ctrl+K, the `((` picker and unlinked-reference search use a bounded recent-
+  result window. Inline Friendly search shares their index, canonical folding
+  and exact matcher, but remains exhaustive up to its 5,000-result limit and
+  preserves display order.
+- A cold, stale, damaged or configuration-changed search index is built and
+  checked in an unpublished file, then atomically becomes ready only as a
+  complete image. Before the first ready image, Ctrl+K and the `((` picker use
+  the loaded graph snapshot while structured queries keep waiting; failure or
+  cancellation preserves the previous coherent committed image.
+- Internal: `scripts/measure-projection.mjs` runs `graph_scale_bench --root <graph>` on a real corpus and reports the compact-projection budget rows (S1 file/Markdown, S2 build write amplification, T1 build time, M1 peak RSS, U1 bytes per single-block edit, T2 Ctrl+K p95, T3 `{{query}}` p95) against `scripts/projection-budget-policy.json`; `src/projectionBudget.test.ts` runs it only when `TINE_PROJECTION_CORPUS` names a corpus. Anon baseline recorded 2026-09-19 (compact-projection P0a).
+- Internal: every SQL statement tine-core sends to the search/query projection
+  now passes through one door (`query/projection_sql.rs`), a blessed statement
+  census exercises every shape against the pinned projection schema, and the
+  storage contract lists the projection's tables as its schema of record
+  (compact-projection campaign P0; no user-visible change).
+
+### Added
+
+- The online Guide now includes three sample journal days, so the Journals
+  view shows tasks, scheduled items, a live query and quick-capture notes
+  instead of an empty page.
+- Clicking **N conflicts** opens a **Conflicts** page listing every page that needs a decision, grouped by source, with how many blocks are left on each. Click a page to resolve it, or shift-click to keep the list in view beside it; rows disappear as pages are resolved. The conflict lists in Settings → Backups & recovery moved there, including **Discard copy** for a sync copy whose page no longer exists. Suggested by EllisMorrow (GH #536).
+- Live exports now have shareable page and block links. With one pane and one
+  tab, the browser address follows navigation; the page and block menus provide
+  explicit copy actions, and opening a link restores its page or block in the
+  read-only exported app (GH #182).
+- Tine's desktop binary now has a documented command-line interface: `--help`
+  and `--version`; explicit `open` and `capture` commands; create-only static
+  and live graph exports with graph-relative output and an explicit `--replace`;
+  and a read-only `doctor` check. Existing `tine GRAPH` and `--capture`
+  invocations remain compatible. Linux packages install a generated `man tine`
+  page (GH #567).
+- Running with `TINE_DEBUG=1` (or `--debug`) now records the search index's
+  lifecycle: when a validation starts reading the graph, how long that read
+  took, how many pages it queued, each worker turn's duration and rows, and when
+  a staged build becomes ready. Without the flag nothing is recorded (GH #543).
+
+### Fixed
+
+- Ctrl+K and the `((` picker remain useful while the query index is
+  unavailable: they search one already-loaded parsed snapshot in document
+  order and rerun against ranked results when the complete index becomes
+  ready. Structured and inline queries still wait for it. Building a large
+  graph's index the first time is about 45% faster (10,000 synthetic pages:
+  47.5 s to 26.2 s on Linux; performance-only, same schema, nothing is
+  rebuilt), and opening a large graph no longer spends most of its time
+  re-reading the index it is building. Search and page autocomplete answer
+  within seconds of launch instead of after a half-minute read storm, and a
+  search typed during launch validation reports "indexing" and retries instead
+  of starting a second build (GH #543).
+- Opening a large graph no longer parses every page beside the search-index
+  check. Page lists, aliases, reference counts, block references, embeds,
+  templates and the calendar answer from the index or wait for its check, and
+  opening today's journal or editing, saving or deleting a page meanwhile no
+  longer throws the check away. A named page such as a restored tab or a
+  favourite opens straight from its file during launch indexing: 4 s to 1 ms
+  on a 10,000-page graph. When two files claim the same page name, the file
+  named for the page is now the one opened. A journal named by a date
+  `title::` under a journal title format without a year now lists as a journal
+  with its calendar day (GH #543).
+- Common actions on a large graph no longer make Tine re-read, re-parse or
+  re-check the whole graph: renaming, merging or deleting a page, a
+  journal-format migration, switching graphs or reloading settings during
+  indexing, an edit landing as the index check finishes, and opening or saving
+  while another edit is being indexed. Creating the first page or journal day
+  after reopening checks the name against the index (416 ms to 23 ms on a
+  10,000-page graph). Saving during indexing no longer queues extra lookups,
+  reference counts or alias reads per save. Indexing runs from one background
+  owner, so a page that always fails to index costs a few spaced-out retries
+  instead of a whole-graph pass after every edit (GH #543).
+- Search, queries and page lists no longer get stuck waiting for the index, in
+  some cases for the rest of a session with nothing left running to do the
+  work. This could follow a failed index update or indexing step, renaming a
+  page whose content could not be read, creating or renaming a page while the
+  index still listed a deleted page, two parts of the app reading the graph at
+  once, or a rename or delete during a rebuild. Launch indexing now always
+  reports that it ended, even when it fails; before, page aliases,
+  block-reference counts and reference-only page names never appeared for that
+  session. A search during a rebuild says the index is not ready instead of
+  returning nothing (GH #543).
+- Search now describes the files on disk. A rename, merge or rescue no longer
+  leaves search answering from the page it used to be, and a merged-away page
+  can no longer come back. Duplicate journal days, journal filename migration
+  and migrated PDF highlight pages no longer leave duplicate or trashed text
+  findable, and edits to either file of a duplicate day reach search. A merge,
+  rescue, delete, move or save that fails part-way leaves search matching what
+  is really there. A late parsed copy of the graph can no longer undo a save
+  in search (the file on disk was never affected), and pages that change,
+  open, fail or recover during the index check reach it (GH #543).
+- One page file Tine cannot read (invalid UTF-8, unparseable, locked, or still
+  arriving from a sync service) no longer blocks creating every new page,
+  keeps the index "not ready", or makes page listings parse every page. Tine
+  says once which file it could not read; only a new page whose name that file
+  could hold is refused, and that refusal, like a rename the file blocks,
+  names the file. Fixing, restoring or deleting it clears the record. The page
+  keeps what was indexed for it until it can be read again. Exporting,
+  printing, renaming or deleting on a graph whose files cannot be read now
+  reports that instead of exporting an empty site (GH #543).
+- Settings now apply in place. Changing the home page, the format for new
+  pages, a display-only setting, dismissing the Guide notice, or editing a
+  setting in `config.edn` outside Tine no longer reloads the graph, restarts
+  indexing, cancels a print or closes an unsaved-edit recovery. Every outside
+  change to `config.edn` is now picked up, and `:hidden` updates All Pages and
+  page links without a restart. A setting changed while the graph reopens is
+  no longer lost (a favorite added then could vanish from `config.edn`).
+  Aliases, links and reference counts follow a reopened graph at once, and a
+  link no longer opens a page that merely declares its name as an alias. (GH
+  #543).
+- Tine now reports when the system refuses to watch a graph folder (for
+  example at Linux's inotify watch limit) and checks it for outside changes,
+  including `config.edn`, every few seconds by polling instead of missing them
+  silently, catching up once watching works; graph-wide settings such as the
+  journal title format take effect there too. Deleting or renaming a page
+  outside Tine, or changing a setting, no longer rescans the whole graph
+  folder; only a removed folder that held pages still does. Restoring a backup
+  no longer processes restored pages twice, a sync tool redelivering a
+  duplicate journal day's file unchanged no longer counts as an edit, and an
+  outside edit the watcher first missed no longer stays out of search (GH
+  #543).
+- Windows and graph switches keep to their own graph. A graph change or
+  finished launch in one window no longer makes another window reload, rebind
+  or stop waiting, and after switching graphs the previous graph's conflict
+  banners and favourites order no longer show on the new one. Closing a window
+  releases its index at once; switching back to a graph Tine is still
+  releasing, or opening one another Tine instance is still indexing, now waits
+  and then indexes instead of leaving search without an index. An HTML export
+  stops if its window switched graphs, and failing to update the recent-graphs
+  list (for example on a full disk) no longer fails the open or skips indexing
+  (GH #543).
+- The indexing progress bar now shows while search waits for the index to be
+  repaired, during a later rebuild in the same session, during whole-graph
+  page reads (also when the index is ready, for example while finding unused
+  assets), and for the whole build, including the first pass that reads every
+  page, where Ctrl+K's progress line vanished for minutes and re-ran the
+  search repeatedly; it now says it is indexing until it knows how many pages
+  there are. It no longer reports a refreshed graph finished before it starts
+  indexing, hides for a second on a repaint, freezes behind a page listing, or
+  goes blank while the index is being written (GH #543).
+- The app no longer freezes while Quick Capture suggests pages during
+  indexing, while the journal title format changes, or during graph-wide
+  listings (journal conflicts, filename migrations, asset trash, installed
+  plugins, spell-check dictionaries) and large asset reads, imports or backup
+  pruning; that work now runs off the main thread. Exporting query results or
+  the graph to HTML during indexing waits for the index and then exports,
+  instead of showing the wait as a failure. Linked and unlinked references in
+  the right sidebar refresh after a rename, backup restore or journal-format
+  change, moving between pages during indexing no longer shows linked
+  references as failed, and a pinned block is removed at launch only when it
+  no longer exists (GH #543).
+- A search index file damaged badly enough that SQLite will not open it is now
+  deleted and rebuilt from your Markdown (nothing in the index is a source of
+  truth); several searches failing at once no longer rebuild it twice; and a
+  damaged index no longer keeps answering or keeps a CPU core busy. A query
+  with a very long `(or …)` or `(and …)` list (about a thousand terms) now
+  answers instead of failing and rebuilding the whole index over and over. The
+  debug report records why a query was refused instead of "other", still as a
+  short fixed code, never anything from your graph. Performance: the record of
+  pages changed during indexing no longer grows without bound (GH #543).
+- Exports used the favorites and workflow the graph had when it opened,
+  ignoring changes made since.
+- When the graph's pages could not be read, the unused-assets list offered
+  every asset for trashing, including media still in use. It now reports the
+  error instead.
+- Advanced queries written the way Logseq's documentation and many
+  `config.edn` files write them now run: `[?b :block/marker "TODO"]`, a marker
+  or date variable narrowed by `contains?`, `=`, `not=`, `<`, `<=`, `>` or
+  `>=`, the block's journal page and journal day, and
+  `(not [?b :block/scheduled ?d])`. Before, these were refused as
+  unsupported, and a `not` or `or` Tine only partly understood ran as the part
+  it understood, so an "overdue" query could list scheduled tasks. Such a
+  `not`/`or` is now left out whole, so a partial answer can only be wider than
+  the query, and says so (GH #542).
+- Opening a graph no longer rebuilds its search index from scratch on every
+  launch. The Journals view reads its first days before the index has been
+  checked, and those reads were given index positions that collided with the
+  ones already stored, so the index was thrown away and rebuilt each time,
+  a large, repeated write on every open (a ~40-second open was reported on an
+  Android phone). Pages read at launch now keep
+  their stored place, and unchanged ones are not re-indexed at all (GH #550).
+- Two more pieces of whole-graph work are off the path to the first journal
+  on every open. Today's journal is found from its date instead of by listing
+  every file in the graph first, and the automatic launch backup now waits
+  until startup has finished (the background indexing is done and the app has
+  been quiet for a few seconds) instead of copying the whole graph one second
+  after open, where it competed with the first page for the disk (GH #550).
+- The online Guide at tine.page showed emoji in a monochrome outline font.
+  Published pages now use the browser's color emoji font; the desktop editor
+  on Linux keeps the monochrome font that avoids the WebKitGTK emoji
+  crash (issue #76, unchanged).
+- On a Mac whose web engine is older than Safari 15.4 (for example Big Sur
+  with Safari never updated), Tine now says so at startup and explains that
+  updating Safari fixes it, instead of opening with every page failing to
+  display. The iOS build now requires iOS 15.4 (GH #572).
+- On Android storage that refuses Tine's atomic "rename without overwriting",
+  a settings write could leave `logseq/config.edn` hidden under a `.retired`
+  name, after which the graph failed to open with "Invalid argument". Tine now
+  checks the rename works before touching `config.edn`, and a graph already
+  affected opens again with its settings restored (GH #538).
+- The Journals view no longer shows "No journal entries found" when the graph
+  folder holds something that is not a page, such as a symlink, an editor lock
+  file, or a file the system cannot read (for example an iCloud file that is
+  not downloaded). Such an entry also no longer stops today's journal from
+  being created or pages from being renamed, and a day that cannot be opened
+  no longer hides all the others (GH #385).
+- A graph no longer opens with every page blank because one item in its folder
+  cannot be read (for example a locked file, an unreadable folder, or a file
+  with an unusual name). Tine now skips that item and shows the rest. Opening a
+  large graph also no longer freezes the app for several seconds while it
+  checks for conflict copies (GH #332).
+- The default journal template could be applied again over text typed into a
+  nested block of today's journal, replacing it. Text anywhere in the journal
+  now counts, so the template never overwrites it (GH #550).
+- With a custom journal title format, opening a graph no longer tries to write
+  the journal template over today's journal delivered by a sync app, which
+  caused a hidden save conflict on every launch (GH #550).
+- A save conflict no longer ends up with a comparison that can never load. If
+  Tine lost track of the conflict in the split second after it happened (for
+  example because another page was deleted or renamed at that moment on
+  Windows), the comparison failed, and after a restart it failed every time.
+  Tine now compares your draft with the file as it is on disk instead, as it
+  already does for any conflict it restores after a restart (GH #490).
+- A page whose first bullet is a numbered-list item keeps saving. Making the
+  first bullet of a new page a numbered item and then typing its text could
+  leave the file holding only `logseq.order-list-type:: number`, with every
+  later save of that page failing (`reason code: unknown`) until Tine was
+  restarted. Tine had taken the empty numbered item for page properties; it now
+  stays a list item (GH #540).
+- A save Tine refuses in order to protect what is already in a file (a page
+  header, merge-conflict markers, an Org file it cannot reproduce) is no longer
+  retried and reported as `reason code: unknown` "after 3 tries" while the page
+  silently stops saving. One message stays up until the page saves again, says
+  the edits are kept in this window, and **Review unsaved** opens the draft to
+  copy it or open the page (GH #535, GH #546).
+- Typing a page's alias after `[[` or `#` now offers it, and the row says
+  which page it is an alias of. Choosing it inserts the alias as you wrote it,
+  and the link opens the real page (GH #558, GH #482).
+- One page that cannot be saved no longer blocks every rename in the graph.
+  A rename used to need every open page saved first, so a single page whose
+  save kept being refused made every rename fail until you deleted and
+  recreated that page. Now such a page stops a rename only if the rename would
+  change it, or its unsaved text mentions the old name, and the message names
+  it. After a rename Tine reloads only the pages the rename changed, so
+  unsaved edits on every other page are kept (GH #535).
+- Renaming a page that many other pages link to is much faster in a large
+  graph. Every file the rename rewrote re-listed the whole pages folder to
+  check for names that differ only in case or accents, so the cost grew with
+  the number of linking pages times the size of the folder; the folder is now
+  listed once per rename. On an 8,000-page graph, a rename touching 800 pages
+  went from about 2.6 s to 0.8 s of file work, and time now grows in step with
+  the graph. The rename still reads every file once, and the app still reloads
+  the graph afterwards (GH #406).
+- Editing a page's properties no longer raises a save-failure toast while you
+  are still typing them. Page properties written as the first bullet of a page
+  are saved into the file's own header, but Tine kept treating them as an
+  ordinary bullet afterwards, so a half-written `key:: value` line proposed a
+  change the save path is required to refuse — surfacing mid-edit as
+  "Couldn't save … after 3 tries — (reason code: unknown)". Tine now follows
+  those properties into the file, and an invalid page header is reported when
+  you finish editing it instead of on every autosave; the page saves by itself
+  as soon as the properties are valid again (GH #546).
+- "Export to PDF…" is no longer offered on Android and iOS, where it could not work: a mobile WebView cannot print, so the option silently did nothing. Choosing it from the command palette or a shortcut now says PDF export needs the desktop app instead of opening a dialog that leads nowhere (GH #560).
+- "Export graph to HTML" now says why it exported nothing when a graph has no public pages, instead of reporting "Exported 0 pages" with no explanation. Only pages marked `public:: true` are exported, as in Logseq (GH #560).
+- Saving a page no longer fails when the file is also hard-linked somewhere else. Graphs managed by git-annex (`annex.thin` mode links every page into `.git/annex/objects/`) or by a deduplicating tool refused every save with a physical-resource alias error, so the graph could be read but never edited. Tine now refuses only the case it can actually name - two pages inside the graph sharing one file - and only where it already knows the whole graph, which is page creation (GH #571, GH #555).
+- A page that is also hard-linked elsewhere (git-annex, a deduplicating tool) can now be renamed; before, such a graph could be saved but every rename failed with a physical-resource alias error. Opening a graph no longer fails when a crash-recovery copy of a page has picked up a second link, and edits made outside Tine to such pages no longer force a full re-index. Two pages inside the graph sharing one file are still refused, with both named (GH #571, GH #555).
+- A graph inside a Cryptomator or VeraCrypt vault (and any other user-space
+  volume) can be created and opened again. Windows asks the volume driver to
+  resolve a path to its final name, and these drivers are allowed to answer
+  "this volume has no recognized file system" — which Tine treated as a broken
+  path and refused, after it had already created the graph folders. Tine now
+  falls back to the plain absolute path when the driver cannot answer; the
+  no-follow open that actually protects the graph tree is unchanged. Saving on
+  such a volume was affected by the same call and is fixed with it (GH #561).
+- A query whose results are pages — `{{query (page-property tags x)}}` and any
+  other page query — now shows those pages in every display view. Table and
+  Board said "No results" and Search reported a count of 0, because those three
+  views read the block results a page query never produces, while List read the
+  pages. The page results were always there: the summary panel went on counting
+  them correctly beside the header's 0. Changing the view now changes only how
+  the same matches are drawn, and the count is the count of what is on screen
+  (GH #547).
+- Typing a `[[` page link on a large graph no longer re-reads the whole
+  reference index on every lookup. Offering page suggestions needs the set of
+  page names the graph links to, and the index answered that by handing back
+  one row per link — 110,000 rows to name 10,010 pages on a 10,000-page
+  graph — which took about 1.4 seconds every time it was asked, whatever was
+  typed. That set is now remembered until the graph changes, so a lookup takes
+  about 10 milliseconds. Page autocomplete, the quick capture picker, the query
+  sheet's page field and the settings page picker all share the one answer,
+  and a newly linked page still appears immediately
+  (REG-QUICKSWITCH-REFERENCE-NAMES-MEMO-001).
+- The first `[[` page lookup after an edit is no longer slow either. Remembering
+  the set of linked page names fixed every repeat lookup, but the first one
+  after each edit still had to read the whole reference index. The index now
+  keeps those names in an order it can read straight through, without consulting
+  the pages themselves, so collecting every linked name on a 10,000-page graph
+  takes about 20 milliseconds instead of 1.3 seconds. Two consequences worth
+  knowing: the first launch after this update rebuilds the graph's search index
+  once, which takes longer than a normal start, and the finished index uses
+  about 5% more disk. Saving is unaffected
+  (REG-QUICKSWITCH-REFERENCE-NAMES-INDEX-001).
+- Searching a large graph no longer reads every block for every keystroke.
+  Ctrl+K asked SQLite to materialise and rank every block in the graph and
+  then keep the matches, and it did that twice per keystroke: once for the
+  block results, and again to work out which pages had matching content. On a
+  10,000-page graph each keystroke cost about 4.5 seconds whether it matched a
+  hundred blocks or none at all. Both reads now start from the substring index
+  and visit only the blocks that can possibly match, bringing a selective
+  search down to about 1.7 seconds. A needle common enough to match more than
+  twenty thousand blocks still uses the old plan, which is genuinely the
+  faster one at that point. The answer is unchanged: the exact text predicate
+  still decides every row (REG-FRIENDLY-BLOCK-CANDIDATE-BOUND-001).
+
 ## [0.6.984] - 2026-09-16
 
 ### Added
 
+- While a large graph is being indexed, the toolbar shows how far it has
+  got — checking, reading or building the search index, with a page count —
+  so a long first open no longer looks stuck. Tine stays usable meanwhile
+  (GH #543).
 - **A part of Tine that fails now says so, where it failed, with a Retry — instead
   of leaving the window blank.** Until now a single unreadable value anywhere in
   the interface tore down the whole render and showed nothing at all, with no

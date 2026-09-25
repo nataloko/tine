@@ -65,14 +65,93 @@ impl Graph {
         self.graph_text_scope.should_descend(&slash_path(relative))
     }
 
-    /// Ownership test for an event path whose file-or-directory nature we do not
-    /// know — a directory move, or a kind the watcher cannot classify. Such an
-    /// event forces a full diff for the owning graph, so the only question is
-    /// whether anything eligible could live *at or under* the path. Excluded
-    /// trees (`assets/`, `node_modules/`, dot-directories, `logseq/bak/`) answer
-    /// no, which is what keeps an image drop from rescanning the graph.
-    pub fn graph_text_watch_could_contain(&self, path: &Path) -> bool {
-        self.graph_text_watch_relevant(path) || self.graph_text_watch_descend(path)
+    /// What an event at `path` can change in this graph's text inventory.
+    ///
+    /// This is the one answer both watcher deciders use — the batch queue
+    /// choosing between an exact path and a full diff, and the callback
+    /// choosing whether to invalidate the guarded identity index — so that
+    /// they cannot disagree about a path (GH #543, audit R9-05/R9-06).
+    ///
+    /// - Excluded trees (`assets/`, `node_modules/`, dot-directories,
+    ///   `logseq/bak/`) reach nothing, which keeps an image drop from
+    ///   rescanning the graph.
+    /// - `logseq/config.edn` reaches nothing here: configuration is not graph
+    ///   text and has its own queue, which decides how far a change reaches.
+    /// - A path that exists answers by what it is.
+    /// - A path that is gone — the old name of a rename — is a subtree only
+    ///   when something that knows the graph's files holds one under it
+    ///   ([`Self::gone_path_holds_files_under`]), or, when nothing can say, it
+    ///   was not named like a page. Assuming a subtree whenever the old name
+    ///   is gone turned an editor's atomic save of any non-page file into a
+    ///   full diff of the graph and a rebuilt identity index, and asking only
+    ///   the identity index (which only a page create or move builds) did so
+    ///   for every external delete (GH #543, audit R10-08).
+    pub fn graph_text_watch_reach(&self, path: &Path) -> GraphTextWatchReach {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return GraphTextWatchReach::Nothing;
+        };
+        let relative = slash_path(relative);
+        if relative.is_empty() {
+            return GraphTextWatchReach::Subtree;
+        }
+        if is_config_file_path(&self.root, path) {
+            return GraphTextWatchReach::Nothing;
+        }
+        let file = if self.graph_text_watch_relevant(path) {
+            GraphTextWatchReach::File
+        } else {
+            GraphTextWatchReach::Nothing
+        };
+        if !self.graph_text_scope.should_descend(&relative) {
+            return file;
+        }
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_dir() => GraphTextWatchReach::Subtree,
+            Ok(_) => file,
+            Err(_) => match self.gone_path_holds_files_under(&relative) {
+                Some(false) => file,
+                Some(true) => GraphTextWatchReach::Subtree,
+                None if text_extension_from_path(path).is_some() => file,
+                None => GraphTextWatchReach::Subtree,
+            },
+        }
+    }
+
+    /// Whether a gone path held graph files strictly under it, asked of
+    /// whatever knows the graph's files without reading the disk: the current
+    /// guarded identity index, the search index's complete page inventory,
+    /// then a parsed cache that read every page. `None` when none of them can
+    /// say. Builds nothing.
+    fn gone_path_holds_files_under(&self, relative: &str) -> Option<bool> {
+        let prefix = format!("{relative}/");
+        {
+            let state = self.guarded_graph_text_identity.read().unwrap();
+            if let Some(index) = state.index.as_ref().filter(|_| !state.invalidated) {
+                return Some(
+                    index
+                        .file_resource_by_exact_relative
+                        .keys()
+                        .any(|held| held.starts_with(&prefix)),
+                );
+            }
+        }
+        if let Some(held) = self
+            .direct_projection
+            .get()
+            .and_then(|projection| projection.holds_pages_under(&prefix))
+        {
+            return Some(held);
+        }
+        let cache = self.cache.read().unwrap();
+        let pages = cache.as_ref()?;
+        if !self.page_index_failures.read().unwrap().is_empty() {
+            return None;
+        }
+        Some(
+            pages
+                .iter()
+                .any(|(entry, _)| entry.rel_path.starts_with(&prefix)),
+        )
     }
 
     /// Record that Tine just wrote content with rev `rev` to `path`, so the file
@@ -363,86 +442,92 @@ impl Graph {
         // creates and unpinned auxiliary writes.
         let commit_recheck = recheck && expected_identity.is_none();
         let create_parent = creation_proof.is_none();
-        let (rev, ()) = self.commit_write(
-            write,
-            path,
-            content,
-            baseline,
-            commit_recheck,
-            create_parent,
-            editor_episode,
-            || match (expected_identity, creation_proof) {
-                (Some(identity), _) => self.graph_text_atomic_replace_bound(
-                    write,
-                    path,
-                    content.as_bytes(),
-                    identity,
-                    recheck.then_some(baseline).flatten().map(str::as_bytes),
-                    editor_episode,
-                    turn_short_id,
-                ),
-                (None, Some(creation_proof)) if baseline.is_none() => self
-                    .graph_text_atomic_create_with_proof(
+        let result = (|| {
+            let (rev, ()) = self.commit_write(
+                write,
+                path,
+                content,
+                baseline,
+                commit_recheck,
+                create_parent,
+                editor_episode,
+                || match (expected_identity, creation_proof) {
+                    (Some(identity), _) => self.graph_text_atomic_replace_bound(
                         write,
                         path,
                         content.as_bytes(),
-                        creation_proof,
+                        identity,
+                        recheck.then_some(baseline).flatten().map(str::as_bytes),
+                        editor_episode,
+                        turn_short_id,
+                    ),
+                    (None, Some(creation_proof)) if baseline.is_none() => self
+                        .graph_text_atomic_create_with_proof(
+                            write,
+                            path,
+                            content.as_bytes(),
+                            creation_proof,
+                            editor_episode,
+                        ),
+                    (None, _) => self.graph_text_atomic_write_with_conflict(
+                        write,
+                        path,
+                        content.as_bytes(),
+                        baseline.is_none(),
                         editor_episode,
                     ),
-                (None, _) => self.graph_text_atomic_write_with_conflict(
-                    write,
-                    path,
-                    content.as_bytes(),
-                    baseline.is_none(),
-                    editor_episode,
-                ),
-            },
-        )?;
-        editor_commit_before_final_reread_hook()?;
-        let reread = match self.graph_text_read_optional_editor_conflict_snapshot(write, path) {
-            Ok(reread) => reread,
-            Err(error) if editor_episode.is_some() => {
-                return Err(Self::observation_failure_or_hard_refusal(
-                    EditorConflictSite::FinalRereadPresent,
-                    error,
-                ));
-            }
-            Err(error) => return Err(error),
-        };
-        let Some((reread, identity)) = reread else {
-            self.validate_editor_conflict_portable_path(write, path)?;
-            return Err(self.conflict_error_from_snapshot(
-                path,
-                editor_episode,
-                EditorConflictSite::FinalRereadAbsent,
-                ConflictSnapshot::Absent,
-                None,
-            ));
-        };
-        if reread != content || content_rev(&reread) != rev {
-            if editor_episode.is_some() {
+                },
+            )?;
+            editor_commit_before_final_reread_hook()?;
+            let reread = match self.graph_text_read_optional_editor_conflict_snapshot(write, path) {
+                Ok(reread) => reread,
+                Err(error) if editor_episode.is_some() => {
+                    return Err(Self::observation_failure_or_hard_refusal(
+                        EditorConflictSite::FinalRereadPresent,
+                        error,
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            let Some((reread, identity)) = reread else {
                 self.validate_editor_conflict_portable_path(write, path)?;
                 return Err(self.conflict_error_from_snapshot(
                     path,
                     editor_episode,
-                    EditorConflictSite::FinalRereadPresent,
-                    ConflictSnapshot::Present {
-                        revision: content_rev(&reread),
-                        resource_identity: identity,
-                    },
-                    Some(reread),
+                    EditorConflictSite::FinalRereadAbsent,
+                    ConflictSnapshot::Absent,
+                    None,
+                ));
+            };
+            if reread != content || content_rev(&reread) != rev {
+                if editor_episode.is_some() {
+                    self.validate_editor_conflict_portable_path(write, path)?;
+                    return Err(self.conflict_error_from_snapshot(
+                        path,
+                        editor_episode,
+                        EditorConflictSite::FinalRereadPresent,
+                        ConflictSnapshot::Present {
+                            revision: content_rev(&reread),
+                            resource_identity: identity,
+                        },
+                        Some(reread),
+                    ));
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "graph text final reread does not match published bytes",
                 ));
             }
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "graph text final reread does not match published bytes",
-            ));
+            self.loaded_file_identities
+                .write()
+                .unwrap()
+                .insert(path.to_path_buf(), (rev.clone(), identity));
+            self.remember_exact_graph_text_state(path, rev.clone(), identity);
+            Ok(rev)
+        })();
+        if result.is_err() {
+            self.reconcile_failed_graph_text_paths(write, std::iter::once(path));
         }
-        self.loaded_file_identities
-            .write()
-            .unwrap()
-            .insert(path.to_path_buf(), (rev.clone(), identity));
-        self.remember_exact_graph_text_state(path, rev.clone(), identity);
-        Ok(rev)
+        result
     }
 }

@@ -188,7 +188,10 @@ pub(crate) struct ReferenceCandidatePages {
     /// every block of every candidate page", which is what every caller did
     /// before this field existed, so the walk is the behaviour a partial or
     /// absent index falls back to rather than a lossy shortcut.
-    pub blocks: Option<std::collections::HashSet<[u8; 16]>>,
+    pub blocks: Option<std::collections::HashSet<String>>,
+    /// Interactive page entities that survived the verified window. `None`
+    /// means page-preamble admission is unrestricted (Exhaustive or fallback).
+    pub page_owners: Option<std::collections::HashSet<std::path::PathBuf>>,
     #[cfg_attr(not(test), allow(dead_code))]
     pub indexed: bool,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -252,11 +255,12 @@ pub enum DirectSaveFailureCode {
     ConflictReplacePostPublication,
     ConflictPinnedOwner,
     ConflictBaseRev,
+    RefusedDataPreservation,
     Unknown,
 }
 
 impl DirectSaveFailureCode {
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 36] = [
         Self::PrecheckSymlink,
         Self::PrecheckInterrupted,
         Self::PrecheckPortableCollision,
@@ -291,6 +295,7 @@ impl DirectSaveFailureCode {
         Self::ConflictReplacePostPublication,
         Self::ConflictPinnedOwner,
         Self::ConflictBaseRev,
+        Self::RefusedDataPreservation,
         Self::Unknown,
     ];
 
@@ -334,6 +339,7 @@ impl DirectSaveFailureCode {
             Self::ConflictReplacePostPublication => "conflict.replace_post_publication",
             Self::ConflictPinnedOwner => "conflict.pinned_owner",
             Self::ConflictBaseRev => "conflict.base_rev",
+            Self::RefusedDataPreservation => "refused.data_preservation",
             Self::Unknown => "unknown",
         }
     }

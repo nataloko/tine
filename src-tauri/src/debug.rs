@@ -140,7 +140,9 @@ pub(crate) fn debug_header() {
 
 pub(crate) fn install_panic_logger() {
     if debug_enabled() && std::env::var_os("RUST_BACKTRACE").is_none() {
-        std::env::set_var("RUST_BACKTRACE", "1");
+        // SAFETY: `run` installs the panic logger before Tauri, GTK or any Tine
+        // thread starts, so no other thread can be reading the environment.
+        unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -366,6 +368,9 @@ impl FlightRecorder {
 }
 
 pub(crate) fn flight_init(dir: PathBuf) {
+    // Before the recorder opens: failures until then wait in the early
+    // buffer like any other event.
+    tine_core::set_index_failure_observer(record_index_failure);
     let recorder = FLIGHT.get_or_init(|| {
         match FlightRecorder::open(dir, FLIGHT_SEGMENT_MAX_BYTES) {
             Ok((mut recorder, previous_unclean)) => {
@@ -437,6 +442,29 @@ fn set_session_active(active: bool) {
             recorder.set_session_active(active);
         }
     }
+}
+
+/// The exact reason vocabulary a diagnostic record may carry.
+///
+/// Every code is one this frontend assigned itself from a Rust enum
+/// (`QueryReadinessReason::as_str`, `QueryUnavailableReason::as_str`), never a
+/// message from the backend or a thrown value's own text: an arbitrary string
+/// could carry a path or graph content into a report the user is invited to
+/// publish. `unavailable:` used to be checked by CHARACTER PATTERN, which
+/// admits any lowercase word this side has never heard of — the one thing this
+/// filter exists to refuse (GH #543, re-audit A2-N3).
+fn diagnostic_reason_is_known(reason: &str) -> bool {
+    matches!(reason, "cancelled" | "other")
+        || reason.strip_prefix("not-ready:").is_some_and(|code| {
+            tine_core::query::QueryReadinessReason::ALL
+                .iter()
+                .any(|reason| reason.as_str() == code)
+        })
+        || reason.strip_prefix("unavailable:").is_some_and(|code| {
+            tine_core::query::QueryUnavailableReason::ALL
+                .iter()
+                .any(|reason| reason.as_str() == code)
+        })
 }
 
 fn record_fixed_event(event: &'static str, fields: Map<String, Value>) {
@@ -525,6 +553,18 @@ pub(crate) fn record_direct_save(
     record_fixed_event("direct.save", fields);
 }
 
+/// One failed index build or update attempt, and whether it left the index
+/// failed for the session (GH #594, index liveness L5). The release app has
+/// no console, so a failure the index only printed was invisible in every
+/// field report. Fixed codes only: the class is `IndexFailureClass::as_str`.
+fn record_index_failure(event: tine_core::IndexFailureEvent) {
+    let mut fields = Map::new();
+    fields.insert("class".into(), json!(event.class.as_str()));
+    fields.insert("attempt".into(), json!(event.attempt));
+    fields.insert("terminal".into(), json!(event.terminal));
+    record_fixed_event("index.failure", fields);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_watcher_latency(
     mode: &'static str,
@@ -549,7 +589,12 @@ pub(crate) fn record_watcher_latency(
 }
 
 #[tauri::command]
-pub(crate) fn diagnostic_ipc_event(command: String, phase: String, elapsed_ms: u64) {
+pub(crate) fn diagnostic_ipc_event(
+    command: String,
+    phase: String,
+    elapsed_ms: u64,
+    reason: Option<String>,
+) {
     if !crate::command_surface::is_known_command(&command)
         || matches!(
             command.as_str(),
@@ -570,6 +615,14 @@ pub(crate) fn diagnostic_ipc_event(command: String, phase: String, elapsed_ms: u
     fields.insert("command".into(), json!(command));
     fields.insert("phase".into(), json!(phase));
     fields.insert("elapsedMs".into(), json!(elapsed_ms));
+    // Fixed vocabulary only. The frontend assigns these codes itself
+    // (`diagnosticFailureReason`); anything else is dropped rather than
+    // written, so no message text, path or graph content can reach a report
+    // the user may publish. Without it a reporter's "7,520 failed run_query"
+    // says nothing about whether they were waiting or broken (GH #543).
+    if let Some(reason) = reason.filter(|reason| diagnostic_reason_is_known(reason)) {
+        fields.insert("reason".into(), json!(reason));
+    }
     record_fixed_event("ipc.command", fields);
 }
 
@@ -581,7 +634,15 @@ pub(crate) fn diagnostic_frontend_event(
     delay_ms: Option<u64>,
     updater_stage: Option<String>,
     updater_cause: Option<String>,
+    close_reason: Option<String>,
+    pages: Option<u64>,
 ) {
+    if kind == "close_discarded_unsaved" {
+        if let Some(fields) = close_discard_fields(close_reason.as_deref(), pages) {
+            record_fixed_event("runtime.close_discarded_unsaved", fields);
+        }
+        return;
+    }
     if kind == "updater_failure" {
         let Some(stage) = updater_stage.filter(|value| {
             matches!(
@@ -629,6 +690,19 @@ pub(crate) fn diagnostic_frontend_event(
     fields.insert("column".into(), json!(column));
     fields.insert("delayMs".into(), json!(delay_ms));
     record_fixed_event("frontend.health", fields);
+}
+
+/// The user closed Tine through the unsaved-changes warning and chose to
+/// discard. `runtime.clean_shutdown` is still true of that process, so without
+/// this event a session that lost drafts looked like any other clean exit
+/// (DanTremonti, GH #540). Only a fixed reason token and a page count are
+/// kept: never page titles, which the report promises to exclude.
+fn close_discard_fields(reason: Option<&str>, pages: Option<u64>) -> Option<Map<String, Value>> {
+    let reason = reason.filter(|value| matches!(*value, "failed" | "still-saving"))?;
+    let mut fields = Map::new();
+    fields.insert("reason".into(), json!(reason));
+    fields.insert("pages".into(), json!(pages.unwrap_or(0)));
+    Some(fields)
 }
 
 #[tauri::command]
@@ -853,6 +927,45 @@ pub(crate) fn clear_diagnostics() -> Result<(), crate::command_error::CommandErr
 mod tests {
     use super::*;
 
+    /// GH #543 (re-audit A2-N3): the diagnostic record's reason filter promised
+    /// a fixed vocabulary and delivered a character pattern for one of its two
+    /// arms, while the other had silently fallen behind a fourth readiness
+    /// reason. Both halves are asserted here: every code the core can actually
+    /// produce survives the filter, and nothing else does.
+    #[test]
+    fn the_diagnostic_reason_filter_is_exactly_the_cores_vocabulary() {
+        for reason in tine_core::query::QueryReadinessReason::ALL {
+            let wire = format!("not-ready:{}", reason.as_str());
+            assert!(
+                diagnostic_reason_is_known(&wire),
+                "the core produces {wire} and the diagnostic drops it"
+            );
+        }
+        for reason in tine_core::query::QueryUnavailableReason::ALL {
+            let wire = format!("unavailable:{}", reason.as_str());
+            assert!(
+                diagnostic_reason_is_known(&wire),
+                "the core produces {wire} and the diagnostic drops it"
+            );
+        }
+        assert!(diagnostic_reason_is_known("cancelled"));
+        assert!(diagnostic_reason_is_known("other"));
+        for refused in [
+            // A lowercase word no enum produces: what the character pattern let
+            // through, and the only thing this filter exists to refuse.
+            "unavailable:no_such_reason",
+            "not-ready:no_such_reason",
+            "unavailable:/home/someone/graph/pages/secret",
+            "the projection at /tmp/graph could not be read",
+            "",
+        ] {
+            assert!(
+                !diagnostic_reason_is_known(refused),
+                "the diagnostic would have written {refused:?} into a report the user may publish"
+            );
+        }
+    }
+
     #[test]
     #[ignore = "child-process probe for stderr capture"]
     fn diag_disabled_child_probe() {
@@ -1058,6 +1171,58 @@ mod tests {
         assert!(!production.contains("fields.insert(\"detail\""));
         assert!(production.contains("verboseDebugLogIncluded\": false"));
         assert!(production.contains("record_fixed_event(\"watcher.batch\", fields)"));
+        assert!(production.contains("record_fixed_event(\"index.failure\", fields)"));
+    }
+
+    /// GH #594 L5: an index failure reaches a report as three fixed fields,
+    /// and every class it can carry is a fixed code.
+    #[test]
+    fn an_index_failure_is_recorded_as_fixed_codes() {
+        for class in tine_core::query::IndexFailureClass::ALL {
+            let code = class.as_str();
+            assert!(
+                !code.is_empty() && code.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{code:?}"
+            );
+        }
+        let source = include_str!("debug.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production diagnostics precede their tests");
+        let body = &production[production
+            .find("fn record_index_failure(")
+            .expect("the recorder exists")..];
+        let body = &body[..body.find("\n}\n").expect("its body ends")];
+        assert_eq!(body.matches("fields.insert(").count(), 3, "{body}");
+        assert!(production.contains("set_index_failure_observer(record_index_failure)"));
+    }
+
+    #[test]
+    fn a_close_that_discards_drafts_records_only_a_fixed_reason_and_a_count() {
+        let fields = close_discard_fields(Some("failed"), Some(3)).unwrap();
+        assert_eq!(fields.get("reason"), Some(&json!("failed")));
+        assert_eq!(fields.get("pages"), Some(&json!(3)));
+        assert_eq!(fields.len(), 2);
+        assert!(close_discard_fields(Some("still-saving"), None).is_some());
+        for refused in [
+            None,
+            Some(""),
+            Some("My secret page"),
+            Some("/home/someone/graph"),
+        ] {
+            assert!(
+                close_discard_fields(refused, Some(1)).is_none(),
+                "{refused:?}"
+            );
+        }
+        let production = include_str!("debug.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(
+            production.contains("record_fixed_event(\"runtime.close_discarded_unsaved\", fields)")
+        );
     }
 
     #[test]

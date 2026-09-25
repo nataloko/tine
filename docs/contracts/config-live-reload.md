@@ -39,22 +39,47 @@ A refresh discards the entire page cache, and Logseq rewrites `config.edn` on
 many ordinary UI actions while Syncthing redelivers it on every peer change. A
 byte-identity gate is therefore **mandatory, not an optimization**.
 
-`Graph::open_config_description()` is a digest of the bytes the running instance
-was opened with; `model::config_file_description(root)` digests what is on disk
-now. A Direct graph refreshes only when they differ — which also means a
-settings write Tine performed itself costs nothing here, because the command
-already refreshed and the reopened graph matches disk.
+`Graph::served_config_description()` is a digest of the bytes the served
+configuration was taken from: the bytes the instance was opened with, then
+whatever `Graph::take_in_config` last took in. `model::config_file_description(root)`
+digests what is on disk now. One decider, `state::take_in_config_change`, acts
+on them: nothing when they are equal, and otherwise it asks `take_in_config`,
+whose `ConfigReach` decides: `Unchanged` and `Settings` are taken in by the
+running graph, `Graph` reopens it. It asks again under the storage transition
+lane, on the graph bound then, so a second caller for the same change finds it
+taken in: one change, one reopen.
 
-`Graph::recent_config_write()` is the second half of the same gate. A setting
-Tine writes itself leaves the running graph's *parsed* view stale — it always
-has, and `set_favorites` in particular never refreshed — so the open-time digest
-alone would read every star toggled in the sidebar as an outside change.
+Both the watcher and every settings command call it. A settings command goes
+through `state::apply_config_write` (the only way a command writes
+configuration; `GraphSlot::apply_config_write` is private to `state.rs`), which
+calls the decider off the main thread when its write left a change the graph
+must reopen for. The command does not leave that to the watcher, which may not
+be running (GH #543, audit R10-07).
+
+Every hand-over of a graph to a window asks too: a reopen's swap, an open's
+bind, and a same-root load that answers with the slot it already has
+(`AlreadyCurrent`) each call `state::serve_disk_config` before the meta they
+hand the frontend is read. A graph reads its configuration when it is opened,
+and a change arriving before the window holds it is taken in by the graph the
+window held then: a settings command writes through the slot being replaced,
+and the watcher takes an outside edit into it. The replacement then served the
+older value, and the frontend, which writes `:favorites` as a whole list,
+dropped a favorite from disk at its next toggle (GH #543, audit R11-03).
+
 `Graph::write_config` is therefore the single funnel every setter publishes
-through, and it records what it wrote.
+through, and it takes in what it wrote, so a star toggled in the sidebar costs
+no reopen. A change that reaches the graph is never taken in, so it leaves the
+digest behind: an outside change folded into Tine's own read-modify-write still
+reopens, and an outside revert to the opening bytes still reads as a change.
+(Two earlier digests — the open-time bytes and the last bytes written — each
+missed one of those.)
 
 Tested by `config::tests::a_graph_reports_whether_config_edn_moved_since_it_was_opened`,
-`config::tests::a_settings_write_tine_performed_itself_does_not_read_as_an_outside_change`
-and `config::tests::only_the_graph_s_own_config_edn_is_recognized_as_configuration`.
+`config::tests::the_watcher_gate_matches_disk_only_when_disk_was_taken_in`,
+`config::tests::only_the_graph_s_own_config_edn_is_recognized_as_configuration`
+`state::tests::a_settings_write_decides_its_own_reopen`,
+`state::tests::a_settings_write_during_a_reopen_reaches_the_replacement` and
+`state::tests::every_graph_handover_serves_the_config_on_disk`.
 
 ## 4. What reaches the frontend
 
@@ -77,6 +102,7 @@ config-derived frontend state.
 |---|---|---|
 | Storage transition lane busy | `RefreshOutcome::Deferred`; the window is remembered in `config_recheck` and retried next cycle | Blocking the watcher thread would stall reconciliation for **every** graph behind one graph's load or storage promotion. The file is still on disk, so nothing is lost by waiting |
 | Kernel rescan, notify error, or poll mode | Every graph re-checks | Those cycles carry no usable paths; poll mode has none at all. One file read and one digest per graph, against a stat scan already being paid |
+| No OS watcher can be created | `graph-watch-error` is emitted once, and each cycle polls until one can | A swallowed creation error left every external change, and every outside configuration change, unseen for the session (GH #543, audit R10-07) |
 | Refresh fails | `graph-watch-error` is emitted | Until it succeeds the window serves stale configuration, which is the failure this whole mechanism exists to prevent. Not silent |
 | Journal filename migrations | **Never** run on a refresh | Concord invariant 4: a refresh re-reads configuration, it does not rewrite the tree. An outside config edit must not rename the user's files as a side effect |
 

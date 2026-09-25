@@ -4,104 +4,122 @@
 use super::*;
 
 impl Graph {
-    /// List all pages and journals in the graph.
+    /// List all pages and journals in the graph, for display: a graph whose
+    /// text cannot be read lists nothing. A caller that acts on the listing
+    /// (exports it, checks a name against it) uses [`Graph::try_list_pages`].
     pub fn list_pages(&self) -> Vec<PageEntry> {
-        let gen = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        if let Some((g, entries)) = self.page_list_cache.read().unwrap().as_ref() {
-            if *g == gen {
-                return entries.clone();
-            }
-        }
-        // R6: a ready projection already holds the effective inventory; the
-        // whole-graph parse below is the not-ready fallback.
-        if let Some(entries) = self.direct_projection_page_inventory(gen) {
-            *self.page_list_cache.write().unwrap() = Some((gen, entries.clone()));
-            return entries;
-        }
-        // Cold inventory used to run its own whole-graph parse, independently
-        // of the page-build flight used by templates, queries and background
-        // warm-up. On first open those passes competed for every core and for
-        // storage, starving the three-page journal feed (GH #550). Join the
-        // existing generation-scoped flight instead.
-        //
-        // Except after a known parse failure. `publish_warm_page_inventory`
-        // deliberately leaves the memo absent then, so that the next listing
-        // revalidates the failed path from disk; the flight answers from the
-        // parsed cache, which still holds the page as it was before it became
-        // unreadable, so joining it here would republish exactly the stale
-        // entry that mechanism exists to drop. Cold open has no failures, so
-        // it keeps the shared flight.
-        let entries = if self.page_index_failures.read().unwrap().is_empty() {
-            self.with_pages(|pages| {
-                pages
-                    .iter()
-                    .map(|(entry, _)| entry.clone())
-                    .collect::<Vec<_>>()
-            })
-        } else {
-            match self.exact_page_inventory_from_disk() {
-                Some(entries) => entries,
-                None => return Vec::new(),
-            }
-        };
-        *self.page_list_cache.write().unwrap() = Some((gen, entries.clone()));
-        entries
+        self.page_listing(false).unwrap_or_default()
     }
 
-    /// Read and parse every graph-text file, exactly as it is on disk right
-    /// now, and republish the parse failures found on the way.
-    ///
-    /// This is the expensive path. It exists for one case: a file whose parse
-    /// failed under the watcher must be revalidated from its bytes rather than
-    /// answered from a cache that predates the failure. `None` means the graph
-    /// text scope itself could not be read; the caller then lists nothing, and
-    /// the reason is left in `page_index_failures`.
-    fn exact_page_inventory_from_disk(&self) -> Option<Vec<PageEntry>> {
-        let built = self.admit_retained_graph_text_writer().and_then(|permit| {
-            let entries = self.graph_text_entries(&permit)?;
-            let limits = graph_text_inventory_limits();
-            let mut raw_bytes = 0_u64;
-            let mut effective = Vec::with_capacity(entries.len());
-            let mut failures = Vec::new();
-            for entry in entries {
-                let loaded = self.graph_text_read_optional_text_with_identity(&permit, &entry.path);
-                let parsed = match loaded {
-                    Ok(Some((content, _))) => {
-                        raw_bytes = raw_bytes
-                            .checked_add(usize_to_u64(content.len())?)
-                            .ok_or_else(|| {
-                                graph_text_inventory_limit_error("aggregate text bytes")
-                            })?;
-                        if raw_bytes > limits.retained_content_bytes {
-                            return Err(graph_text_inventory_limit_error("aggregate text bytes"));
-                        }
-                        parse_exact_page(self, &entry, &content)
-                    }
-                    Ok(None) => {
-                        failures.push(format!(
-                            "{}: disappeared during graph text listing",
-                            entry.rel_path
-                        ));
-                        continue;
-                    }
-                    Err(error) => Err(error),
-                };
-                match parsed {
-                    Ok((entry, _, _)) => effective.push(entry),
-                    Err(_) => failures.push(entry.rel_path),
-                }
-            }
-            *self.page_index_failures.write().unwrap() = failures;
-            Ok(effective)
-        });
-        match built {
-            Ok(entries) => Some(entries),
-            Err(error) => {
-                *self.page_index_failures.write().unwrap() =
-                    vec![format!("graph-text-scope: {error}")];
-                None
+    /// [`Graph::list_pages`] for a caller that acts on the listing: a graph
+    /// whose text cannot be read is an error, never an empty graph.
+    pub fn try_list_pages(&self) -> io::Result<Vec<PageEntry>> {
+        self.exact_read(|| self.page_listing(true))
+    }
+
+    /// Forget the memoized page list, as a reopen that never parsed has none:
+    /// the next listing asks the index (statement census).
+    #[cfg(test)]
+    pub(crate) fn forget_page_list_test(&self) {
+        *self.page_list_cache.write().unwrap() = None;
+    }
+
+    fn page_listing(&self, exact: bool) -> io::Result<Vec<PageEntry>> {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        if let Some((g, entries)) = self.page_list_cache.read().unwrap().as_ref() {
+            if *g == generation {
+                return Ok(entries.clone());
             }
         }
+        // One base inventory: the ready index's, or else the shared page-build
+        // flight's. Cold inventory used to run its own whole-graph parse,
+        // competing with the flight for every core and for storage and
+        // starving the journal feed (GH #550).
+        //
+        // A graph whose text cannot be read, or a display read on a retired
+        // graph, lists nothing for display and is an error to an acting
+        // caller; neither answer is memoized, so it cannot outlive its cause.
+        let base = match self.indexed_or_fallback(|| self.direct_projection_page_inventory()) {
+            Ok((_, entries)) => entries,
+            Err(PageFallback::Cache(pages)) => {
+                pages.iter().map(|(entry, _)| entry.clone()).collect()
+            }
+            Err(PageFallback::Parse) => match self.page_snapshot(!exact) {
+                Ok(Some(pages)) => pages.iter().map(|(entry, _)| entry.clone()).collect(),
+                Ok(None) => return Ok(Vec::new()),
+                Err(error) if exact => return Err(error),
+                Err(_) => return Ok(Vec::new()),
+            },
+        };
+        let failures = self.page_index_failures.read().unwrap().to_vec();
+        let entries = if failures.is_empty() {
+            base
+        } else {
+            match self.with_failed_paths_revalidated(base, &failures) {
+                Ok(entries) => entries,
+                Err(error) if exact => return Err(error),
+                Err(_) => return Ok(Vec::new()),
+            }
+        };
+        if self.answer_is_complete()
+            && self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation
+        {
+            *self.page_list_cache.write().unwrap() = Some((generation, entries.clone()));
+        }
+        Ok(entries)
+    }
+
+    /// `base` after known parse failures: its entries for healthy pages,
+    /// with every failed path read and parsed again on its own. Both bases
+    /// still hold a failed page as it was before it failed, and only a failed
+    /// path can be stale, so only a failed path is revalidated: one that
+    /// still fails to read or parse is left out, one that is gone is left
+    /// out, and one that now parses is listed as it is now. An error when
+    /// the graph text scope itself could not be read.
+    ///
+    /// This replaced a whole-graph read and parse taken whenever a failure
+    /// was recorded and no parsed cache existed, as in every warm SQL
+    /// session: one unreadable file cost a 10k-page parse per listing
+    /// (GH #543, indexing audits IT-07, R3-04 and R4-03).
+    fn with_failed_paths_revalidated(
+        &self,
+        base: Vec<PageEntry>,
+        failures: &[String],
+    ) -> io::Result<Vec<PageEntry>> {
+        if let Some(scope) = failures
+            .iter()
+            .find(|failure| failure.starts_with(super::page_cache::GRAPH_TEXT_SCOPE_FAILURE))
+        {
+            return Err(io::Error::other(scope.clone()));
+        }
+        let permit = self.admit_retained_graph_text_writer()?;
+        let mut recovered = Vec::new();
+        for failure in failures {
+            // A failure is a graph-relative path only when it names a file;
+            // skip reasons ("<path>: <why>") name no file and list nothing.
+            let path = self.root.join(failure);
+            if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+                continue;
+            }
+            let Ok(Some((content, _))) =
+                self.graph_text_read_optional_text_with_identity(&permit, &path)
+            else {
+                continue;
+            };
+            let Ok(Some(entry)) = self.graph_text_entry_for_path(&path) else {
+                continue;
+            };
+            if let Ok((entry, _, _)) = parse_exact_page(self, &entry, &content) {
+                recovered.push(entry);
+            }
+        }
+        let failed = failures.iter().map(String::as_str).collect::<HashSet<_>>();
+        let mut entries = base
+            .into_iter()
+            .filter(|entry| !failed.contains(entry.rel_path.as_str()))
+            .collect::<Vec<_>>();
+        entries.extend(recovered);
+        Ok(entries)
     }
 
     /// Publish the exact physical/effective page inventory already represented by
@@ -127,30 +145,22 @@ impl Graph {
     /// Capture a current list memo before a transaction that must discard the
     /// parsed cache. The transaction may update this in memory from bytes it
     /// already owns, avoiding a second whole-graph read/parse after commit.
-    pub(super) fn current_page_inventory_snapshot(&self) -> Option<(Vec<PageEntry>, Vec<String>)> {
+    pub(super) fn current_page_inventory_snapshot(&self) -> Option<Vec<PageEntry>> {
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        let entries = self
-            .page_list_cache
+        self.page_list_cache
             .read()
             .unwrap()
             .as_ref()
             .filter(|(memo_generation, _)| *memo_generation == generation)
-            .map(|(_, entries)| entries.clone())?;
-        let failures = self.page_index_failures.read().unwrap().clone();
-        (self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation)
-            .then_some((entries, failures))
+            .map(|(_, entries)| entries.clone())
     }
 
-    pub(super) fn publish_page_inventory_snapshot(
-        &self,
-        mut entries: Vec<PageEntry>,
-        mut failures: Vec<String>,
-    ) {
+    /// Publish the list memo a transaction updated. The failures it found
+    /// are already recorded ([`Graph::note_graph_text_state`]): the record
+    /// describes the disk and outlives the parsed cache.
+    pub(super) fn publish_page_inventory_snapshot(&self, mut entries: Vec<PageEntry>) {
         entries.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-        failures.sort();
-        failures.dedup();
         let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
-        *self.page_index_failures.write().unwrap() = failures;
         *self.page_list_cache.write().unwrap() = Some((generation, entries));
     }
 
@@ -186,10 +196,40 @@ impl Graph {
     /// changes. It carries the count as well, so adding a name that collides with
     /// a removed one still shows up unless the count also matches.
     pub fn referenced_page_names_versioned(&self, known: Option<u64>) -> ReferencedPageNames {
-        if let Some(names) = self.direct_projection_referenced_page_names() {
+        let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        if let Some((cached, digest, names)) = self.referenced_names_cache.read().unwrap().as_ref()
+        {
+            if *cached == generation {
+                return ReferencedPageNames::answer(*digest, names, known);
+            }
+        }
+        let indexed = self.indexed_or_fallback(|| self.direct_projection_referenced_page_names());
+        if let Err(PageFallback::Cache(pages)) = &indexed {
+            let names = referenced_page_names_from_snapshot(pages);
             let digest = referenced_names_digest(&names);
             return ReferencedPageNames::answer(digest, &names, known);
         }
+        if let Ok(names) = indexed {
+            let digest = referenced_names_digest(&names);
+            let answer = ReferencedPageNames::answer(digest, &names, known);
+            // Only a read that still matches the generation we keyed on may be
+            // memoized. The projection revalidates internally, but the
+            // generation can move between our load and its answer, and a set
+            // recorded under a stale key would outlive the edit that
+            // invalidated it — an autocomplete offering pages that no longer
+            // exist, or missing one just linked.
+            if self.answer_is_complete()
+                && self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation
+            {
+                *self.referenced_names_cache.write().unwrap() = Some((generation, digest, names));
+            }
+            return answer;
+        }
+        // The parser fallback is deliberately NOT memoized: it answers with an
+        // empty set when the page cache is not yet warm (it must not force a
+        // parse here), and caching that would make "this graph references no
+        // pages" stick for the whole generation — autocomplete would silently
+        // offer nothing until the next edit happened to bump it.
         let names = self.rebuild_referenced_page_names();
         let digest = referenced_names_digest(&names);
         ReferencedPageNames::answer(digest, &names, known)
@@ -200,54 +240,13 @@ impl Graph {
         let Some(pages) = guard.as_ref() else {
             return Vec::new(); // cache not warm — don't force a parse
         };
-        fn add(seen: &mut std::collections::HashMap<String, String>, name: String) {
-            if !name.is_empty() {
-                seen.entry(crate::refs::page_key(&name)).or_insert(name);
-            }
-        }
-        let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        for (_, doc) in pages.iter() {
-            if let Some(pre) = &doc.pre_block {
-                for name in crate::doc::property_reference_page_names(pre) {
-                    add(&mut seen, name);
-                }
-            }
-            let mut frames: [Option<std::slice::Iter<'_, DocBlock>>; MAX_BLOCK_DEPTH] =
-                std::array::from_fn(|_| None);
-            let mut len = usize::from(!doc.roots.is_empty());
-            if len != 0 {
-                frames[0] = Some(doc.roots.iter());
-            }
-            while len != 0 {
-                let mut frame = frames[len - 1]
-                    .take()
-                    .expect("active cached-reference frame");
-                let Some(block) = frame.next() else {
-                    len -= 1;
-                    continue;
-                };
-                frames[len - 1] = Some(frame);
-                // Read the memoized projection's original-case page refs instead of a
-                // fresh `block_refs` parse. This whole-graph path runs on reference
-                // autocomplete after each cache generation change.
-                for name in &block.projection().refs_page {
-                    add(&mut seen, name.clone());
-                }
-                for name in crate::doc::property_reference_page_names(&block.raw) {
-                    add(&mut seen, name);
-                }
-                if !block.children.is_empty() {
-                    if len == MAX_BLOCK_DEPTH {
-                        // Cache documents normally pass the checked parser/admission
-                        // boundary. Contain any forged or stale over-depth value:
-                        // publish no partial result.
-                        return Vec::new();
-                    }
-                    frames[len] = Some(block.children.iter());
-                    len += 1;
-                }
-            }
-        }
-        seen.into_values().collect()
+        referenced_page_names_from_snapshot(pages)
     }
+}
+
+pub(super) fn referenced_page_names_from_snapshot(
+    pages: &[(PageEntry, Arc<Document>)],
+) -> Vec<String> {
+    crate::query::referenced_page_names_from_snapshot_cancellable(pages, &|| false)
+        .unwrap_or_default()
 }

@@ -70,33 +70,89 @@ pub(crate) const PAYLOAD_BATCH: usize = 128;
 /// the page's own facets share these two tables under owner type 0.
 const OWNER_BLOCK: i64 = 1;
 
-/// Where an admitted row's PUBLIC id comes from (WARM-IDENTITY-ORDER-CONTRACT).
+/// The live runtime ids one lowering of a page carried where they differ from
+/// the structural id the index stores (R3; GH #594), keyed by that structural
+/// id. `revision` is the page's stored source revision: the exceptions decode
+/// exactly the rows written at it and no other.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PageLiveIds {
+    pub(crate) revision: String,
+    pub(crate) ids: std::collections::HashMap<String, String>,
+}
+
+/// Where an admitted row's PUBLIC id comes from (WARM-IDENTITY-ORDER-CONTRACT;
+/// R3 of `docs/contracts/direct-query-identities.md`).
 ///
-/// Physical selection ids and public result ids are separate. This policy is
-/// captured ONCE per job, beside the snapshot, and is never re-read from live
-/// state while an answer is being built.
+/// The index stores every block's STRUCTURAL id,
+/// `doc_runtime_id_for_order(path, order_key)`: what a fresh parse assigns, so
+/// a page nobody edited in this session resolves with no document and no
+/// traversal. A block this session's document names otherwise (a block that
+/// kept its id across an insertion above it, a new block) is an exception
+/// recorded by the lowering, and `live` holds the exceptions whose revision is
+/// the one this snapshot stores. SQLite is never the identity authority.
 ///
-/// A page nobody edited in this session will be re-parsed on demand into
-/// reproducible STRUCTURAL runtime ids, so its rows resolve through
-/// `doc_runtime_id_for_order(path, order_key)` — no document, no traversal. A
-/// page this session DID edit kept its live ids at an exact revision, so its
-/// rows use the stored `query_block_results.result_id`.
-///
-/// The set is captured by the caller together with the snapshot; nothing here
-/// reads live state. `all_session` is the whole-graph shortcut for a session
-/// that owns every page's identity.
+/// Captured ONCE per job, beside the snapshot, and never re-read from live
+/// state while an answer is being built. `all_session` answers the stored id
+/// as it is, for fixtures that store the ids they expect.
+#[derive(Clone, Default)]
 pub(crate) struct ResultIdentity {
-    pub(crate) session_pages: Arc<HashSet<[u8; 16]>>,
+    pub(crate) live: Arc<std::collections::HashMap<String, Arc<PageLiveIds>>>,
     pub(crate) all_session: bool,
 }
 
 impl ResultIdentity {
+    /// No page carries a live exception: every stored id is structural.
+    pub(crate) fn structural() -> Self {
+        Self::default()
+    }
+
+    /// The public id of one stored block row: the id the page's document
+    /// carries at the snapshot's generation. Every reader that matches a
+    /// stored block against a document asks this, or its answer names blocks
+    /// no document has: the Linked References filter compared stored ids
+    /// directly, and a page edited in an earlier session lost its backlinks
+    /// after a reopen (GH #594).
+    pub(crate) fn public_id(
+        &self,
+        path: &str,
+        order_key: &str,
+        stored_id: &str,
+    ) -> Result<String, String> {
+        if self.all_session {
+            return Ok(stored_id.to_owned());
+        }
+        let structural = doc_runtime_id_for_order(path, order_key)
+            .map_err(|error| format!("stored structural order does not resolve an id: {error}"))?
+            .to_string();
+        Ok(self
+            .live
+            .get(path)
+            .and_then(|page| page.ids.get(&structural))
+            .cloned()
+            .unwrap_or(structural))
+    }
+
+    /// The id the index stores for `public`: its structural id when it is one
+    /// of this snapshot's live exceptions, else `public` itself. The reverse of
+    /// [`Self::public_id`], for a reader that looks a block up by the id a
+    /// document gave it.
+    pub(crate) fn stored_id<'a>(&'a self, public: &'a str) -> &'a str {
+        self.live
+            .values()
+            .find_map(|page| {
+                page.ids
+                    .iter()
+                    .find_map(|(stored, live)| (live == public).then_some(stored.as_str()))
+            })
+            .unwrap_or(public)
+    }
+
     /// Every page's identity belongs to this session, so every row keeps its
     /// stored id.
     #[cfg(test)]
     pub(crate) fn session_owned() -> Self {
         Self {
-            session_pages: Arc::default(),
+            live: Arc::default(),
             all_session: true,
         }
     }
@@ -116,8 +172,8 @@ impl ResultIdentity {
 /// snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ResultLocator {
-    pub(crate) page_id: [u8; 16],
-    pub(crate) block_id: [u8; 16],
+    pub(crate) page_id: i64,
+    pub(crate) block_id: i64,
 }
 
 /// What one admitted row is stored AS in its group.
@@ -206,23 +262,6 @@ pub(crate) enum ResultReadError {
     Corrupt(String),
     /// The owner cancelled this job. The snapshot is released by the caller.
     Cancelled,
-}
-
-/// Shared full-text readiness fact, read from the query's owned image.
-pub(crate) const FTS_READY_PROBE_SQL: &str =
-    "SELECT phase FROM search_fts_build WHERE singleton = 1";
-
-pub(crate) fn probe_fts_ready(
-    snapshot: &mut PhysicalProjectionQuerySnapshot,
-) -> Result<bool, ResultReadError> {
-    match snapshot.run_projection_query(FTS_READY_PROBE_SQL, &[]) {
-        Ok(rows) => Ok(matches!(
-            rows.first().and_then(|row| row.first()),
-            Some(PhysicalQueryValue::Integer(1))
-        )),
-        Err(_) if snapshot.cancellation().is_cancelled() => Err(ResultReadError::Cancelled),
-        Err(error) => Err(ResultReadError::Sql(error)),
-    }
 }
 
 impl std::fmt::Display for ResultReadError {
@@ -435,8 +474,11 @@ pub(crate) fn read_page_results(
     let mut damage: Option<String> = None;
     let mut failure = None;
     let mut ordinal = 0usize;
-    let visit =
-        snapshot.visit_projection_query(&statement.query.sql, &statement.query.params, |row| {
+    let visit = crate::query::projection_sql::visit(
+        snapshot,
+        &statement.query.sql,
+        &statement.query.params,
+        |row| {
             if cancellation.is_cancelled() {
                 failure = Some(ResultReadError::Cancelled);
                 return Ok(std::ops::ControlFlow::Break(()));
@@ -500,7 +542,8 @@ pub(crate) fn read_page_results(
                 return Ok(std::ops::ControlFlow::Break(()));
             }
             Ok(std::ops::ControlFlow::Continue(()))
-        });
+        },
+    );
     if let Err(error) = visit {
         return Err(sql_or_cancelled(snapshot, error));
     }
@@ -531,7 +574,7 @@ pub(crate) fn read_page_results(
 /// One decoded `@page` descriptor, including the physical and census fields
 /// validated before its public payload is hydrated.
 pub(crate) struct PageResultDescriptor {
-    pub(crate) page_id: [u8; 16],
+    pub(crate) page_id: i64,
     pub(crate) name: String,
     pub(crate) kind: PageKind,
     pub(crate) journal_day: Option<i64>,
@@ -548,7 +591,7 @@ mod page_column {
     pub(super) const TEXT_KIND: usize = 2;
     pub(super) const JOURNAL_DAY: usize = 3;
     pub(super) const PATH: usize = 4;
-    pub(super) const POSITION: usize = 5;
+    pub(super) const STORED_PAGE: usize = 5;
     pub(super) const ESTIMATED_BYTES: usize = 6;
     pub(super) const PROPERTY_COUNT: usize = 7;
     pub(super) const MATCHED_TOTAL: usize = 8;
@@ -567,7 +610,7 @@ fn decode_page_row(row: &[PhysicalQueryValue]) -> Result<PageResultDescriptor, S
             column::COLUMNS
         ));
     }
-    let page_id = blob16(row, column::PAGE_ID, "page row page_id")?;
+    let page_id = integer(row, column::PAGE_ID, "page row page_id")?;
     let name = text(row, column::NAME, "pages.name")?;
     let text_kind = integer(row, column::TEXT_KIND, "pages.text_kind")?;
     let Some(kind) = page_kind_from_sql(text_kind) else {
@@ -575,10 +618,10 @@ fn decode_page_row(row: &[PhysicalQueryValue]) -> Result<PageResultDescriptor, S
     };
     let journal_day = opt_integer(row, column::JOURNAL_DAY, "pages.journal_day")?;
     let path = text(row, column::PATH, "pages.path")?;
-    let position = opt_integer(row, column::POSITION, "query_page_order.position")?;
-    // Direct Files' page order IS this column (see `decode_descriptor`).
-    if position.is_none() {
-        return Err("query_page_order has no position for a matched page".to_string());
+    // The order is the stored page's path (see `decode_descriptor`); a
+    // matched page with no stored row would sort to one end of the answer.
+    if opt_integer(row, column::STORED_PAGE, "pages.page_id")?.is_none() {
+        return Err("the page row is absent for a matched page".to_string());
     }
     Ok(PageResultDescriptor {
         page_id,
@@ -586,16 +629,8 @@ fn decode_page_row(row: &[PhysicalQueryValue]) -> Result<PageResultDescriptor, S
         kind,
         journal_day,
         path,
-        estimated_bytes: count(
-            row,
-            column::ESTIMATED_BYTES,
-            "query_page_results.estimated_bytes",
-        )?,
-        property_count: count(
-            row,
-            column::PROPERTY_COUNT,
-            "query_page_results.property_count",
-        )?,
+        estimated_bytes: count(row, column::ESTIMATED_BYTES, "pages.estimated_bytes")?,
+        property_count: count(row, column::PROPERTY_COUNT, "pages.property_count")?,
         matched_total: count(row, column::MATCHED_TOTAL, "page matched count")?,
     })
 }
@@ -617,31 +652,32 @@ pub(crate) fn hydrate_page_rows(
         }
         let ids = batch
             .iter()
-            .map(|row| PhysicalQueryValue::Blob(row.page_id.to_vec()))
+            .map(|row| PhysicalQueryValue::Integer(row.page_id))
             .collect::<Vec<_>>();
         let sql = format!(
-            "SELECT owner_id, page_id, name, value, ordinal FROM properties \
-             WHERE owner_type = 0 AND owner_id IN ({}) \
-             ORDER BY owner_id, ordinal, name",
+            "SELECT property.owner_id, property.page_id, name.raw, property.value, property.ordinal \
+             FROM properties property JOIN names name ON name.name_id = property.name_id \
+             WHERE property.owner_type = 0 AND property.owner_id IN ({}) \
+             ORDER BY property.owner_id, property.ordinal, property.name_id",
             placeholders(ids.len())
         );
         #[cfg(test)]
         note(|census| census.page_payload_statements += 1);
-        let rows = snapshot
-            .run_projection_query(&sql, &ids)
+        let rows = crate::query::projection_sql::run(snapshot, &sql, &ids)
             .map_err(|error| sql_or_cancelled(snapshot, error))?;
         let admitted = batch.iter().map(|row| row.page_id).collect::<HashSet<_>>();
-        let mut properties: HashMap<[u8; 16], Vec<(usize, String, String)>> = HashMap::new();
+        let mut properties: HashMap<i64, Vec<(usize, String, String)>> = HashMap::new();
         for row in &rows {
             #[cfg(test)]
             note(|census| census.page_payload_property_rows += 1);
-            let owner = blob16(row, 0, "properties.owner_id").map_err(ResultReadError::Corrupt)?;
+            let owner = integer(row, 0, "properties.owner_id").map_err(ResultReadError::Corrupt)?;
             if !admitted.contains(&owner) {
                 return Err(ResultReadError::Corrupt(
                     "a page property belongs to no admitted page".into(),
                 ));
             }
-            let page_id = blob16(row, 1, "properties.page_id").map_err(ResultReadError::Corrupt)?;
+            let page_id =
+                integer(row, 1, "properties.page_id").map_err(ResultReadError::Corrupt)?;
             if page_id != owner {
                 return Err(ResultReadError::Corrupt(
                     "an admitted page property names a different page".into(),
@@ -740,12 +776,12 @@ pub(crate) fn sql_or_cancelled(
 /// One selected block, as the descriptor read describes it. No payload: the raw
 /// text, tags and properties of a row nobody admits are never read.
 struct Descriptor {
-    block_id: [u8; 16],
+    block_id: i64,
     /// The PHYSICAL page this row's block belongs to. Beside `page` (the
     /// group's index), not instead of it: the payload's ownership check and
     /// the export locator both name the physical id, while the group index is
     /// where the DTO is pushed.
-    page_id: [u8; 16],
+    page_id: i64,
     page: usize,
     /// The public id this row will carry, already resolved through the captured
     /// identity policy.
@@ -776,7 +812,7 @@ struct PageGroups<C: ResultCarrier> {
     adjacent: bool,
     coalesce_names: bool,
     order: Vec<PageGroup<C>>,
-    by_page: HashMap<[u8; 16], usize>,
+    by_page: HashMap<i64, usize>,
 }
 
 // Derived `Default` would demand `C: Default`, which no carrier is: the
@@ -797,7 +833,7 @@ impl<C: ResultCarrier> PageGroups<C> {
     /// is the descriptor order.
     fn slot(
         &mut self,
-        page_id: [u8; 16],
+        page_id: i64,
         name: &str,
         kind: PageKind,
         journal_day: Option<i64>,
@@ -882,7 +918,7 @@ mod descriptor_column {
     pub(super) const TAG_COUNT: usize = 10;
     pub(super) const PROPERTY_COUNT: usize = 11;
     pub(super) const ORDER_KEY: usize = 12;
-    pub(super) const POSITION: usize = 13;
+    pub(super) const STORED_PAGE: usize = 13;
     pub(super) const COLUMNS: usize = 14;
 }
 
@@ -924,53 +960,54 @@ fn read_descriptors<C: ResultCarrier>(
     let mut failure = None;
     let mut ordinal = 0usize;
     let cancellation = snapshot.cancellation();
-    let visit = snapshot.visit_projection_query(&statement.sql, &statement.params, |row| {
-        if cancellation.is_cancelled() {
-            failure = Some(ResultReadError::Cancelled);
-            return Ok(std::ops::ControlFlow::Break(()));
-        }
-        #[cfg(test)]
-        note(|census| census.descriptor_rows += 1);
-        if let Some((view, _)) = ordered {
-            match count(row, 14, "complete block count") {
-                Ok(total) => *matched_total = Some(total),
+    let visit =
+        crate::query::projection_sql::visit(snapshot, &statement.sql, &statement.params, |row| {
+            if cancellation.is_cancelled() {
+                failure = Some(ResultReadError::Cancelled);
+                return Ok(std::ops::ControlFlow::Break(()));
+            }
+            #[cfg(test)]
+            note(|census| census.descriptor_rows += 1);
+            if let Some((view, _)) = ordered {
+                match count(row, 14, "complete block count") {
+                    Ok(total) => *matched_total = Some(total),
+                    Err(what) => {
+                        damage = Some(what);
+                        return Ok(std::ops::ControlFlow::Break(()));
+                    }
+                }
+                if view.sample.is_some_and(|sample| ordinal >= sample as usize) {
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
+            }
+            ordinal += 1;
+            let descriptor = if ordered.is_some() {
+                row.get(..14).unwrap_or(row)
+            } else {
+                row
+            };
+            let (page, decoded) = match decode_descriptor(descriptor, inputs) {
+                Ok(decoded) => decoded,
                 Err(what) => {
                     damage = Some(what);
                     return Ok(std::ops::ControlFlow::Break(()));
                 }
+            };
+            if let Some(fold) = statistics {
+                if let Err(error) = fold_statistics_row(fold, row, 15) {
+                    failure = Some(error);
+                    return Ok(std::ops::ControlFlow::Break(()));
+                }
             }
-            if view.sample.is_some_and(|sample| ordinal >= sample as usize) {
-                return Ok(std::ops::ControlFlow::Break(()));
-            }
-        }
-        ordinal += 1;
-        let descriptor = if ordered.is_some() {
-            row.get(..14).unwrap_or(row)
-        } else {
-            row
-        };
-        let (page, decoded) = match decode_descriptor(descriptor, inputs) {
-            Ok(decoded) => decoded,
-            Err(what) => {
-                damage = Some(what);
-                return Ok(std::ops::ControlFlow::Break(()));
-            }
-        };
-        if let Some(fold) = statistics {
-            if let Err(error) = fold_statistics_row(fold, row, 15) {
-                failure = Some(error);
-                return Ok(std::ops::ControlFlow::Break(()));
-            }
-        }
-        Ok(admit_decoded(
-            &page,
-            decoded,
-            inputs,
-            pages,
-            budget,
-            &mut admitted,
-        ))
-    });
+            Ok(admit_decoded(
+                &page,
+                decoded,
+                inputs,
+                pages,
+                budget,
+                &mut admitted,
+            ))
+        });
     if let Err(error) = visit {
         return Err(sql_or_cancelled(snapshot, error));
     }
@@ -1011,7 +1048,7 @@ fn fold_statistics_row(
 /// What one descriptor row says about its page, dropped immediately after the
 /// row is offered to the budget.
 struct DescriptorPage {
-    page_id: [u8; 16],
+    page_id: i64,
     name: String,
     kind: PageKind,
     journal_day: Option<i64>,
@@ -1023,7 +1060,7 @@ struct DescriptorPage {
 /// `blocks.order_key` and the stored id, which [`resolve_identity`] folded into
 /// `result_id` and `estimated_bytes`.
 struct DecodedDescriptor {
-    block_id: [u8; 16],
+    block_id: i64,
     result_id: String,
     estimated_bytes: usize,
     tag_count: usize,
@@ -1044,8 +1081,8 @@ fn decode_descriptor(
             column::COLUMNS
         ));
     }
-    let block_id = blob16(row, column::BLOCK_ID, "descriptor block_id")?;
-    let page_id = blob16(row, column::PAGE_ID, "descriptor page_id")?;
+    let block_id = integer(row, column::BLOCK_ID, "descriptor block_id")?;
+    let page_id = integer(row, column::PAGE_ID, "descriptor page_id")?;
     // A LEFT JOIN that found nothing is the shape this read exists to catch:
     // the selected block IS in the answer, so its missing metadata is damage
     // and never a dropped row (D-3).
@@ -1056,36 +1093,27 @@ fn decode_descriptor(
     };
     let journal_day = opt_integer(row, column::JOURNAL_DAY, "pages.journal_day")?;
     let path = text(row, column::PATH, "pages.path")?;
-    let result_page = blob16(row, column::RESULT_PAGE_ID, "query_block_results.page_id")?;
+    let result_page = integer(row, column::RESULT_PAGE_ID, "blocks.page_id")?;
     if result_page != page_id {
-        return Err("query_block_results.page_id does not own its block's page".to_string());
+        return Err("blocks.page_id does not own its block's page".to_string());
     }
-    let preorder = integer(row, column::PREORDER, "query_block_results.preorder")?;
+    let preorder = integer(row, column::PREORDER, "blocks.preorder")?;
     if preorder < 0 {
-        return Err("query_block_results.preorder is negative".to_string());
+        return Err("blocks.preorder is negative".to_string());
     }
-    let stored_id = text(row, column::RESULT_ID, "query_block_results.result_id")?;
+    let stored_id = text(row, column::RESULT_ID, "blocks.result_id")?;
     if stored_id.is_empty() {
-        return Err("query_block_results.result_id is empty".to_string());
+        return Err("blocks.result_id is empty".to_string());
     }
-    let stored_estimate = count(
-        row,
-        column::ESTIMATED_BYTES,
-        "query_block_results.estimated_bytes",
-    )?;
-    let tag_count = count(row, column::TAG_COUNT, "query_block_results.tag_count")?;
-    let property_count = count(
-        row,
-        column::PROPERTY_COUNT,
-        "query_block_results.property_count",
-    )?;
+    let stored_estimate = count(row, column::ESTIMATED_BYTES, "blocks.estimated_bytes")?;
+    let tag_count = count(row, column::TAG_COUNT, "blocks.tag_count")?;
+    let property_count = count(row, column::PROPERTY_COUNT, "blocks.property_count")?;
     let order_key = text(row, column::ORDER_KEY, "blocks.order_key")?;
-    let position = opt_integer(row, column::POSITION, "query_page_order.position")?;
-    // Direct Files' cross-page order IS this column; a NULL would silently
-    // sort a page to one end of the answer, which changes which rows survive a
-    // truncated budget.
-    if position.is_none() {
-        return Err("query_page_order has no position for a result page".to_string());
+    // Direct Files' cross-page order is the stored page's path; a missing
+    // page row would silently sort a page to one end of the answer, which
+    // changes which rows survive a truncated budget.
+    if opt_integer(row, column::STORED_PAGE, "pages.page_id")?.is_none() {
+        return Err("the page row is absent for a result page".to_string());
     }
     let (result_id, estimated_bytes) = resolve_identity(
         inputs.identity,
@@ -1170,19 +1198,16 @@ fn admit_decoded<C: ResultCarrier>(
 /// contradiction, and a saturating subtraction would hide it.
 pub(crate) fn resolve_identity(
     identity: &ResultIdentity,
-    page_id: [u8; 16],
+    _page_id: i64,
     path: &str,
     order_key: &str,
     stored_id: &str,
     stored_estimate: usize,
 ) -> Result<(String, usize), String> {
-    let structural = !identity.all_session && !identity.session_pages.contains(&page_id);
-    if !structural {
-        return Ok((stored_id.to_owned(), stored_estimate));
+    let resolved = identity.public_id(path, order_key, stored_id)?;
+    if resolved == stored_id {
+        return Ok((resolved, stored_estimate));
     }
-    let resolved = doc_runtime_id_for_order(path, order_key)
-        .map_err(|error| format!("stored structural order does not resolve an id: {error}"))?
-        .to_string();
     let estimate = stored_estimate
         .checked_sub(stored_id.len())
         .and_then(|rest| rest.checked_add(resolved.len()))
@@ -1208,8 +1233,8 @@ pub(crate) enum PayloadChannel {
 /// Borrowed rather than owned: an ordinary read already holds these six facts
 /// on its `Descriptor` and must not pay a second `String` for them.
 pub(crate) struct PayloadFacts<'a> {
-    pub(crate) block_id: [u8; 16],
-    pub(crate) page_id: [u8; 16],
+    pub(crate) block_id: i64,
+    pub(crate) page_id: i64,
     pub(crate) result_id: &'a str,
     pub(crate) estimated_bytes: usize,
     pub(crate) tag_count: usize,
@@ -1248,7 +1273,7 @@ pub(crate) fn read_admitted_payload<R>(
         }
         let ids = batch
             .iter()
-            .map(|row| PhysicalQueryValue::Blob(facts(row).block_id.to_vec()))
+            .map(|row| PhysicalQueryValue::Integer(facts(row).block_id))
             .collect::<Vec<_>>();
         let block_facets = read_block_facets(snapshot, &ids, channel)?;
         let tags = read_owner_strings(
@@ -1256,19 +1281,21 @@ pub(crate) fn read_admitted_payload<R>(
             &ids,
             OwnerList::Tags,
             channel,
-            "SELECT owner_id, tag FROM tags \
-             WHERE owner_type = {owner} AND owner_id IN ({ids}) \
-             ORDER BY owner_id, ordinal",
-            |row| text(row, 1, "tags.tag"),
+            "SELECT tag.owner_id, name.raw FROM tags tag \
+             JOIN names name ON name.name_id = tag.name_id \
+             WHERE tag.owner_type = {owner} AND tag.owner_id IN ({ids}) \
+             ORDER BY tag.owner_id, tag.ordinal",
+            |row| text(row, 1, "names.raw"),
         )?;
         let properties = read_owner_strings(
             snapshot,
             &ids,
             OwnerList::Properties,
             channel,
-            "SELECT owner_id, name, value FROM properties \
-             WHERE owner_type = {owner} AND owner_id IN ({ids}) \
-             ORDER BY owner_id, ordinal",
+            "SELECT property.owner_id, name.raw, property.value FROM properties property \
+             JOIN names name ON name.name_id = property.name_id \
+             WHERE property.owner_type = {owner} AND property.owner_id IN ({ids}) \
+             ORDER BY property.owner_id, property.ordinal",
             |row| {
                 Ok((
                     text(row, 1, "properties.name")?,
@@ -1337,7 +1364,7 @@ enum OwnerList {
 /// One admitted block's non-list facets: the block row, its required text, and
 /// the two optional facet rows beside them.
 struct BlockFacets {
-    page_id: [u8; 16],
+    page_id: i64,
     collapsed: bool,
     heading_level: Option<u8>,
     raw: String,
@@ -1361,7 +1388,7 @@ fn read_block_facets(
     snapshot: &mut PhysicalProjectionQuerySnapshot,
     ids: &[PhysicalQueryValue],
     channel: PayloadChannel,
-) -> Result<HashMap<[u8; 16], BlockFacets>, ResultReadError> {
+) -> Result<HashMap<i64, BlockFacets>, ResultReadError> {
     let sql = format!(
         "SELECT b.block_id, b.page_id, b.collapsed, b.heading_level, t.content, \
          k.marker, pl.priority, pl.scheduled, pl.deadline \
@@ -1376,8 +1403,7 @@ fn read_block_facets(
     note(|census| *payload_statements(census, channel) += 1);
     #[cfg(not(test))]
     let _ = channel;
-    let rows = snapshot
-        .run_projection_query(&sql, ids)
+    let rows = crate::query::projection_sql::run(snapshot, &sql, ids)
         .map_err(|error| sql_or_cancelled(snapshot, error))?;
     let mut facets = HashMap::with_capacity(rows.len());
     for row in &rows {
@@ -1393,17 +1419,15 @@ fn read_block_facets(
     Ok(facets)
 }
 
-fn decode_block_facets(
-    row: &[PhysicalQueryValue],
-) -> Result<([u8; 16], BlockFacets), ResultReadError> {
-    let decode = || -> Result<([u8; 16], BlockFacets), String> {
+fn decode_block_facets(row: &[PhysicalQueryValue]) -> Result<(i64, BlockFacets), ResultReadError> {
+    let decode = || -> Result<(i64, BlockFacets), String> {
         if row.len() != 9 {
             return Err(format!(
                 "block payload row has {} columns, expected 9",
                 row.len()
             ));
         }
-        let block_id = blob16(row, 0, "blocks.block_id")?;
+        let block_id = integer(row, 0, "blocks.block_id")?;
         let collapsed = match integer(row, 2, "blocks.collapsed")? {
             0 => false,
             1 => true,
@@ -1417,7 +1441,7 @@ fn decode_block_facets(
         Ok((
             block_id,
             BlockFacets {
-                page_id: blob16(row, 1, "blocks.page_id")?,
+                page_id: integer(row, 1, "blocks.page_id")?,
                 collapsed,
                 heading_level,
                 raw: text(row, 4, "block_text.content")?,
@@ -1444,7 +1468,7 @@ fn read_owner_strings<T>(
     channel: PayloadChannel,
     shape: &str,
     decode: impl Fn(&[PhysicalQueryValue]) -> Result<T, String>,
-) -> Result<HashMap<[u8; 16], Vec<T>>, ResultReadError> {
+) -> Result<HashMap<i64, Vec<T>>, ResultReadError> {
     let sql = shape
         .replace("{owner}", &OWNER_BLOCK.to_string())
         .replace("{ids}", &placeholders(ids.len()));
@@ -1452,10 +1476,9 @@ fn read_owner_strings<T>(
     note(|census| *payload_statements(census, channel) += 1);
     #[cfg(not(test))]
     let _ = (list, channel);
-    let rows = snapshot
-        .run_projection_query(&sql, ids)
+    let rows = crate::query::projection_sql::run(snapshot, &sql, ids)
         .map_err(|error| sql_or_cancelled(snapshot, error))?;
-    let mut owners: HashMap<[u8; 16], Vec<T>> = HashMap::new();
+    let mut owners: HashMap<i64, Vec<T>> = HashMap::new();
     for row in &rows {
         #[cfg(test)]
         note(|census| match list {
@@ -1463,7 +1486,7 @@ fn read_owner_strings<T>(
             OwnerList::Properties => *payload_property_rows(census, channel) += 1,
         });
         let decoded = (|| {
-            let owner = blob16(row, 0, "owner_id")?;
+            let owner = integer(row, 0, "owner_id")?;
             Ok::<_, String>((owner, decode(row)?))
         })()
         .map_err(ResultReadError::Corrupt)?;
@@ -1486,9 +1509,9 @@ fn emit_batch<R>(
     first: usize,
     facts: &impl for<'r> Fn(&'r R) -> PayloadFacts<'r>,
     emit: &mut impl FnMut(usize, BlockDto),
-    mut block_facets: HashMap<[u8; 16], BlockFacets>,
-    mut tags: HashMap<[u8; 16], Vec<String>>,
-    mut properties: HashMap<[u8; 16], Vec<(String, String)>>,
+    mut block_facets: HashMap<i64, BlockFacets>,
+    mut tags: HashMap<i64, Vec<String>>,
+    mut properties: HashMap<i64, Vec<(String, String)>>,
 ) -> Result<(), String> {
     for (at, row) in batch.iter().enumerate() {
         let descriptor = facts(row);
@@ -1554,22 +1577,6 @@ pub(crate) fn placeholders(count: usize) -> String {
 // Every accessor names the COLUMN and the type it found and never the value:
 // a decode failure message travels into a receipt and a log, and a projection
 // row is user content.
-
-pub(crate) fn blob16(
-    row: &[PhysicalQueryValue],
-    at: usize,
-    what: &str,
-) -> Result<[u8; 16], String> {
-    match row.get(at) {
-        Some(PhysicalQueryValue::Blob(bytes)) if bytes.len() == 16 => {
-            Ok(bytes.as_slice().try_into().expect("a checked 16-byte id"))
-        }
-        Some(PhysicalQueryValue::Blob(bytes)) => {
-            Err(format!("{what} is {} bytes, expected 16", bytes.len()))
-        }
-        other => Err(format!("{what} is {}, expected a blob", spell(other))),
-    }
-}
 
 pub(crate) fn text(row: &[PhysicalQueryValue], at: usize, what: &str) -> Result<String, String> {
     match row.get(at) {

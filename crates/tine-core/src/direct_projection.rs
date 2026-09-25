@@ -2,26 +2,41 @@ use crate::config::ParseConfig;
 use crate::doc::{property_key_norm, DocBlock, Document};
 use crate::query::registry_cache::{CommittedRegistryCache, RegistryCapture};
 use crate::query::registry_sql::{self, PageRegistryMetadata};
+use crate::query::results::PageLiveIds;
 use crate::query::PropertyFacetAccumulator;
 use crate::query_cursor::drain_after;
 use crate::query_jobs::{
     OwnedAdmission, QueryJobOwner, DEFAULT_QUERY_JOB_CAPACITY, QUERY_JOB_WAIT,
 };
 use crate::vocab::{Format, PageEntry, PageKind, ReferenceKind};
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use fs2::FileExt as _;
-use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use tine_storage::sqlite::{
-    PhysicalAliasDeclaration, PhysicalBlock, PhysicalEntityId, PhysicalGraphProjectionChange,
-    PhysicalGraphProjectionDatabase, PhysicalGraphProjectionSourceRevision, PhysicalPage,
+    PhysicalAliasDeclaration, PhysicalBlock, PhysicalEntityCoordinate, PhysicalEntityId,
+    PhysicalGraphProjectionChange, PhysicalGraphProjectionDatabase,
+    PhysicalGraphProjectionSourceRevision, PhysicalName, PhysicalPage,
     PhysicalProjectionQuerySnapshot, PhysicalProperty, PhysicalQueryValue,
     PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalTask,
 };
-use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
+
+#[path = "direct_projection_lease.rs"]
+mod lease;
+#[path = "direct_projection_owner.rs"]
+mod owner;
+#[cfg(test)]
+pub(crate) use owner::index_failures_reported_for_test;
+use owner::ReportDamage;
+#[cfg(test)]
+pub(crate) use owner::INDEX_ATTEMPTS;
+use owner::{backing_off, image_is_current, note_unsettled};
+pub use owner::{set_index_failure_observer, IndexFailureEvent};
+pub(crate) use owner::{IndexFailure, IndexNeed, IndexOwnerRegistration, OwnerStep};
 
 type PageSnapshot = Arc<Vec<(PageEntry, Arc<Document>)>>;
 type PageRevisions = Arc<HashMap<PathBuf, String>>;
@@ -37,28 +52,60 @@ type SharedCommittedRegistry = Arc<Mutex<Option<CommittedRegistryOwner>>>;
 // Bump it whenever unchanged source bytes must be lowered into new/different
 // physical facts. The source-revision delta then rebuilds each page once even
 // when tine-storage's disposable SQLite schema itself remains compatible.
-const DIRECT_PROJECTION_FACTS_VERSION: u32 = 2;
+// v3: `pages.journal_day` is the page's own `date_key`, so a journal named by
+// `title::` has its day (GH #543, audit R13-06).
+// v4: `blocks.result_id` is the block's structural id, never a session's live
+// id, so a page stored by an earlier session resolves after a reopen (R3; GH
+// #594).
+// v5: the search fold keeps marks that make another letter (kana voicing,
+// virama, Indic vowel signs, Cyrillic й) and unstrokes ł ø đ ħ ŧ, so stored
+// search tokens and folded names change (decided by Martin 2026-09-24).
+const DIRECT_PROJECTION_FACTS_VERSION: u32 = 5;
 const REFERENCE_DELTA_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
-/// R6: how many streamed warm deltas may wait in the queue before the warm
-/// thread parses the next batch. It bounds what a cold or changed open retains
-/// beyond the worker's current turn to one batch of documents, instead of the
-/// whole parsed graph the full snapshot used to pin (plan §2D).
-pub(crate) const WARM_STREAM_HIGH_WATER: usize = 64;
-
 #[cfg(test)]
 // Test receipts count only their own graph, including its worker threads.
 static PHYSICAL_PAGE_LOWERINGS: Mutex<(Option<PathBuf>, u64)> = Mutex::new((None, 0));
-/// R6 test receipt: the most deltas a warm stream ever left queued, so a test
-/// can prove the stream never retained more than `WARM_STREAM_HIGH_WATER`.
-#[cfg(test)]
-static MAX_PENDING_DELTAS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
-static BEFORE_APPLY_PENDING: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+type BeforeApplyHook = (PathBuf, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+static BEFORE_APPLY_PENDING: Mutex<Option<BeforeApplyHook>> = Mutex::new(None);
+
+/// Count page lowerings under `root` from now on (model-level tests).
+#[cfg(test)]
+pub(crate) fn count_page_lowerings_test(root: &Path) {
+    *PHYSICAL_PAGE_LOWERINGS.lock().unwrap() = (Some(root.to_path_buf()), 0);
+}
 
 #[cfg(test)]
-fn run_before_apply_pending_hook() {
-    if let Some(hook) = BEFORE_APPLY_PENDING.lock().unwrap().take() {
+pub(crate) fn page_lowerings_test() -> u64 {
+    PHYSICAL_PAGE_LOWERINGS.lock().unwrap().1
+}
+
+/// Run `hook` once, just before the next turn applies, on the worker whose
+/// projection database path starts with `scope` (the database itself, or the
+/// graph root when the database lives under it). Scoped to one graph: tests
+/// run in parallel, and a hook another graph's worker took would hold that
+/// test's turn instead.
+#[cfg(test)]
+pub(crate) fn before_next_apply_test(scope: &Path, hook: Box<dyn FnOnce() + Send>) {
+    *BEFORE_APPLY_PENDING.lock().unwrap() = Some((scope.to_path_buf(), hook));
+}
+
+#[cfg(test)]
+fn run_before_apply_deltas_hook(database: &Path) {
+    let hook = {
+        let mut pending = BEFORE_APPLY_PENDING.lock().unwrap();
+        if pending
+            .as_ref()
+            .is_some_and(|(scope, _)| database.starts_with(scope))
+        {
+            pending.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, hook)) = hook {
         hook();
     }
 }
@@ -73,20 +120,10 @@ fn take_registry_read_attempts() -> u64 {
     REGISTRY_READ_ATTEMPTS.with(|count| count.replace(0))
 }
 
-/// One queued page change. **The graph config travels INSIDE the work item**
-/// (§5.8 M21, F11): every arm that lowers a page carries the exact
+/// One page change, as a mark carries it. **The graph config travels INSIDE the
+/// work item** (§5.8 M21, F11): every arm that lowers a page carries the exact
 /// [`ParseConfig`] it must be lowered under, so the worker cannot reach a state
 /// where queued work exists and the config that describes it does not.
-///
-/// The config used to sit beside the queue, and the worker read it as
-/// `parse_config.clone().unwrap_or_else(|| Arc::new(ParseConfig::default()))`.
-/// That fallback was unreachable — the stop check runs first and every enqueue
-/// path set the config in the same critical section that inserted the work —
-/// but if it had ever fired it would have lowered queued pages under the
-/// DEFAULT config and stamped the result as current: silently wrong rows,
-/// which is exactly what the stamp exists to prevent, reached from inside. A
-/// `debug_assert` would have hidden the release-mode behaviour behind a passing
-/// debug run, so the absence is removed by SHAPE — it can no longer be spelled.
 ///
 /// `Delete` deliberately carries no config: it lowers nothing and stamps no
 /// source revision, so a config on that arm would be a value with no reader.
@@ -97,31 +134,33 @@ enum PageDelta {
         document: Arc<Document>,
         revision: String,
         parse_config: Arc<ParseConfig>,
-        /// `None` while a warm stream is open (R6): the rows carry no order
-        /// position until the stream's closing order turn reconciles the
-        /// whole `query_page_order` table, because a position written mid-stream
-        /// could collide with a retained page's previous-session position.
-        query_page_order: Option<u64>,
-        identity: DeltaIdentity,
     },
     Delete {
         entry: PageEntry,
     },
 }
 
-/// R6 session identity rule (WARM-IDENTITY-ORDER-CONTRACT.md item 3): where a
-/// replacement's runtime ids came from decides whether the page joins or
-/// leaves `ProjectionShared::session_pages`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DeltaIdentity {
-    /// The document is this process's live one (a save, or a parsed-cache
-    /// snapshot that may carry preserved ids): the stored `result_id`s ARE the
-    /// public ids, so the page is added.
-    Live,
-    /// A fresh parse (the warm stream): the stored ids are structural, equal to
-    /// what `doc_runtime_id_for_order` derives, so the page is removed — an
-    /// external incompatible revision invalidates any live mapping it had.
-    Structural,
+/// One page the caller has added, rewritten or removed, as the model layer
+/// describes it. A mutation that changes the page SET — a rename, a merge, a
+/// file rescue — hands its whole change over as one of these lists; see
+/// [`DirectProjection::enqueue_page_set`].
+pub(crate) enum PageSetChange {
+    Replace {
+        entry: PageEntry,
+        document: Arc<Document>,
+        revision: String,
+    },
+    Delete {
+        entry: PageEntry,
+    },
+}
+
+impl PageSetChange {
+    pub(crate) fn entry(&self) -> &PageEntry {
+        match self {
+            PageSetChange::Replace { entry, .. } | PageSetChange::Delete { entry } => entry,
+        }
+    }
 }
 
 impl PageDelta {
@@ -130,57 +169,50 @@ impl PageDelta {
             PageDelta::Replace { entry, .. } | PageDelta::Delete { entry } => entry,
         }
     }
+
+    /// Whether this change leaves the page at `revision` under `digest`.
+    fn carries(&self, revision: &str, digest: &tine_storage::ContentDigest) -> bool {
+        match self {
+            PageDelta::Replace {
+                revision: sent,
+                parse_config,
+                ..
+            } => sent == revision && parse_config.digest() == *digest,
+            PageDelta::Delete { .. } => false,
+        }
+    }
 }
 
-/// A queued whole-graph snapshot and the config it must be lowered under. The
-/// config is stamped into every page's `projection_source_revision`, so a
-/// config edit re-lowers every page on the next snapshot instead of leaving
-/// rows that answer a question the config no longer asks (J7, D-1: rebuild,
-/// never migrate).
+/// A queued whole-graph snapshot for a fresh build, the generation it was
+/// captured at, and the config it must be lowered under. The config is stamped
+/// into every page's `projection_source_revision`, so a config edit re-lowers
+/// every page (J7, D-1: rebuild, never migrate).
 struct PendingFull {
     pages: PageSnapshot,
     revisions: PageRevisions,
     parse_config: Arc<ParseConfig>,
+    /// Sources that exist but could not be read, listed or parsed for this
+    /// snapshot, as graph-relative paths: a page, or a directory whose pages
+    /// all count as unread (`""` is the whole graph). A fresh build over a
+    /// healthy image carries their stored rows (see `carried`).
+    retained: Vec<String>,
 }
 
-/// R6 warm validation: the walk inventory with each page's exact content
-/// revision, and nothing parsed. The worker compares it with
-/// `direct_source_revisions`; an unchanged graph publishes readiness from this
-/// alone, a changed one names the pages the warm thread must parse.
-struct PendingWarm {
-    sources: Vec<(PageEntry, String)>,
-    parse_config: Arc<ParseConfig>,
-}
+/// Above this share of the pages, a stale image found by the launch survey is
+/// rebuilt from a complete parsed snapshot instead of repaired page by page:
+/// it parses the same pages, writes a fresh file rather than rewriting most of
+/// the old one in place, stops between batches and shows progress (GH #543,
+/// audit R10-02). Read only by [`repair_is_proportionate`].
+const REPAIR_MAX_SHARE_DIVISOR: usize = 4;
 
-/// What the worker's warm-validation turn decided (R6), read by the warm
-/// thread through `wait_warm_outcome`.
-#[derive(Clone, Debug)]
-pub(crate) enum WarmOutcome {
-    /// Every walk page's rows are current: readiness publishes without a parse.
-    Clean,
-    /// These pages' rows are missing or stale; the warm thread streams them.
-    Replacements(Vec<PageEntry>),
-    /// A full parsed snapshot arrived first and owns readiness.
-    Superseded,
-    /// The validation turn failed; the parser fallback owns readiness.
-    Failed,
-}
-
-/// One page of the R6 warm stream, as the warm thread hands it over.
-pub(crate) enum WarmStreamItem {
-    Replace {
-        entry: PageEntry,
-        document: Arc<Document>,
-        revision: String,
-        identity: DeltaIdentity,
-    },
-    Delete {
-        entry: PageEntry,
-    },
+/// Whether an image that differs from its source by `changed` of `total`
+/// pages is repaired in place rather than built fresh.
+pub(crate) fn repair_is_proportionate(changed: usize, total: usize) -> bool {
+    changed * REPAIR_MAX_SHARE_DIVISOR <= total
 }
 
 enum QueryCaptureRequirement {
-    CurrentSnapshot,
+    CurrentSnapshot(Currency),
     #[cfg(test)]
     StrictGeneration(u64),
 }
@@ -210,99 +242,147 @@ fn reject_query_captures(captures: Vec<PendingQueryCapture>) {
     }
 }
 
+/// A page change on its way to the image, stamped with the cache generation
+/// at which its truth was observed: the generation its producer moved to, or
+/// the one the launch survey loaded before it read the page.
+type Mark = (u64, PageDelta);
+
+/// The index update protocol's whole state (GH #543, the reconciler; design:
+/// `specs/notes/2026-09-23-index-reconciler-design.md`).
+///
+/// **One invariant: every page change reaches the image as a [`Mark`], the
+/// queue keeps only the newest mark per page, and no mark older than what the
+/// image already holds for that page is applied.** Nothing else crosses time:
+/// no verdict computed at one moment is applied later on the strength of that
+/// moment. A save racing the launch survey, a deletion confirmed before a
+/// re-creation, a failed turn returning its work -- each is one mark against
+/// another, and the newer wins wherever they meet (see [`Self::record_mark`]).
 #[derive(Default)]
 struct PendingProjection {
     // Each capture owns one slot from the shared two-job cap.
     captures: Vec<PendingQueryCapture>,
+    /// A fresh build's snapshot, queued.
     full: Option<PendingFull>,
+    /// A fresh image is owed: there is none, it is damaged (K1), or the launch
+    /// survey found too much of it stale. Only a fresh build clears it. While
+    /// it holds, marks wait: the snapshot that clears it contains them.
     rebuild: bool,
-    deltas: BTreeMap<String, (u64, PageDelta)>,
+    /// Per page, the newest change not yet taken by the worker.
+    marks: BTreeMap<String, Mark>,
+    /// The marks the running worker turn took and has not committed.
+    in_flight: BTreeMap<String, Mark>,
+    /// Per page, the generation of the newest mark committed this session.
+    applied: HashMap<String, u64>,
+    /// The survey validated the image under this configuration: the next turn
+    /// reads the committed property registry from it. Queries capture from
+    /// that registry, so readiness waits for it.
+    registry_owed: Option<Arc<ParseConfig>>,
+    /// Every page the image holds is at least this new: the generation of the
+    /// last fresh snapshot accepted.
+    floor: u64,
     latest_generation: u64,
     stop: bool,
-    page_order: BTreeMap<String, u64>,
-    next_page_order: u64,
-    /// R6 warm validation queued for the worker.
-    warm: Option<PendingWarm>,
-    /// R6: the worker's verdict on the last warm validation.
-    warm_outcome: Option<WarmOutcome>,
-    /// R6: a warm stream is open at this generation. Readiness never publishes
-    /// while it is `Some`, and deltas recorded meanwhile carry no order
-    /// position (see `PageDelta::Replace::query_page_order`).
-    warm_stream: Option<u64>,
-    /// R6: the stream's closing turn — reconcile `query_page_order` over the
-    /// queue's own inventory and then publish readiness.
-    order: Option<u64>,
-    /// R6: a full snapshot was queued after the warm; the stream must stop
-    /// enqueueing (its deltas would drop the snapshot's order rows).
-    warm_superseded: bool,
-    /// R6: an abandoned stream left stale rows behind; only a full snapshot may
-    /// publish readiness again (the worker turns this into
-    /// `requires_full_rebuild`).
-    needs_full: bool,
+    /// The worker has opened (or found no) stored image. Until then nobody,
+    /// the worker included, knows what the image needs.
+    set_up: bool,
+    /// The stored image was written under the current facts version and parse
+    /// configuration, so it may be served before the launch check validates it
+    /// ([`owner::serving_stored`]). Decided once, when the worker sets up.
+    stored_servable: bool,
+    /// The background integrity check ([`integrity`]) holds a read connection
+    /// on the image. A drain waits for it to let go.
+    integrity_running: bool,
+    /// The background WAL checkpoint ([`checkpoint`]) holds a connection on
+    /// the image. A drain waits for it to let go.
+    checkpoint_running: bool,
+    /// The worker is running a fresh build. Queries do not capture from an
+    /// image being replaced.
+    building: bool,
+    /// The page revisions (by graph-relative path) and parse configuration
+    /// of the newest full snapshot queued or being built: what the fresh
+    /// image will hold, so "does the index have these bytes" is answered
+    /// from it while the old image is going away.
+    snapshot: Option<(Arc<HashMap<String, String>>, tine_storage::ContentDigest)>,
+    /// Index owners registered for this graph: the app's owner loop, or an
+    /// inline warm while it runs. While one is, whole-graph index work is
+    /// that owner's to start and nobody else's (GH #543).
+    owners: usize,
+    /// Whole-graph passes and worker turns that ended without making the
+    /// index ready, since it last was. Reset where readiness is published.
+    unsettled_passes: u32,
+    /// No owner pass, and no retry of marks a failed turn returned, starts
+    /// before this instant; see [`note_unsettled`].
+    retry_after: Option<std::time::Instant>,
+    /// The worker is waiting for another writer to release the database's
+    /// writer lease; see [`lease::take_writer_lease`].
+    lease_wait: bool,
+    /// The index stopped trying for this session after [`owner::INDEX_ATTEMPTS`]
+    /// consecutive failures, and why (GH #594, liveness L1). Cleared only by
+    /// the user's retry.
+    failed: Option<crate::query::IndexFailureClass>,
+    /// Why the last unsettled pass or turn did not make the index ready.
+    last_failure: Option<crate::query::IndexFailureClass>,
 }
 
 impl PendingProjection {
-    fn record_delta(&mut self, generation: u64, mut delta: PageDelta) {
-        let key = delta.entry().rel_path.clone();
-        match &mut delta {
-            PageDelta::Replace {
-                query_page_order, ..
-            } => {
-                let position = if let Some(position) = self.page_order.get(&key) {
-                    *position
-                } else {
-                    let position = self.next_page_order;
-                    self.next_page_order += 1;
-                    self.page_order.insert(key.clone(), position);
-                    position
-                };
-                *query_page_order = self.warm_stream.is_none().then_some(position);
-            }
-            PageDelta::Delete { .. } => {
-                self.page_order.remove(&key);
-            }
-        }
-        self.deltas.insert(key, (generation, delta));
+    /// The generation of the newest truth about `rel` the image holds or is
+    /// being given by the running turn.
+    fn held(&self, rel: &str) -> u64 {
+        let applied = self.applied.get(rel).copied().unwrap_or(0);
+        let in_flight = self
+            .in_flight
+            .get(rel)
+            .map_or(0, |(generation, _)| *generation);
+        self.floor.max(applied).max(in_flight)
+    }
+
+    /// The one entry of every page change into the queue. A mark older than
+    /// what the image holds (or is being given) for its page, or than the mark
+    /// already queued for it, is dropped: it describes a state the page has
+    /// already left. Returns whether the mark was kept.
+    fn record_mark(&mut self, generation: u64, delta: PageDelta) -> bool {
         self.latest_generation = self.latest_generation.max(generation);
-    }
-
-    /// Seed the queue's page order from a complete inventory (a full snapshot
-    /// or a warm walk), replacing whatever a cache-less session appended.
-    fn seed_page_order<'a>(&mut self, inventory: impl ExactSizeIterator<Item = &'a str>) {
-        let mut inventory = inventory.collect::<Vec<_>>();
-        if self.rebuild {
-            // Repair preserves the session's retained/append order. Stable
-            // sorting leaves newly discovered paths in their inventory order,
-            // after existing pages. Re-number both owners together below.
-            inventory.sort_by_key(|path| self.page_order.get(*path).copied().unwrap_or(u64::MAX));
+        let key = delta.entry().rel_path.clone();
+        if generation < self.held(&key)
+            || self
+                .marks
+                .get(&key)
+                .is_some_and(|(queued, _)| *queued > generation)
+        {
+            projection_diag(|| format!("mark dropped: generation={generation} is older"));
+            return false;
         }
-        self.next_page_order = inventory.len() as u64;
-        self.page_order = inventory
-            .into_iter()
-            .enumerate()
-            .map(|(position, rel_path)| (rel_path.to_owned(), position as u64))
-            .collect();
+        self.marks.insert(key, (generation, delta));
+        true
     }
 
-    /// The queue's own page inventory in position order: the R6 order turn's
-    /// authority. After a warm seed the map tracks every applied replacement
-    /// and deletion, so it names exactly the pages the projection holds.
-    fn ordered_inventory(&self) -> Vec<[u8; 16]> {
-        let mut ordered = self
-            .page_order
-            .iter()
-            .map(|(rel_path, position)| (*position, page_id(rel_path)))
-            .collect::<Vec<_>>();
-        ordered.sort_unstable_by_key(|(position, _)| *position);
-        ordered.into_iter().map(|(_, id)| id).collect()
+    /// The change queued or in flight for `rel`, newest first.
+    fn queued(&self, rel: &str) -> Option<&PageDelta> {
+        self.marks
+            .get(rel)
+            .or_else(|| self.in_flight.get(rel))
+            .map(|(_, delta)| delta)
     }
 
+    /// Work that stands between the image and readiness.
     fn has_work(&self) -> bool {
         self.full.is_some()
-            || !self.deltas.is_empty()
-            || self.warm.is_some()
-            || self.order.is_some()
-            || self.needs_full
+            || !self.marks.is_empty()
+            || !self.in_flight.is_empty()
+            || self.registry_owed.is_some()
+    }
+
+    /// Whether the worker has a turn to take: a fresh snapshot, or marks for
+    /// an image it keeps (none while a rebuild is owed, and none inside the
+    /// backoff after a failed turn returned them).
+    fn worker_can_take(&self) -> bool {
+        // A failed index takes nothing until the user retries (GH #594 L1):
+        // what is queued meanwhile waits for that.
+        self.failed.is_none()
+            && (self.full.is_some()
+                || ((!self.marks.is_empty() || self.registry_owed.is_some())
+                    && !self.rebuild
+                    && !backing_off(self)))
     }
 }
 
@@ -316,26 +396,44 @@ struct ProjectionShared {
     commit_notification: AtomicU64,
     commit_waker: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     reader: Mutex<Option<PhysicalGraphProjectionDatabase>>,
+    /// The ready generation at which a failed read last found the stored
+    /// image intact, so a statement SQLite refuses is checked once, not on
+    /// every retry (audit R10-01).
+    image_verified_intact_at: Mutex<Option<u64>>,
+    /// Rows contradicting each other have already cost this projection one
+    /// fresh build; see [`owner::failure_owes_new_image`].
+    contradiction_rebuilt: AtomicBool,
+    /// Worker-owned: the running turn builds a fresh image, from the moment
+    /// it decides to until its outcome is recorded. The one answer to "does a
+    /// fresh build own the image's replacement?"; the progress counter also
+    /// counts update and repair turns, and stops before the build publishes
+    /// (GH #543, audit R12-01).
+    fresh_build_running: AtomicBool,
     /// R3: the ONE admission/cancellation owner for database-owned query jobs
     /// (plan §2B). Capacity is taken before a snapshot is opened; the worker
     /// drains every job before it replaces or resets the file, and `Drop`
     /// drains before the worker is stopped.
     query_jobs: Arc<QueryJobOwner>,
-    /// R3 identity policy (WARM-IDENTITY-ORDER-CONTRACT.md §"Chosen strategy"
-    /// 2–3): the pages whose rows THIS process lowered. Their stored
-    /// `query_block_results.result_id` is the live runtime id the parsed
-    /// document carried when the row was written. Every other page's rows
-    /// survived from an earlier session, and a fresh parse of an unchanged
-    /// page assigns STRUCTURAL runtime ids, so their public id is derived from
-    /// `(path, order_key)` through `model::doc_runtime_id_for_order` instead.
-    /// Copy-on-write: the worker swaps a new `Arc` after each successful
-    /// apply, and a job clones the `Arc` at snapshot acquisition — never a
-    /// live lookup during output.
-    session_pages: Mutex<Arc<HashSet<[u8; 16]>>>,
+    /// R3 identity (`docs/contracts/direct-query-identities.md`): the index
+    /// stores every block's STRUCTURAL id; these are the live ids this
+    /// session's documents carried where they differ, per page and stored
+    /// source revision, newest first and at most [`LIVE_ID_REVISIONS`] of
+    /// them. Recorded before the rows commit, so a snapshot of either the new
+    /// image or the one before it finds the revision its rows were written
+    /// at. Copy-on-write: a job clones the `Arc` beside its snapshot
+    /// ([`capture_result_identity`]) and never reads it live during output.
+    session_ids: Mutex<Arc<SessionLiveIds>>,
     committed_registry: SharedCommittedRegistry,
     worker_available: AtomicBool,
     worker_failed: AtomicBool,
     worker_busy: AtomicBool,
+    /// True while the worker is EXECUTING a turn that carries a build — a
+    /// fresh snapshot build. The
+    /// queue empties the moment the worker takes that payload, so testing the
+    /// queue alone reported `None` (idle) for the whole SQL transaction, and a
+    /// surface that reruns on the completion edge announced a build finished
+    /// in its most loaded moment (GH #543, re-audit A2-F1). `worker_busy` on
+    /// its own is too broad: an ordinary one-page save turn is not a build.
     /// The writer worker has RETURNED, and every resource it owned — the
     /// SQLite writer connection and the exclusive writer lease — is closed.
     ///
@@ -349,15 +447,42 @@ struct ProjectionShared {
     /// lease. None closes registration once worker teardown starts.
     worker_resources: Mutex<Option<Vec<Arc<dyn Send + Sync>>>>,
     /// R6: this session has validated the complete page inventory against
-    /// the projection at least once (a full snapshot, or a warm validation's
-    /// `Clean` or closing order turn). Until then a live delta keeps the file
+    /// the projection at least once (a fresh snapshot, or the launch
+    /// survey's `validated`). Until then a live delta keeps the file
     /// converging but must not publish readiness: rows of pages this session
     /// has never compared to disk could be stale from an earlier session.
     /// In-scope scenario: an external edit between two sessions, followed by
-    /// a save of some other page before the warm runs.
+    /// a save of some other page before the survey runs.
     validated: AtomicBool,
+    /// Interrupts the running background integrity check ([`integrity`]).
+    integrity_check: Mutex<Option<tine_storage::sqlite::PhysicalProjectionQueryCancellation>>,
     #[cfg(test)]
     after_sql_commit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    /// Fires after the next batch of any lowering loop, not only a fresh build's.
+    after_lowering_batch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    before_fresh_publication: Mutex<Option<Box<dyn FnOnce() -> Result<(), String> + Send>>>,
+    /// Fails every fresh build just before it publishes, while set.
+    #[cfg(test)]
+    fresh_publication_failure: Mutex<Option<String>>,
+    /// From-scratch builds this index has started.
+    #[cfg(test)]
+    fresh_builds: AtomicU64,
+    #[cfg(test)]
+    after_fresh_publication: Mutex<Option<Box<dyn FnOnce() -> Result<(), String> + Send>>>,
+    #[cfg(test)]
+    before_shared_reader_admission: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    after_shared_reader_admission: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    before_shared_reader_drain_lock: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    after_shared_reader_drain_lock: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    serving_writer_cache_budget: AtomicU64,
+    #[cfg(test)]
+    projection_health_checks: AtomicU64,
     #[cfg(test)]
     capture_thread: Mutex<Option<std::sync::mpsc::Sender<std::thread::ThreadId>>>,
     #[cfg(test)]
@@ -377,6 +502,14 @@ struct ProjectionShared {
     /// `Unavailable(ReadFailed)` on a projection that is being repaired
     /// perfectly well by the thread beside it.
     repairs_in_flight: AtomicUsize,
+    /// Generation moves whose delta is on its way: the mover has moved the
+    /// generation and not yet queued the delta that describes it. A reader
+    /// landing in that window found the index behind with nothing queued and
+    /// parsed the whole graph (GH #543); it now waits, as for a queued edit.
+    deltas_coming: AtomicUsize,
+    /// Pages written by the running fresh build, for the indexing progress
+    /// bar only (GH #543).
+    build_progress: crate::indexing_progress::ProgressCounter,
     /// §5.9's failed-read injection: one read through the seam fails, exactly as
     /// a torn or truncated projection file, a disk error or a resource limit
     /// makes it fail. It exists because the obligation a failed read carries —
@@ -385,12 +518,38 @@ struct ProjectionShared {
     /// future arm silently drops (M9).
     #[cfg(test)]
     inject_read_failure: AtomicBool,
+    /// The next failed-read health check finds the image damaged. An injected
+    /// read failure stands for a damaged image, which is what it was written
+    /// to exercise; a statement refused on an intact image is a real query.
+    #[cfg(test)]
+    inject_image_damage: AtomicBool,
+    /// The next background integrity check finds the image damaged.
+    #[cfg(test)]
+    inject_integrity_damage: AtomicBool,
+    /// Background integrity checks started ([`integrity`]).
+    #[cfg(test)]
+    integrity_checks_started: AtomicU64,
+    /// Hold the next background integrity check before it opens the image.
+    #[cfg(test)]
+    integrity_check_pause: Mutex<Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>>,
+    /// Fail the worker's next this-many turns, as a disk error or a SQLite
+    /// fault would.
+    #[cfg(test)]
+    inject_turn_failure: std::sync::atomic::AtomicU32,
+    /// The worker's last turn failed. A failure on an intact image leaves
+    /// nothing else behind to observe it by.
+    #[cfg(test)]
+    last_turn_failed: AtomicBool,
+    /// The worker found the writer lease held at least once.
+    #[cfg(test)]
+    pub(super) lease_contended: AtomicBool,
     #[cfg(test)]
     fallback_reads: AtomicU64,
     #[cfg(test)]
     referenced_name_reads: AtomicU64,
+    /// Background checkpoint passes run, retries included.
     #[cfg(test)]
-    fuzzy_candidate_reads: AtomicU64,
+    pub(super) checkpoint_passes: AtomicU64,
 }
 
 impl ProjectionShared {
@@ -414,49 +573,161 @@ impl ProjectionShared {
         };
         reject_query_captures(captures);
         self.changed.notify_all();
+        integrity::cancel_and_wait(self);
+        if !close {
+            // A close replaces nothing: the checkpoint may finish on its own.
+            checkpoint::wait(self);
+        }
         fence
     }
 
-    /// R3 identity policy bookkeeping, run by the worker after every
-    /// successful apply: the pages just lowered carry this process's live ids;
-    /// the pages just deleted carry nothing.
-    fn record_session_pages(&self, applied: &AppliedPages) {
-        if applied.lowered.is_empty()
-            && applied.deleted.is_empty()
-            && applied.relowered_structurally.is_empty()
+    /// R3: record the live-id exceptions of pages about to be written, BEFORE
+    /// their rows commit. A page that never had an exception and has none now
+    /// needs no entry: its public ids are its stored structural ids.
+    pub(super) fn record_live_ids(&self, pages: Vec<(String, String, HashMap<String, String>)>) {
+        let mut current = self.session_ids.lock().unwrap();
+        let mut next: Option<SessionLiveIds> = None;
+        for (path, revision, ids) in pages {
+            let known = next.as_ref().unwrap_or(&current).contains_key(&path);
+            if ids.is_empty() && !known {
+                continue;
+            }
+            let entries = next
+                .get_or_insert_with(|| (**current).clone())
+                .entry(path)
+                .or_default();
+            entries.retain(|entry| entry.revision != revision);
+            entries.insert(0, Arc::new(PageLiveIds { revision, ids }));
+            entries.truncate(LIVE_ID_REVISIONS);
+        }
+        if let Some(next) = next {
+            *current = Arc::new(next);
+        }
+    }
+
+    /// R3 bookkeeping after an apply commits: a deleted page's rows are gone,
+    /// and so are its exceptions.
+    fn record_deleted_pages(&self, applied: &AppliedPages) {
+        let mut current = self.session_ids.lock().unwrap();
+        if !applied
+            .deleted
+            .iter()
+            .any(|page| current.contains_key(page))
         {
             return;
         }
-        let mut current = self.session_pages.lock().unwrap();
-        let mut next: HashSet<[u8; 16]> = (**current).clone();
-        next.extend(applied.lowered.iter().copied());
-        for page in applied
-            .deleted
-            .iter()
-            .chain(applied.relowered_structurally.iter())
-        {
+        let mut next = (**current).clone();
+        for page in &applied.deleted {
             next.remove(page);
         }
         *current = Arc::new(next);
     }
 }
 
-/// Completeness gate shared by admission and producer snapshot capture.
-/// Live queries may read an older committed image, but a partial warm stream,
-/// replacement or failed write must not be mistaken for a complete graph.
+/// How many stored revisions of one page keep their live-id exceptions: the
+/// image being written and the one before it, which a snapshot opened just
+/// before the commit still reads.
+const LIVE_ID_REVISIONS: usize = 2;
+
+/// Per page path, the live-id exceptions of its latest lowerings, newest
+/// first (R3; see `ProjectionShared::session_ids`).
+pub(crate) type SessionLiveIds = HashMap<String, Vec<Arc<PageLiveIds>>>;
+
+/// The public-identity decoder of one snapshot (R3): the recorded exceptions
+/// whose revision is the one this snapshot stores for their page. A snapshot
+/// of an image recorded exceptions do not describe decodes structurally, and
+/// never names one block by another's live id.
+fn capture_result_identity(
+    shared: &ProjectionShared,
+    snapshot: &mut PhysicalProjectionQuerySnapshot,
+) -> Result<crate::query::results::ResultIdentity, tine_storage::sqlite::MaterializationError> {
+    let recorded = Arc::clone(&shared.session_ids.lock().unwrap());
+    let mut live = HashMap::new();
+    for (path, entries) in recorded.iter() {
+        let mut stored = None;
+        crate::query::projection_sql::visit(
+            snapshot,
+            "SELECT revision FROM direct_source_revisions WHERE path = ?",
+            &[PhysicalQueryValue::Text(path.clone())],
+            |row| {
+                if let Some(PhysicalQueryValue::Text(revision)) = row.first() {
+                    stored = Some(revision.clone());
+                }
+                Ok(std::ops::ControlFlow::Break(()))
+            },
+        )?;
+        if let Some(entry) = stored
+            .and_then(|stored| entries.iter().find(|entry| entry.revision == stored))
+            .filter(|entry| !entry.ids.is_empty())
+        {
+            live.insert(path.clone(), Arc::clone(entry));
+        }
+    }
+    Ok(crate::query::results::ResultIdentity {
+        live: Arc::new(live),
+        all_session: false,
+    })
+}
+
+/// How current an index answer must be (launch design D3). Chosen at the
+/// command boundary: a read inside `Graph::display_read` is only displayed and
+/// may be `LaunchStored`; every other read acts on its answer and is `Current`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Currency {
+    /// Ready at the reader's exact generation.
+    Current,
+    /// `Current`, or the stored image the last session left while the launch
+    /// check has not yet validated it ([`owner::serving_stored`]). Wrong at
+    /// worst until the check corrects it, which the display then re-asks.
+    LaunchStored,
+}
+
+/// The generation a Gate R read is asked at, and how current its answer
+/// must be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReadAt {
+    pub(crate) generation: u64,
+    pub(crate) currency: Currency,
+}
+
+impl ReadAt {
+    #[cfg(test)]
+    pub(crate) fn current(generation: u64) -> Self {
+        Self {
+            generation,
+            currency: Currency::Current,
+        }
+    }
+}
+
+/// Admission gate shared by admission and producer snapshot capture.
+///
+/// Live queries may read an older complete committed image while ordinary
+/// page edits are queued. They may not read while a replacement image is being
+/// built/published. Before the launch check validates the image, they read it
+/// only while it is served as stored ([`owner::serving_stored`]): every query
+/// is displayed, and the display re-asks when the check lands (design D2).
+fn query_capture_admissible(
+    shared: &ProjectionShared,
+    pending: &PendingProjection,
+    currency: Currency,
+) -> bool {
+    !pending.stop
+        && !pending.rebuild
+        && !shared.worker_failed.load(Ordering::Acquire)
+        && !pending.building
+        && (shared.validated.load(Ordering::Acquire)
+            || (currency == Currency::LaunchStored && owner::serving_stored(shared, pending)))
+}
+
 fn query_capture_available(
     shared: &ProjectionShared,
     requirement: &QueryCaptureRequirement,
 ) -> bool {
     match requirement {
-        QueryCaptureRequirement::CurrentSnapshot => {
+        QueryCaptureRequirement::CurrentSnapshot(currency) => {
             let pending = shared.pending.lock().unwrap();
-            !pending.stop
-                && !pending.rebuild
-                && !pending.needs_full
-                && pending.warm_stream.is_none()
-                && shared.validated.load(Ordering::Acquire)
-                && !shared.worker_failed.load(Ordering::Acquire)
+            query_capture_admissible(shared, &pending, *currency)
         }
         #[cfg(test)]
         QueryCaptureRequirement::StrictGeneration(generation) => shared.ready_at(*generation),
@@ -470,8 +741,11 @@ fn capture_query_job(
     slot: crate::query_jobs::OwnedJobSlot,
 ) -> QueryJobOpen {
     #[cfg(test)]
-    if let Some(observed) = shared.capture_thread.lock().unwrap().take() {
-        observed.send(std::thread::current().id()).unwrap();
+    {
+        let observed = shared.capture_thread.lock().unwrap().take();
+        if let Some(observed) = observed {
+            observed.send(std::thread::current().id()).unwrap();
+        }
     }
     if slot.is_cancelled() {
         return QueryJobOpen::Cancelled;
@@ -496,7 +770,9 @@ fn capture_query_job(
     if !slot.register(snapshot.cancellation()) {
         return QueryJobOpen::Cancelled;
     }
-    let session_pages = Arc::clone(&shared.session_pages.lock().unwrap());
+    let Ok(identity) = capture_result_identity(shared, &mut snapshot) else {
+        return QueryJobOpen::Failed;
+    };
     let query_revision = match snapshot.query_revision() {
         Ok(revision) => revision,
         Err(_) => return QueryJobOpen::Failed,
@@ -534,7 +810,7 @@ fn capture_query_job(
     QueryJobOpen::Job(DirectQueryJob {
         _slot: slot,
         snapshot,
-        session_pages,
+        identity,
         config,
         #[cfg(test)]
         query_revision,
@@ -553,9 +829,9 @@ pub(crate) struct DirectQueryJob {
     pub(crate) snapshot: PhysicalProjectionQuerySnapshot,
     /// Held for its `Drop`: releasing the slot is the job's only exit.
     _slot: crate::query_jobs::OwnedJobSlot,
-    /// The pages whose rows this process lowered (see
-    /// `ProjectionShared::session_pages`), as of the snapshot.
-    pub(crate) session_pages: Arc<HashSet<[u8; 16]>>,
+    /// The public-identity decoder of this snapshot's rows (R3,
+    /// [`capture_result_identity`]).
+    pub(crate) identity: crate::query::results::ResultIdentity,
     pub(crate) config: Arc<ParseConfig>,
     /// Actual acquired SQL image, distinct from the admission target.
     #[cfg(test)]
@@ -579,7 +855,7 @@ impl DirectQueryJob {
             .iter()
             .map(|(entry, revision)| {
                 (
-                    page_id(&entry.rel_path),
+                    entry.rel_path.clone(),
                     projection_source_revision(revision, config_digest),
                 )
             })
@@ -593,24 +869,22 @@ impl DirectQueryJob {
         let mut at = 0;
         let mut matches = true;
         let mut malformed = false;
-        let read = self.snapshot.visit_projection_query(
-            "SELECT p.page_id, s.revision FROM pages p \
-             LEFT JOIN direct_source_revisions s ON s.page_id = p.page_id \
-             ORDER BY p.page_id",
+        let read = crate::query::projection_sql::visit(
+            &mut self.snapshot,
+            "SELECT p.path, s.revision FROM pages p \
+             LEFT JOIN direct_source_revisions s ON s.path = p.path \
+             ORDER BY p.path",
             &[],
             |row| {
-                let [PhysicalQueryValue::Blob(id), PhysicalQueryValue::Text(revision)] = row else {
+                let [PhysicalQueryValue::Text(path), PhysicalQueryValue::Text(revision)] = row
+                else {
                     malformed = true;
                     return Ok(std::ops::ControlFlow::Break(()));
                 };
-                if id.len() != 16 {
-                    malformed = true;
-                    return Ok(std::ops::ControlFlow::Break(()));
-                }
                 if !expected
                     .get(at)
-                    .is_some_and(|(wanted_id, wanted_revision)| {
-                        wanted_id.as_slice() == id.as_slice() && wanted_revision == revision
+                    .is_some_and(|(wanted_path, wanted_revision)| {
+                        wanted_path == path && wanted_revision == revision
                     })
                 {
                     matches = false;
@@ -695,6 +969,7 @@ pub(crate) enum QueryJobOpen {
 /// and translates them into the three answers the public boundary can act on.
 /// It adds no state of its own, because a second opinion about whether the
 /// worker is making progress is exactly the twin D-14 forbids.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ProjectionProgress {
     /// Ready at this generation by the time the question was asked: the two
     /// reads straddled a save. Retryable.
@@ -709,6 +984,9 @@ pub(crate) enum ProjectionProgress {
     /// returned. No repair this graph can schedule will be picked up, so a
     /// retry loop here would never end.
     Stopped,
+    /// The index could not be built or updated and has stopped trying this
+    /// session (GH #594, liveness L1). Terminal until the user retries.
+    Failed(crate::query::IndexFailureClass),
 }
 
 /// Whether the projection can narrow THIS reference target at all.
@@ -735,7 +1013,44 @@ pub(crate) fn reference_narrowing_supported(names_norm: &[String], kind: Referen
 /// existed, so a partial index can never silently drop a row.
 pub(crate) struct ReferenceCandidateIndex {
     pub paths: std::collections::BTreeSet<PathBuf>,
-    pub blocks: Option<std::collections::HashSet<[u8; 16]>>,
+    pub blocks: Option<std::collections::HashSet<String>>,
+    /// Page entities admitted by an Interactive verified window. `None` keeps
+    /// the established Exhaustive/explicit/fallback behavior: every loaded
+    /// candidate page may contribute its property preamble. A containing path
+    /// admitted only by one of its blocks is deliberately absent from `Some`.
+    pub page_owners: Option<std::collections::HashSet<PathBuf>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PLAIN_REFERENCE_EXACT_CALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PLAIN_REFERENCE_QUERY_PLANS: std::cell::RefCell<Vec<Vec<String>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_plain_reference_query_instrumentation() {
+    PLAIN_REFERENCE_EXACT_CALLBACKS.with(|count| count.set(0));
+    PLAIN_REFERENCE_QUERY_PLANS.with(|plans| plans.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub(crate) fn plain_reference_query_instrumentation() -> (usize, Vec<Vec<String>>) {
+    let callbacks = PLAIN_REFERENCE_EXACT_CALLBACKS.with(std::cell::Cell::get);
+    let plans = PLAIN_REFERENCE_QUERY_PLANS.with(|plans| plans.borrow().clone());
+    (callbacks, plans)
+}
+
+#[cfg(test)]
+fn capture_plain_reference_query_plan(
+    path: &Path,
+    sql: &str,
+    params: &[PhysicalQueryValue],
+) -> Option<()> {
+    let plan_reader = tine_storage::sqlite::PhysicalProjectionQueryReader::open(path).ok()?;
+    plan_reader.set_query_rank_function(|_, _| Ok(None)).ok()?;
+    let plan = plan_reader.explain_query_plan(sql, params).ok()?;
+    PLAIN_REFERENCE_QUERY_PLANS.with(|plans| plans.borrow_mut().push(plan));
+    Some(())
 }
 
 /// Direct Files' disposable parser-fact projection.
@@ -757,7 +1072,15 @@ impl DirectProjection {
         self.shared.commit_notification.load(Ordering::Acquire)
     }
 
-    pub(crate) fn start(path: PathBuf) -> std::io::Result<Self> {
+    /// Start the projection of the graph whose index lives at `path`.
+    /// `launch_config` is the parse configuration the graph opens with: a
+    /// stored image written under it (and under this facts version) is served
+    /// to display reads while the launch check runs (design D2). `None`
+    /// serves nothing before the check.
+    pub(crate) fn start(
+        path: PathBuf,
+        launch_config: Option<Arc<ParseConfig>>,
+    ) -> std::io::Result<Self> {
         let shared = Arc::new(ProjectionShared {
             path,
             pending: Mutex::new(PendingProjection::default()),
@@ -767,8 +1090,11 @@ impl DirectProjection {
             commit_notification: AtomicU64::new(0),
             commit_waker: Mutex::new(None),
             reader: Mutex::new(None),
+            image_verified_intact_at: Mutex::new(None),
+            contradiction_rebuilt: AtomicBool::new(false),
+            fresh_build_running: AtomicBool::new(false),
             query_jobs: Arc::new(QueryJobOwner::new(DEFAULT_QUERY_JOB_CAPACITY)),
-            session_pages: Mutex::new(Arc::new(HashSet::new())),
+            session_ids: Mutex::new(Arc::default()),
             committed_registry: Arc::new(Mutex::new(None)),
             worker_available: AtomicBool::new(true),
             worker_failed: AtomicBool::new(false),
@@ -776,8 +1102,31 @@ impl DirectProjection {
             worker_finished: AtomicBool::new(false),
             worker_resources: Mutex::new(Some(Vec::new())),
             validated: AtomicBool::new(false),
+            integrity_check: Mutex::new(None),
             #[cfg(test)]
             after_sql_commit: Mutex::new(None),
+            #[cfg(test)]
+            after_lowering_batch: Mutex::new(None),
+            #[cfg(test)]
+            before_fresh_publication: Mutex::new(None),
+            #[cfg(test)]
+            fresh_publication_failure: Mutex::new(None),
+            #[cfg(test)]
+            fresh_builds: AtomicU64::new(0),
+            #[cfg(test)]
+            after_fresh_publication: Mutex::new(None),
+            #[cfg(test)]
+            before_shared_reader_admission: Mutex::new(None),
+            #[cfg(test)]
+            after_shared_reader_admission: Mutex::new(None),
+            #[cfg(test)]
+            before_shared_reader_drain_lock: Mutex::new(None),
+            #[cfg(test)]
+            after_shared_reader_drain_lock: Mutex::new(None),
+            #[cfg(test)]
+            serving_writer_cache_budget: AtomicU64::new(0),
+            #[cfg(test)]
+            projection_health_checks: AtomicU64::new(0),
             #[cfg(test)]
             capture_thread: Mutex::new(None),
             #[cfg(test)]
@@ -787,23 +1136,38 @@ impl DirectProjection {
             #[cfg(test)]
             registry_capture_attempts: AtomicU64::new(0),
             repairs_in_flight: AtomicUsize::new(0),
+            deltas_coming: AtomicUsize::new(0),
+            build_progress: Default::default(),
             #[cfg(test)]
             inject_read_failure: AtomicBool::new(false),
+            #[cfg(test)]
+            inject_image_damage: AtomicBool::new(false),
+            #[cfg(test)]
+            inject_integrity_damage: AtomicBool::new(false),
+            #[cfg(test)]
+            integrity_checks_started: AtomicU64::new(0),
+            #[cfg(test)]
+            integrity_check_pause: Mutex::new(None),
+            #[cfg(test)]
+            inject_turn_failure: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            last_turn_failed: AtomicBool::new(false),
+            #[cfg(test)]
+            lease_contended: AtomicBool::new(false),
             #[cfg(test)]
             fallback_reads: AtomicU64::new(0),
             #[cfg(test)]
             referenced_name_reads: AtomicU64::new(0),
             #[cfg(test)]
-            fuzzy_candidate_reads: AtomicU64::new(0),
+            checkpoint_passes: AtomicU64::new(0),
         });
         let worker = Arc::clone(&shared);
         std::thread::Builder::new()
             .name("tine-direct-projection".into())
-            .spawn(move || projection_worker(worker))?;
+            .spawn(move || projection_worker(worker, launch_config))?;
         Ok(Self { shared })
     }
 
-    /// Keep repair requested until a complete source inventory or parser snapshot arrives.
     /// Publish that a repair is computing its payload. `progress_at` reports
     /// `Working(Recovering)` for as long as the returned guard lives, so a
     /// concurrent query waits for it instead of declaring the repair failed.
@@ -812,246 +1176,125 @@ impl DirectProjection {
         RepairInFlight(Arc::clone(&self.shared))
     }
 
-    /// True while the last worker turn failed. The flag clears on the next
-    /// successful turn, so it names a projection that owes a reset — not one
-    /// that has merely never started.
+    /// Announce a generation move whose delta the caller queues next; see
+    /// `DeltaComing`.
+    pub(crate) fn delta_coming(&self) -> DeltaComing {
+        self.shared.deltas_coming.fetch_add(1, Ordering::AcqRel);
+        DeltaComing(Arc::clone(&self.shared))
+    }
+
+    /// True while a failed turn owes a new image (K1: it was building one, or
+    /// the image is damaged). A turn that failed on an intact image returns
+    /// its marks instead and leaves this clear. The flag clears on the next
+    /// successful turn.
+    #[cfg(test)]
     pub(crate) fn worker_failed(&self) -> bool {
         self.shared.worker_failed.load(Ordering::Acquire)
     }
 
-    pub(crate) fn request_rebuild(&self) {
-        let mut pending = self.shared.pending.lock().unwrap();
-        pending.rebuild = true;
-        self.shared.ready.store(false, Ordering::Release);
+    /// True while the writer worker accepts work (it holds the lease and has
+    /// not been told to stop).
+    #[cfg(test)]
+    pub(crate) fn worker_available(&self) -> bool {
+        self.shared.worker_available.load(Ordering::Acquire)
     }
 
+    /// Whether this session has compared the image with the graph (the
+    /// launch survey finished, or a fresh build published). A queued edit may
+    /// lower onto an image the session has not surveyed, but readiness is
+    /// never published over one: `index_need` answers `Validate` until this
+    /// is set. So a pending edit on an unsurveyed image is not by itself
+    /// coming (GH #543, audit R9-14).
+    pub(crate) fn validated(&self) -> bool {
+        self.shared.validated.load(Ordering::Acquire)
+    }
+
+    /// Queue a fresh build from `pages`, captured at `generation`.
+    ///
+    /// A snapshot older than the queue is refused: the worker may already
+    /// have applied a newer mark that the snapshot does not contain, and a
+    /// fresh image built from it would silently lose that page change while
+    /// readiness said otherwise (third audit A3-N1). The need stays `Fresh`,
+    /// and the owner assembles a snapshot at the current generation.
+    ///
+    /// Accepting it sets the floor: every mark at or before `generation` is
+    /// in the snapshot, so the queue drops them now and any that arrive late.
     pub(crate) fn enqueue_full(
         &self,
         generation: u64,
         pages: PageSnapshot,
         revisions: PageRevisions,
         parse_config: Arc<ParseConfig>,
-    ) {
-        self.shared.ready.store(false, Ordering::Release);
-        self.shared.worker_failed.store(false, Ordering::Release);
+        retained: Vec<String>,
+    ) -> bool {
         let mut pending = self.shared.pending.lock().unwrap();
-        pending.seed_page_order(pages.iter().map(|(entry, _)| entry.rel_path.as_str()));
+        // A full snapshot is the fresh build's input and nothing else: over an
+        // image nobody owes a rebuild it would only re-lower every page and
+        // drop readiness meanwhile (GH #543 round 2).
+        if !pending.rebuild {
+            projection_diag(|| {
+                format!("full refused at generation={generation}: no fresh image owed")
+            });
+            return false;
+        }
+        if generation < pending.latest_generation {
+            projection_diag(|| {
+                format!(
+                    "full refused: snapshot generation={generation} older than queue {}",
+                    pending.latest_generation,
+                )
+            });
+            return false;
+        }
+        self.shared.ready.store(false, Ordering::Release);
+        pending.snapshot = Some((
+            Arc::new(
+                pages
+                    .iter()
+                    .filter_map(|(entry, _)| {
+                        revisions
+                            .get(&entry.path)
+                            .map(|revision| (entry.rel_path.clone(), revision.clone()))
+                    })
+                    .collect(),
+            ),
+            parse_config.digest(),
+        ));
         pending.full = Some(PendingFull {
             pages,
             revisions,
             parse_config,
+            retained,
         });
-        pending.deltas.clear();
+        pending.marks.clear();
+        pending.applied.clear();
+        pending.registry_owed = None;
+        pending.floor = generation;
         pending.latest_generation = generation;
-        // R6: a complete parsed snapshot owns readiness from here. A warm
-        // validation or stream still in flight must not lower beside it — its
-        // deltas carry no order positions and would erase the snapshot's.
-        if pending.warm.is_some() || pending.warm_stream.is_some() || pending.order.is_some() {
-            pending.warm = None;
-            pending.warm_stream = None;
-            pending.order = None;
-            pending.warm_superseded = true;
-            pending.warm_outcome = Some(WarmOutcome::Superseded);
-        }
-        pending.needs_full = false;
-        self.shared.changed.notify_all();
-    }
-
-    /// R6 warm validation: hand the worker the walk inventory with exact
-    /// content revisions and nothing parsed. Refused (`false`) when a newer
-    /// mutation or queued work already outranks this generation — the caller
-    /// then leaves readiness to the parser fallback, exactly as
-    /// `install_built` does on generation drift.
-    pub(crate) fn enqueue_warm(
-        &self,
-        generation: u64,
-        sources: Vec<(PageEntry, String)>,
-        parse_config: Arc<ParseConfig>,
-    ) -> bool {
-        if !self.shared.worker_available.load(Ordering::Acquire) {
-            return false;
-        }
-        let mut pending = self.shared.pending.lock().unwrap();
-        if pending.has_work()
-            || pending.warm_stream.is_some()
-            || pending.latest_generation > generation
-            || (self.shared.worker_failed.load(Ordering::Acquire) && !pending.rebuild)
-        {
-            return false;
-        }
-        self.shared.ready.store(false, Ordering::Release);
-        pending.seed_page_order(sources.iter().map(|(entry, _)| entry.rel_path.as_str()));
-        // Optimistically open the stream now so every delta recorded from here
-        // until the outcome carries no order position; the worker closes it
-        // again in the same turn when the outcome is `Clean`.
-        pending.warm_stream = Some(generation);
-        pending.warm_outcome = None;
-        pending.warm_superseded = false;
-        pending.warm = Some(PendingWarm {
-            sources,
-            parse_config,
-        });
-        pending.latest_generation = generation;
+        drop(pending);
         self.shared.changed.notify_all();
         true
     }
 
-    /// Block until the worker has decided the queued warm validation.
-    pub(crate) fn wait_warm_outcome(&self) -> WarmOutcome {
-        let mut pending = self.shared.pending.lock().unwrap();
-        loop {
-            if let Some(outcome) = pending.warm_outcome.take() {
-                return outcome;
-            }
-            if !self.shared.worker_available.load(Ordering::Acquire) || pending.stop {
-                return WarmOutcome::Failed;
-            }
-            pending = self.shared.changed.wait(pending).unwrap();
-        }
-    }
-
-    /// R6 stream back-pressure: wait until fewer than `WARM_STREAM_HIGH_WATER`
-    /// deltas are queued, so the warm thread never parses further ahead than
-    /// one batch beyond the worker's current turn. `false` when the stream is
-    /// no longer this thread's to feed (superseded, failed, or drifted).
-    pub(crate) fn warm_stream_admit(&self, generation: u64, batch_len: usize) -> bool {
-        let mut pending = self.shared.pending.lock().unwrap();
-        loop {
-            if pending.warm_superseded
-                || pending.warm_stream != Some(generation)
-                || pending.latest_generation > generation
-                || pending.stop
-                || !self.shared.worker_available.load(Ordering::Acquire)
-                || self.shared.worker_failed.load(Ordering::Acquire)
-            {
-                return false;
-            }
-            if pending.deltas.len() + batch_len <= WARM_STREAM_HIGH_WATER {
-                return true;
-            }
-            pending = self.shared.changed.wait(pending).unwrap();
-        }
-    }
-
-    /// Queue one parsed batch of the warm stream. The session identity owner
-    /// marks exact-revision restored IDs as Live, fresh IDs as Structural. A page that failed to
-    /// parse is deleted from the projection. `false` means the batch was
-    /// refused: a newer mutation outranks this generation, a full snapshot
-    /// superseded the stream, or the worker failed — the caller abandons.
-    pub(crate) fn enqueue_warm_stream(
-        &self,
-        generation: u64,
-        batch: Vec<WarmStreamItem>,
-        parse_config: Arc<ParseConfig>,
-    ) -> bool {
-        let mut pending = self.shared.pending.lock().unwrap();
-        if pending.warm_superseded
-            || pending.warm_stream != Some(generation)
-            || pending.latest_generation > generation
-            || self.shared.worker_failed.load(Ordering::Acquire)
-        {
-            return false;
-        }
-        for item in batch {
-            let delta = match item {
-                WarmStreamItem::Replace {
-                    entry,
-                    document,
-                    revision,
-                    identity,
-                } => PageDelta::Replace {
-                    entry,
-                    document,
-                    revision,
-                    parse_config: Arc::clone(&parse_config),
-                    query_page_order: None,
-                    identity,
-                },
-                WarmStreamItem::Delete { entry } => PageDelta::Delete { entry },
-            };
-            pending.record_delta(generation, delta);
-        }
-        #[cfg(test)]
-        MAX_PENDING_DELTAS.fetch_max(pending.deltas.len() as u64, Ordering::Relaxed);
-        self.shared.changed.notify_all();
-        true
-    }
-
-    /// Close the warm stream (R6): the worker reconciles `query_page_order`
-    /// over the queue's inventory and then publishes readiness. `false` when
-    /// the stream is no longer this thread's; a superseding snapshot owns
-    /// readiness in that case and nothing is owed.
-    pub(crate) fn finish_warm_stream(&self, generation: u64) -> bool {
-        let mut pending = self.shared.pending.lock().unwrap();
-        if pending.warm_superseded {
-            return true;
-        }
-        if pending.warm_stream != Some(generation)
-            || pending.latest_generation > generation
-            || self.shared.worker_failed.load(Ordering::Acquire)
-        {
-            return false;
-        }
-        pending.order = Some(generation);
-        self.shared.changed.notify_all();
-        true
-    }
-
-    /// Abandon an open warm stream (R6: cancellation, drift, or a refused
-    /// batch). Rows already validated or streamed are consistent, but the
-    /// replacements not yet streamed are stale; only a full snapshot may
-    /// publish readiness again. In-scope scenario: a save racing the warm.
-    /// Returns whether a full snapshot superseded the stream — in which case
-    /// that snapshot owns readiness and the caller has nothing to fall back to.
-    pub(crate) fn abandon_warm_stream(&self, generation: u64) -> bool {
-        let mut pending = self.shared.pending.lock().unwrap();
-        if pending.warm_superseded {
-            return true;
-        }
-        if pending.warm_stream != Some(generation) {
-            return false;
-        }
-        pending.warm_stream = None;
-        pending.order = None;
-        pending.needs_full = true;
-        self.shared.ready.store(false, Ordering::Release);
-        self.shared.changed.notify_all();
-        false
-    }
-
-    /// R6: the projected page inventory as `(name, path, text_kind)` rows,
+    /// R6: the projected page inventory as `(name, path, kind)` rows,
     /// read through `drain_after` from the ready projection. `list_pages`
     /// rebuilds `PageEntry`s from it instead of parsing every file.
-    pub(crate) fn page_inventory(
-        &self,
-        cache_generation: u64,
-    ) -> Option<Vec<(String, String, i64)>> {
-        if !self.ready_at(cache_generation) {
-            return None;
-        }
-        let mut reader = self.shared.reader.lock().unwrap();
-        if reader.is_none() {
-            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
-        }
+    pub(crate) fn page_inventory(&self, at: ReadAt) -> Option<Vec<(String, String, PageKind)>> {
+        let reader = self.shared_reader_at(at)?;
         let read = reader.as_ref()?.read();
         let mut rows = Vec::new();
         drain_after(
-            |cursor: Option<([u8; 16], String)>, batch| {
+            |cursor: Option<(i64, String)>, batch| {
                 read.navigation_pages_after_with_header_validation(
                     cursor.as_ref().map(|(_, path)| path.as_str()),
-                    cursor.as_ref().map(|(id, _)| id),
+                    cursor.as_ref().map(|(id, _)| *id),
                     batch,
-                    |_, kind| match kind {
-                        0 | 1 => Ok(()),
-                        _ => Err(tine_storage::sqlite::MaterializationError::Corrupt(
-                            format!("unknown Direct Files text kind {kind}"),
-                        )),
-                    },
+                    |_, kind| derived_reads::page_kind(kind).map(|_| ()),
                 )
             },
-            |row| (row.page_id, row.path.clone()),
+            |row| (row.cursor, row.path.clone()),
             |row| {
-                rows.push((row.name, row.path, row.text_kind));
+                rows.push((row.name, row.path, derived_reads::page_kind(row.text_kind)?));
                 Ok(())
             },
             |error, batch| {
@@ -1062,16 +1305,66 @@ impl DirectProjection {
                 .then(|| (batch / 2).max(1))
             },
         )
-        .ok()?;
-        self.ready_at(cache_generation).then_some(rows)
+        .reported(self)?;
+        self.answers(at).then_some(rows)
     }
 
-    /// Bounded wait for readiness at `generation` (R6): the whole-graph derived
+    /// Bounded wait until the index answers `at` (R6): the whole-graph derived
     /// reads that would otherwise fall to a full parse in the milliseconds
     /// after a save or a warm turn wait for that bounded worker turn first.
     /// Same ceiling and same non-authority as `wait_for_reference_generation`.
-    pub(crate) fn wait_ready_at(&self, generation: u64) -> bool {
-        self.wait_for_reference_generation(generation)
+    #[must_use = "a readiness wait that timed out must fail the test or be handled (GH #543, R9-15e)"]
+    pub(crate) fn wait_ready_at(&self, at: ReadAt) -> bool {
+        self.wait_for_reference_generation(at)
+    }
+
+    /// Unbounded wait for readiness at `generation`, for an index owner only
+    /// (GH #543): a survey's marks or a fresh build on a large graph can
+    /// outlast the bounded wait used by derived-map reads. Returns `false`
+    /// when readiness at this generation is no longer coming: a newer
+    /// generation, the worker gone or failed, an idle queue that did not
+    /// publish, owner work next, or `cancelled`.
+    ///
+    /// Owner work next: a rebuild, a validation or a failed index's retry is
+    /// work only an owner pass does, and the worker takes no queued edit while
+    /// a rebuild is owed. The caller is an owner, so waiting would wait on
+    /// itself -- forever when nothing cancels it (the CLI's `warm_cache`; a
+    /// rebuild the integrity check requested beside a queued edit hung a test
+    /// for 600 s).
+    #[must_use = "a readiness wait that timed out must fail the test or be handled (GH #543, R9-15e)"]
+    pub(crate) fn wait_until_ready_at(
+        &self,
+        generation: u64,
+        cancelled: &impl Fn() -> bool,
+    ) -> bool {
+        let mut pending = self.shared.pending.lock().unwrap();
+        loop {
+            if self.ready_at(generation) {
+                return true;
+            }
+            if cancelled()
+                || pending.stop
+                || pending.lease_wait
+                || !self.shared.worker_available.load(Ordering::Acquire)
+                || self.shared.worker_failed.load(Ordering::Acquire)
+                || pending.latest_generation > generation
+                || matches!(
+                    owner::index_need(&self.shared, &pending),
+                    IndexNeed::Fresh | IndexNeed::Validate | IndexNeed::Failed
+                )
+            {
+                return false;
+            }
+            if !pending.has_work() && !self.shared.worker_busy.load(Ordering::Acquire) {
+                return false;
+            }
+            pending = self
+                .shared
+                .changed
+                .wait_timeout(pending, std::time::Duration::from_millis(50))
+                .unwrap()
+                .0;
+        }
     }
 
     pub(crate) fn enqueue_replace(
@@ -1089,8 +1382,6 @@ impl DirectProjection {
                 document,
                 revision,
                 parse_config,
-                query_page_order: None, // Filled under the queue lock, before coalescing.
-                identity: DeltaIdentity::Live,
             },
         );
     }
@@ -1099,17 +1390,173 @@ impl DirectProjection {
         self.enqueue_delta(generation, PageDelta::Delete { entry });
     }
 
+    /// One page-set change published as ONE queue transaction.
+    ///
+    /// The worker drains whatever is queued the moment it wakes, so a producer
+    /// that enqueues its marks one at a time can have the queue empty
+    /// underneath it: a rename's `Delete` was drained on its own, the watermark
+    /// already read as the new generation, and readiness was published over an
+    /// image whose `Replace` had not been enqueued yet — search answered
+    /// "complete" over a graph that was missing the page entirely (fourth audit
+    /// A4-N2). Taking the lock once makes the whole change one step.
+    pub(crate) fn enqueue_page_set(
+        &self,
+        generation: u64,
+        changes: Vec<PageSetChange>,
+        parse_config: Arc<ParseConfig>,
+    ) {
+        // A mover that claimed `IndexEffect::Sent` and then had nothing to
+        // send (every replacement failed to parse) still owes the index its
+        // generation (GH #543, audit R8-07).
+        if changes.is_empty() {
+            self.advance_generation(generation);
+            return;
+        }
+        self.shared.ready.store(false, Ordering::Release);
+        let mut pending = self.shared.pending.lock().unwrap();
+        for change in changes {
+            let delta = match change {
+                PageSetChange::Replace {
+                    entry,
+                    document,
+                    revision,
+                } => PageDelta::Replace {
+                    entry,
+                    document,
+                    revision,
+                    parse_config: Arc::clone(&parse_config),
+                },
+                PageSetChange::Delete { entry } => PageDelta::Delete { entry },
+            };
+            pending.record_mark(generation, delta);
+        }
+        publish_if_current(&self.shared, &mut pending);
+        drop(pending);
+        self.shared.changed.notify_all();
+    }
+
     fn enqueue_delta(&self, generation: u64, delta: PageDelta) {
         self.shared.ready.store(false, Ordering::Release);
         let mut pending = self.shared.pending.lock().unwrap();
-        pending.record_delta(generation, delta);
-        self.shared.changed.notify_one();
+        pending.record_mark(generation, delta);
+        // A dropped mark leaves nothing to wait for.
+        publish_if_current(&self.shared, &mut pending);
+        drop(pending);
+        self.shared.changed.notify_all();
     }
 
-    pub(crate) fn mark_stale(&self) {
+    /// The launch survey's page changes, observed at `generation` (loaded
+    /// before the survey read anything). Each is a mark like any other: a
+    /// save the survey raced is newer and wins (GH #543, audit R14-03).
+    pub(crate) fn record_survey_marks(
+        &self,
+        generation: u64,
+        changes: Vec<PageSetChange>,
+        parse_config: Arc<ParseConfig>,
+    ) {
+        if changes.is_empty() {
+            return;
+        }
+        let mut pending = self.shared.pending.lock().unwrap();
+        let mut kept = false;
+        for change in changes {
+            let delta = match change {
+                PageSetChange::Replace {
+                    entry,
+                    document,
+                    revision,
+                } => PageDelta::Replace {
+                    entry,
+                    document,
+                    revision,
+                    parse_config: Arc::clone(&parse_config),
+                },
+                PageSetChange::Delete { entry } => PageDelta::Delete { entry },
+            };
+            kept |= pending.record_mark(generation, delta);
+        }
+        if kept {
+            self.shared.ready.store(false, Ordering::Release);
+        }
+        drop(pending);
+        self.shared.changed.notify_all();
+    }
+
+    /// The survey has compared the image with the graph at `generation`:
+    /// every page whose bytes differed is now a mark. Readiness follows as
+    /// soon as those are applied.
+    pub(crate) fn survey_validated(&self, generation: u64, parse_config: Arc<ParseConfig>) {
+        let mut pending = self.shared.pending.lock().unwrap();
+        pending.latest_generation = pending.latest_generation.max(generation);
+        pending.registry_owed = Some(parse_config);
         self.shared.ready.store(false, Ordering::Release);
-        // Source-oriented navigation waits for reconciliation; live queries
-        // can still read the complete committed image.
+        self.shared.validated.store(true, Ordering::Release);
+        publish_if_current(&self.shared, &mut pending);
+        drop(pending);
+        self.shared.changed.notify_all();
+    }
+
+    /// The survey found more of the image stale than a page-by-page repair
+    /// is worth ([`repair_is_proportionate`]): a fresh image is owed.
+    pub(crate) fn survey_owes_fresh_build(&self) {
+        let mut pending = self.shared.pending.lock().unwrap();
+        pending.rebuild = true;
+        self.shared.ready.store(false, Ordering::Release);
+        drop(pending);
+        self.shared.changed.notify_all();
+    }
+
+    /// The graph moved to `generation` without changing anything this index
+    /// holds beyond what is already queued: a page became unreadable, or
+    /// readable again before its mark, and its rows stay as they are; or a
+    /// survey announced the findings it has recorded as marks. An index ready at the previous
+    /// generation is ready at this one; one with work queued publishes
+    /// readiness at the latest generation when the work drains. Without this
+    /// the index stayed not-ready with nothing coming, and every indexed read
+    /// fell back to parsing the graph (GH #543, audit R4-03).
+    pub(crate) fn advance_generation(&self, generation: u64) {
+        let mut pending = self.shared.pending.lock().unwrap();
+        pending.latest_generation = pending.latest_generation.max(generation);
+        if !self.shared.worker_busy.load(Ordering::Acquire)
+            && self.shared.ready.load(Ordering::Acquire)
+        {
+            publish_if_current(&self.shared, &mut pending);
+        }
+        drop(pending);
+        self.shared.changed.notify_all();
+    }
+
+    /// Whether the index holds, or is being given, a page whose
+    /// graph-relative path starts with `prefix` (a directory path ending in
+    /// `/`); `None` when it has no image to answer from.
+    pub(crate) fn holds_pages_under(&self, prefix: &str) -> Option<bool> {
+        let (queued, deleted) = {
+            let pending = self.shared.pending.lock().unwrap();
+            if !pending.set_up || pending.rebuild || pending.full.is_some() {
+                return None;
+            }
+            let mut queued = false;
+            let mut deleted = HashSet::new();
+            for (path, (_, delta)) in pending.in_flight.iter().chain(pending.marks.iter()) {
+                if !path.starts_with(prefix) {
+                    continue;
+                }
+                match delta {
+                    PageDelta::Replace { .. } => {
+                        queued = true;
+                        deleted.remove(path);
+                    }
+                    PageDelta::Delete { .. } => {
+                        deleted.insert(path.clone());
+                    }
+                }
+            }
+            (queued, deleted)
+        };
+        if queued {
+            return Some(true);
+        }
+        self.image_paths_under(prefix, &deleted)
     }
 
     /// A reference read which races an already-queued one-page fact delta is
@@ -1117,14 +1564,23 @@ impl DirectProjection {
     /// every parsed page. The timeout is a latency ceiling, not an authority:
     /// failure, worker loss, a newer generation, or expiry all return `false`
     /// and the caller uses the exact parser fallback.
-    pub(crate) fn wait_for_reference_generation(&self, generation: u64) -> bool {
-        if self.ready_at(generation) {
+    #[must_use = "a readiness wait that timed out must fail the test or be handled (GH #543, R9-15e)"]
+    ///
+    /// A [`Currency::LaunchStored`] read also stops waiting when the stored
+    /// image serves again: an edit made during the launch check is applied
+    /// in one turn, and the read then sees it (design D2, read-your-writes).
+    pub(crate) fn wait_for_reference_generation(&self, at: ReadAt) -> bool {
+        let generation = at.generation;
+        if self.answers(at) {
             return true;
         }
         let deadline = std::time::Instant::now() + REFERENCE_DELTA_WAIT;
         let mut pending = self.shared.pending.lock().unwrap();
         loop {
-            if self.ready_at(generation) {
+            if self.ready_at(generation)
+                || (at.currency == Currency::LaunchStored
+                    && owner::serving_stored(&self.shared, &pending))
+            {
                 return true;
             }
             if !self.shared.worker_available.load(Ordering::Acquire)
@@ -1134,10 +1590,7 @@ impl DirectProjection {
             {
                 return false;
             }
-            if !pending.has_work()
-                && pending.warm_stream.is_none()
-                && !self.shared.worker_busy.load(Ordering::Acquire)
-            {
+            if !pending.has_work() && !self.shared.worker_busy.load(Ordering::Acquire) {
                 return false;
             }
             let now = std::time::Instant::now();
@@ -1158,19 +1611,13 @@ impl DirectProjection {
 
     pub(crate) fn property_facets(
         &self,
-        cache_generation: u64,
+        at: ReadAt,
         autocomplete: bool,
         hidden_properties: &[String],
         max_items: usize,
         max_bytes: usize,
     ) -> Option<(Vec<(String, Vec<String>)>, bool)> {
-        if !self.ready_at(cache_generation) {
-            return None;
-        }
-        let mut reader = self.shared.reader.lock().unwrap();
-        if reader.is_none() {
-            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
-        }
+        let reader = self.shared_reader_at(at)?;
         let read = reader.as_ref()?.read();
         let mut accumulator = if autocomplete {
             PropertyFacetAccumulator::autocomplete(hidden_properties, max_items, max_bytes)
@@ -1179,7 +1626,13 @@ impl DirectProjection {
         };
         drain_after(
             |cursor, batch| read.property_facet_rows_after(!autocomplete, cursor, batch),
-            |row| (row.owner, row.source_name.clone(), row.ordinal),
+            |row| {
+                let owner = match row.owner {
+                    PhysicalEntityId::Page(_) => PhysicalEntityCoordinate::Page(row.owner_cursor),
+                    PhysicalEntityId::Block(_) => PhysicalEntityCoordinate::Block(row.owner_cursor),
+                };
+                (owner, row.name_cursor, row.ordinal)
+            },
             |row| {
                 accumulator.offer(&row.normalized_name, &row.value);
                 Ok(())
@@ -1192,8 +1645,8 @@ impl DirectProjection {
                 .then(|| (batch / 2).max(1))
             },
         )
-        .ok()?;
-        if !self.ready_at(cache_generation) {
+        .reported(self)?;
+        if !self.answers(at) {
             return None;
         }
         #[cfg(test)]
@@ -1220,7 +1673,7 @@ impl DirectProjection {
     #[cfg(test)]
     pub(crate) fn property_owner_rows(
         &self,
-        cache_generation: u64,
+        at: ReadAt,
     ) -> Option<(
         Vec<crate::query::registry::OwnerRow>,
         HashMap<String, crate::query::registry::PageMeta>,
@@ -1229,13 +1682,7 @@ impl DirectProjection {
         #[cfg(test)]
         REGISTRY_READ_ATTEMPTS.with(|count| count.set(count.get() + 1));
 
-        if !self.ready_at(cache_generation) {
-            return None;
-        }
-        let mut reader = self.shared.reader.lock().unwrap();
-        if reader.is_none() {
-            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
-        }
+        let reader = self.shared_reader_at(at)?;
         let read = reader.as_ref()?.read();
 
         // The page map and the rows are read from the SAME `read`, i.e. the same
@@ -1243,24 +1690,21 @@ impl DirectProjection {
         // snapshot-consistency defect and fails the build (§6.2), never a
         // silent fallback to Markdown.
         let mut pages: HashMap<String, PageMeta> = HashMap::new();
+        let mut page_ids = HashMap::new();
         drain_after(
-            |cursor: Option<([u8; 16], String)>, batch| {
+            |cursor: Option<(i64, String)>, batch| {
                 read.navigation_pages_after_with_header_validation(
                     cursor.as_ref().map(|(_, path)| path.as_str()),
-                    cursor.as_ref().map(|(id, _)| id),
+                    cursor.as_ref().map(|(id, _)| *id),
                     batch,
-                    |_, kind| match kind {
-                        0 | 1 => Ok(()),
-                        _ => Err(tine_storage::sqlite::MaterializationError::Corrupt(
-                            format!("unknown Direct Files text kind {kind}"),
-                        )),
-                    },
+                    |_, kind| derived_reads::page_kind(kind).map(|_| ()),
                 )
             },
-            |row| (row.page_id, row.path.clone()),
+            |row| (row.cursor, row.path.clone()),
             |row| {
+                page_ids.insert(row.path.clone(), row.cursor);
                 pages.insert(
-                    crate::query::registry_sql::page_key(row.page_id),
+                    crate::query::registry_sql::page_key(row.cursor),
                     PageMeta {
                         // §6.2 E4: `Format::from_path`, case-insensitive —
                         // never `reference_source_is_org`.
@@ -1278,27 +1722,36 @@ impl DirectProjection {
                 .then(|| (batch / 2).max(1))
             },
         )
-        .ok()?;
+        .reported(self)?;
 
         let mut rows: Vec<OwnerRow> = Vec::new();
         drain_after(
             |cursor, batch| read.property_facet_rows_after(false, cursor, batch),
-            |row| (row.owner, row.source_name.clone(), row.ordinal),
+            |row| {
+                let owner = match row.owner {
+                    PhysicalEntityId::Page(_) => PhysicalEntityCoordinate::Page(row.owner_cursor),
+                    PhysicalEntityId::Block(_) => PhysicalEntityCoordinate::Block(row.owner_cursor),
+                };
+                (owner, row.name_cursor, row.ordinal)
+            },
             |row| {
                 let (owner_type, owner_id) = match row.owner {
-                    PhysicalEntityId::Page(id) => (
-                        OwnerType::Page,
-                        format!("p:{}", crate::query::registry_sql::hex16(id)),
-                    ),
-                    PhysicalEntityId::Block(id) => (
-                        OwnerType::Block,
-                        format!("b:{}", crate::query::registry_sql::hex16(id)),
-                    ),
+                    PhysicalEntityId::Page(_) => {
+                        (OwnerType::Page, format!("p:{}", row.owner_cursor))
+                    }
+                    PhysicalEntityId::Block(_) => {
+                        (OwnerType::Block, format!("b:{}", row.owner_cursor))
+                    }
                 };
+                let page_id = page_ids.get(&row.page_path).ok_or_else(|| {
+                    tine_storage::sqlite::MaterializationError::Corrupt(
+                        "registry property names an absent page path".into(),
+                    )
+                })?;
                 rows.push(OwnerRow {
                     owner_type,
                     owner_id,
-                    page_id: crate::query::registry_sql::page_key(row.page_id),
+                    page_id: crate::query::registry_sql::page_key(*page_id),
                     source_name: row.source_name,
                     normalized_name: row.normalized_name,
                     ordinal: row.ordinal,
@@ -1314,11 +1767,11 @@ impl DirectProjection {
                 .then(|| (batch / 2).max(1))
             },
         )
-        .ok()?;
+        .reported(self)?;
 
         // The generation must still hold AFTER both scans, or the two halves
         // could straddle a rebuild — the same re-check `property_facets` makes.
-        if !self.ready_at(cache_generation) {
+        if !self.answers(at) {
             return None;
         }
         #[cfg(test)]
@@ -1360,19 +1813,20 @@ impl DirectProjection {
 
     /// Acquire the current complete projection without waiting for a saved edit.
     /// Ordinary queued deltas do not invalidate the committed image.
+    /// A [`Currency::LaunchStored`] job may read the stored image during the
+    /// launch check (design D2).
     pub(crate) fn open_current_query_job(
         &self,
         registry_sensitivity: RegistrySensitivity,
+        currency: Currency,
     ) -> QueryJobOpen {
+        let requirement = QueryCaptureRequirement::CurrentSnapshot(currency);
         if !self.shared.worker_available.load(Ordering::Acquire)
-            || !query_capture_available(&self.shared, &QueryCaptureRequirement::CurrentSnapshot)
+            || !query_capture_available(&self.shared, &requirement)
         {
             return QueryJobOpen::NotReady;
         }
-        self.enqueue_query_capture(
-            QueryCaptureRequirement::CurrentSnapshot,
-            registry_sensitivity,
-        )
+        self.enqueue_query_capture(requirement, registry_sensitivity)
     }
 
     fn enqueue_query_capture(
@@ -1410,12 +1864,8 @@ impl DirectProjection {
                 return QueryJobOpen::Failed;
             }
             let available = match &requirement {
-                QueryCaptureRequirement::CurrentSnapshot => {
-                    !pending.rebuild
-                        && !pending.needs_full
-                        && pending.warm_stream.is_none()
-                        && self.shared.validated.load(Ordering::Acquire)
-                        && !self.shared.worker_failed.load(Ordering::Acquire)
+                QueryCaptureRequirement::CurrentSnapshot(currency) => {
+                    query_capture_admissible(&self.shared, &pending, *currency)
                 }
                 #[cfg(test)]
                 QueryCaptureRequirement::StrictGeneration(generation) => self.ready_at(*generation),
@@ -1441,8 +1891,8 @@ impl DirectProjection {
     }
 
     #[cfg(test)]
-    pub(crate) fn session_pages_test(&self) -> Arc<HashSet<[u8; 16]>> {
-        Arc::clone(&self.shared.session_pages.lock().unwrap())
+    pub(crate) fn session_ids_test(&self) -> Arc<SessionLiveIds> {
+        Arc::clone(&self.shared.session_ids.lock().unwrap())
     }
 
     #[cfg(test)]
@@ -1455,33 +1905,69 @@ impl DirectProjection {
         self.shared.fallback_reads.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn referenced_page_names(&self, cache_generation: u64) -> Option<Vec<String>> {
-        if !self.ready_at(cache_generation) {
+    /// Admit a pooled projection read under the same mutex publication drains.
+    ///
+    /// The fast check avoids taking the mutex for a known-stale generation, but
+    /// the check under the mutex is authoritative: a caller paused after the
+    /// first check must not reopen the destination after replacement withdrew
+    /// readiness. The returned guard stays alive for the complete read, making
+    /// every SQLite handle visible to the publication drain.
+    fn shared_reader_at(
+        &self,
+        at: ReadAt,
+    ) -> Option<std::sync::MutexGuard<'_, Option<PhysicalGraphProjectionDatabase>>> {
+        if !self.answers(at) {
             return None;
         }
+        #[cfg(test)]
+        {
+            let hook = self
+                .shared
+                .before_shared_reader_admission
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let mut reader = self.shared.reader.lock().unwrap();
+        if !self.answers(at) {
+            return None;
+        }
         if reader.is_none() {
             *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
         }
+        reader.as_ref()?;
+        #[cfg(test)]
+        {
+            let hook = self
+                .shared
+                .after_shared_reader_admission
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        Some(reader)
+    }
+
+    pub(crate) fn referenced_page_names(&self, at: ReadAt) -> Option<Vec<String>> {
+        let reader = self.shared_reader_at(at)?;
         let read = reader.as_ref()?.read();
         let mut names = std::collections::HashMap::<String, String>::new();
         drain_after(
-            |after: Option<(String, String, String, [u8; 16])>, batch| {
+            |after: Option<(String, String)>, batch| {
                 read.navigation_reference_names_after(
-                    after.as_ref().map(|(path, raw, normalized, id)| {
-                        (path.as_str(), raw.as_str(), normalized.as_str(), id)
-                    }),
+                    after
+                        .as_ref()
+                        .map(|(normalized, raw)| (normalized.as_str(), raw.as_str())),
                     batch,
                 )
             },
-            |row| {
-                (
-                    row.owner_path.clone(),
-                    row.raw_name.clone(),
-                    row.normalized_name.clone(),
-                    row.source_page_id,
-                )
-            },
+            |row| (row.normalized_name.clone(), row.raw_name.clone()),
             |row| {
                 names
                     .entry(crate::refs::page_key(&row.raw_name))
@@ -1490,8 +1976,8 @@ impl DirectProjection {
             },
             |_, _| None,
         )
-        .ok()?;
-        if !self.ready_at(cache_generation) {
+        .reported(self)?;
+        if !self.answers(at) {
             return None;
         }
         let mut names = names.into_values().collect::<Vec<_>>();
@@ -1505,66 +1991,60 @@ impl DirectProjection {
 
     pub(crate) fn page_aliases_with_owners(
         &self,
-        cache_generation: u64,
+        at: ReadAt,
     ) -> Option<Vec<(String, String, String)>> {
-        if !self.ready_at(cache_generation) {
-            return None;
-        }
-        let mut reader = self.shared.reader.lock().unwrap();
-        if reader.is_none() {
-            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
-        }
-        let read = reader.as_ref()?.read();
+        let _reader = self.shared_reader_at(at)?;
         let mut aliases = Vec::new();
-        drain_after(
-            |after: Option<(String, String, [u8; 16])>, batch| {
-                read.navigation_aliases_after(
-                    after
-                        .as_ref()
-                        .map(|(path, alias, id)| (path.as_str(), alias.as_str(), id)),
-                    batch,
-                )
-            },
+        let mut snapshot =
+            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
+                .reported(self)?;
+        crate::query::projection_sql::visit(
+            &mut snapshot,
+            "SELECT alias.raw, owner.raw, p.path \
+             FROM reference_alias_declarations d \
+             JOIN pages p ON p.page_id = d.source_page_id \
+             JOIN names owner ON owner.name_id = p.name_id \
+             JOIN names alias ON alias.name_id = d.alias_name_id \
+             WHERE d.source_entity_type = 0 AND d.source_entity_id = d.source_page_id \
+             ORDER BY d.source_page_id, d.ordinal, alias.raw",
+            &[],
             |row| {
-                (
-                    row.owner_path.clone(),
-                    row.normalized_alias.clone(),
-                    row.source_page_id,
-                )
+                let values = row
+                    .iter()
+                    .map(|value| match value {
+                        PhysicalQueryValue::Text(text) => Ok(text.clone()),
+                        _ => Err(tine_storage::sqlite::MaterializationError::InvalidQuery(
+                            "page alias ownership row contains non-text data".into(),
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if values.len() != 3 {
+                    return Err(tine_storage::sqlite::MaterializationError::InvalidQuery(
+                        "page alias ownership row has the wrong width".into(),
+                    ));
+                }
+                aliases.push((values[0].clone(), values[1].clone(), values[2].clone()));
+                Ok(std::ops::ControlFlow::Continue(()))
             },
-            |row| {
-                aliases.push((row.normalized_alias, row.owner_name, row.owner_path));
-                Ok(())
-            },
-            |_, _| None,
         )
-        .ok()?;
-        self.ready_at(cache_generation).then_some(aliases)
+        .reported(self)?;
+        self.answers(at).then_some(aliases)
     }
 
-    pub(crate) fn real_page_names(
-        &self,
-        cache_generation: u64,
-    ) -> Option<crate::query::RealPageNames> {
-        if !self.ready_at(cache_generation) {
-            return None;
-        }
-        let mut reader = self.shared.reader.lock().unwrap();
-        if reader.is_none() {
-            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
-        }
+    pub(crate) fn real_page_names(&self, at: ReadAt) -> Option<crate::query::RealPageNames> {
+        let reader = self.shared_reader_at(at)?;
         let read = reader.as_ref()?.read();
         let mut names = crate::query::RealPageNames::new();
         drain_after(
-            |after: Option<(String, [u8; 16])>, batch| {
+            |after: Option<(String, i64)>, batch| {
                 read.navigation_pages_after_with_header_validation(
                     after.as_ref().map(|(path, _)| path.as_str()),
-                    after.as_ref().map(|(_, id)| id),
+                    after.as_ref().map(|(_, id)| *id),
                     batch,
                     |_, _| Ok(()),
                 )
             },
-            |row| (row.path.clone(), row.page_id),
+            |row| (row.path.clone(), row.cursor),
             |row| {
                 let path = PathBuf::from(&row.path);
                 match names.get_mut(&row.name_key) {
@@ -1581,8 +2061,8 @@ impl DirectProjection {
             },
             |_, _| None,
         )
-        .ok()?;
-        self.ready_at(cache_generation).then_some(names)
+        .reported(self)?;
+        self.answers(at).then_some(names)
     }
 
     /// The candidate set for one reference target: the pages that may contain a
@@ -1603,125 +2083,332 @@ impl DirectProjection {
     /// candidate page is classified as it was.
     pub(crate) fn reference_candidates(
         &self,
-        cache_generation: u64,
+        at: ReadAt,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
+        mode: crate::query::candidate::CandidateMode,
+        config: &crate::config::Config,
     ) -> Option<ReferenceCandidateIndex> {
-        if !self.ready_at(cache_generation) {
-            return None;
-        }
         if !reference_narrowing_supported(names_norm, kind) {
             return None;
         }
-        let mut reader = self.shared.reader.lock().unwrap();
-        if reader.is_none() {
-            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
-        }
-        let read = reader.as_ref()?.read();
-        let mut page_ids = std::collections::BTreeSet::new();
+        let reader = self.shared_reader_at(at)?;
+        let mut paths = std::collections::BTreeSet::new();
         let mut blocks = std::collections::HashSet::new();
-        let mut blocks_are_complete = true;
+        let mut page_owners = matches!(
+            (kind, mode),
+            (
+                ReferenceKind::Plain,
+                crate::query::candidate::CandidateMode::Interactive { .. }
+            )
+        )
+        .then(std::collections::HashSet::new);
+        reader.as_ref()?;
+        // The block set names blocks as the candidate pages' documents do, by
+        // the identity policy captured beside the image (R3,
+        // `ResultIdentity::public_id`). The stored id of a page edited in an
+        // earlier session is that session's live id, which no document
+        // carries after a reopen; compared directly, the filter dropped every
+        // such block and Linked References lost them (GH #594).
+        // All title/alias needles observe one committed image. Reopening per
+        // spelling could otherwise union candidates from opposite sides of an
+        // edit even though each individual query was coherent.
+        let mut snapshot =
+            PhysicalProjectionQuerySnapshot::open_direct(&self.shared.path, || Ok(()))
+                .reported(self)?;
+        let identity = capture_result_identity(&self.shared, &mut snapshot).reported(self)?;
+        let mut insert_block = |path: &str,
+                                result_id: Option<&PhysicalQueryValue>,
+                                order_key: Option<&PhysicalQueryValue>|
+         -> Result<(), tine_storage::sqlite::MaterializationError> {
+            match (result_id, order_key) {
+                (
+                    Some(PhysicalQueryValue::Text(result_id)),
+                    Some(PhysicalQueryValue::Text(order_key)),
+                ) => {
+                    blocks.insert(
+                        identity
+                            .public_id(path, order_key, result_id)
+                            .map_err(tine_storage::sqlite::MaterializationError::Corrupt)?,
+                    );
+                    Ok(())
+                }
+                // A page-level posting names no block. The page-property
+                // pseudo-block it stands for is built from the page preamble
+                // and never classified through the block walk, so the block
+                // set stays complete for the walk.
+                (Some(PhysicalQueryValue::Null), Some(PhysicalQueryValue::Null)) => Ok(()),
+                _ => Err(tine_storage::sqlite::MaterializationError::InvalidQuery(
+                    "reference candidate has an invalid identity".into(),
+                )),
+            }
+        };
         for name in names_norm {
             match kind {
                 ReferenceKind::Explicit => {
-                    drain_after(
-                        |after, batch| read.page_referrer_candidates_after(name, after, batch),
-                        |row| (row.source_page_id, row.source),
+                    // Property-key pseudo pages are not backlinks; duplicate
+                    // occurrences collapse to one source entity.
+                    crate::query::projection_sql::visit(
+                        &mut snapshot,
+                        "SELECT DISTINCT p.path, b.result_id, b.order_key \
+                         FROM reference_postings r \
+                         JOIN names n ON n.name_id = r.target_name_id \
+                         JOIN pages p ON p.page_id = r.source_page_id \
+                         LEFT JOIN blocks b \
+                           ON r.source_entity_type = 1 AND b.block_id = r.source_entity_id \
+                         WHERE r.target_type = 0 AND r.reference_kind <= 4 AND n.key = ?1",
+                        &[PhysicalQueryValue::Text(name.clone())],
                         |row| {
-                            page_ids.insert(row.source_page_id);
-                            match row.source {
-                                PhysicalEntityId::Block(block_id) => {
-                                    blocks.insert(block_id);
-                                }
-                                // A page-level posting names no block. The
-                                // page-property pseudo-block it stands for is
-                                // built from the page preamble and never
-                                // classified through the block walk, so the
-                                // block set stays complete for the walk.
-                                PhysicalEntityId::Page(_) => {}
-                            }
-                            Ok(())
+                            let Some(PhysicalQueryValue::Text(path)) = row.first() else {
+                                return Err(
+                                    tine_storage::sqlite::MaterializationError::InvalidQuery(
+                                        "reference candidate has no page path".into(),
+                                    ),
+                                );
+                            };
+                            insert_block(path, row.get(1), row.get(2))?;
+                            paths.insert(PathBuf::from(path));
+                            Ok(std::ops::ControlFlow::Continue(()))
                         },
-                        |_, _| None,
                     )
-                    .ok()?;
+                    .reported(self)?;
                 }
                 ReferenceKind::Plain => {
-                    // FTS narrows to pages here; `plain_text_candidate_pages_after`
-                    // projects `owner.page_id` and does not expose the owning
-                    // entity, so the walk still classifies every block of a
-                    // candidate page.
-                    blocks_are_complete = false;
-                    drain_after(
-                        |after, batch| read.plain_text_candidate_pages_after(name, after, batch),
-                        |row| row.page_id,
-                        |row| {
-                            page_ids.insert(row.page_id);
-                            Ok(())
-                        },
-                        |_, _| None,
-                    )
-                    .ok()?;
+                    let folded = crate::search_query::canonical_fold(name);
+                    let plan = crate::query::candidate::fragment_bound(&folded);
+                    let mut params = plan
+                        .as_ref()
+                        .map(|(_, expression)| vec![PhysicalQueryValue::Text(expression.clone())])
+                        .unwrap_or_default();
+                    let snapshot = &mut snapshot;
+                    let exclusions = crate::refs::ReferenceSourceExclusions::new(
+                        self_page,
+                        config.favorites_page.as_deref(),
+                    );
+                    let mut indexed_filters = Vec::new();
+                    let mut scan_filters = Vec::new();
+                    for key in exclusions.keys() {
+                        params.push(PhysicalQueryValue::Text(key.clone()));
+                        indexed_filters.push(format!("owner_key <> ?{}", params.len()));
+                        scan_filters.push(format!("n.key <> ?{}", params.len()));
+                    }
+                    let indexed_filter = indexed_filters.join(" AND ");
+                    let scan_filter = scan_filters.join(" AND ");
+                    let mut limit_sql = String::new();
+                    match mode {
+                        crate::query::candidate::CandidateMode::Exhaustive => {}
+                        crate::query::candidate::CandidateMode::Interactive { window } => {
+                            let needle = vec![name.clone()];
+                            let config = config.clone();
+                            snapshot
+                                .set_query_rank_function(move |entity_type, framed| {
+                                    #[cfg(test)]
+                                    PLAIN_REFERENCE_EXACT_CALLBACKS
+                                        .with(|count| count.set(count.get().saturating_add(1)));
+                                    let (raw, path) = crate::query::rank::decode_pair(framed)?;
+                                    let is_org = Format::from_path(Path::new(path)) == Format::Org;
+                                    let matched = if entity_type == 0 {
+                                        crate::query::page_preamble_has_reference(
+                                            raw,
+                                            is_org,
+                                            &needle,
+                                            ReferenceKind::Plain,
+                                            &config,
+                                        )
+                                    } else {
+                                        let block = DocBlock::preamble(raw, is_org);
+                                        let projection = block.projection();
+                                        crate::reference_evidence::has_occurrence_kind(
+                                            raw,
+                                            &projection.reference_source,
+                                            &needle,
+                                            ReferenceKind::Plain,
+                                            &config,
+                                        )
+                                    };
+                                    Ok(matched.then(Vec::new))
+                                })
+                                .reported(self)?;
+                            params.push(PhysicalQueryValue::Integer(
+                                i64::try_from(window).unwrap_or(i64::MAX),
+                            ));
+                            limit_sql = format!(" LIMIT ?{}", params.len());
+                        }
+                    }
+                    let sql = if let Some((table, _)) = plan {
+                        let candidate_source = format!(
+                            "(SELECT c.rowid AS entity_id, \
+                                     CASE WHEN ep.page_id IS NOT NULL THEN 0 ELSE 1 END AS entity_type, \
+                                     owner.path, b.result_id, b.order_key, \
+                                     CASE WHEN ep.page_id IS NOT NULL \
+                                          THEN COALESCE(pt.preamble, '') ELSE bt.content END AS raw, \
+                                     owner_name.key AS owner_key \
+                              FROM (SELECT rowid FROM {table} \
+                                    WHERE {table} MATCH ?1 ORDER BY rowid DESC) c \
+                              LEFT JOIN pages ep ON ep.page_id = c.rowid \
+                              LEFT JOIN blocks b ON b.block_id = c.rowid \
+                              JOIN pages owner ON owner.page_id = COALESCE(ep.page_id, b.page_id) \
+                              JOIN names owner_name ON owner_name.name_id = owner.name_id \
+                              LEFT JOIN page_text pt ON pt.page_id = ep.page_id \
+                              LEFT JOIN block_text bt ON bt.block_id = b.block_id \
+                              WHERE ep.page_id IS NOT NULL OR b.block_id IS NOT NULL) candidates",
+                            table = table.name(),
+                        );
+                        let mut conditions = indexed_filter;
+                        if matches!(
+                            mode,
+                            crate::query::candidate::CandidateMode::Interactive { .. }
+                        ) {
+                            let frame = crate::query::text::framed_pair_sql("raw", "path");
+                            if !conditions.is_empty() {
+                                conditions.push_str(" AND ");
+                            }
+                            conditions.push_str(&format!(
+                                "tine_query_rank(entity_type, {frame}) IS NOT NULL"
+                            ));
+                        }
+                        let where_sql = (!conditions.is_empty())
+                            .then(|| format!(" WHERE {conditions}"))
+                            .unwrap_or_default();
+                        format!(
+                            "SELECT path, result_id, entity_id, entity_type, order_key \
+                             FROM {candidate_source}{where_sql} \
+                             ORDER BY entity_id DESC{limit_sql}"
+                        )
+                    } else {
+                        let page_frame = crate::query::text::framed_pair_sql(
+                            "COALESCE(pt.preamble, '')",
+                            "p.path",
+                        );
+                        let block_frame =
+                            crate::query::text::framed_pair_sql("bt.content", "p.path");
+                        let mut page_conditions = scan_filter.clone();
+                        let mut block_conditions = scan_filter;
+                        if matches!(
+                            mode,
+                            crate::query::candidate::CandidateMode::Interactive { .. }
+                        ) {
+                            if !page_conditions.is_empty() {
+                                page_conditions.push_str(" AND ");
+                                block_conditions.push_str(" AND ");
+                            }
+                            page_conditions
+                                .push_str(&format!("tine_query_rank(0, {page_frame}) IS NOT NULL"));
+                            block_conditions.push_str(&format!(
+                                "tine_query_rank(1, {block_frame}) IS NOT NULL"
+                            ));
+                        }
+                        let page_where = (!page_conditions.is_empty())
+                            .then(|| format!(" WHERE {page_conditions}"))
+                            .unwrap_or_default();
+                        let block_where = (!block_conditions.is_empty())
+                            .then(|| format!(" WHERE {block_conditions}"))
+                            .unwrap_or_default();
+                        format!(
+                            "SELECT p.path AS path, NULL AS result_id, \
+                                    p.page_id AS entity_id, 0 AS entity_type, \
+                                    NULL AS order_key \
+                             FROM pages p JOIN names n ON n.name_id = p.name_id \
+                             LEFT JOIN page_text pt ON pt.page_id = p.page_id{page_where} \
+                             UNION ALL \
+                             SELECT p.path, b.result_id, b.block_id, 1, b.order_key \
+                             FROM blocks b JOIN block_text bt ON bt.block_id = b.block_id \
+                             JOIN pages p ON p.page_id = b.page_id \
+                             JOIN names n ON n.name_id = p.name_id{block_where} \
+                             ORDER BY entity_id DESC{limit_sql}"
+                        )
+                    };
+                    #[cfg(test)]
+                    if matches!(
+                        mode,
+                        crate::query::candidate::CandidateMode::Interactive { .. }
+                    ) {
+                        capture_plain_reference_query_plan(&self.shared.path, &sql, &params)?;
+                    }
+                    crate::query::projection_sql::visit(snapshot, &sql, &params, |row| {
+                        let Some(PhysicalQueryValue::Text(path)) = row.first() else {
+                            return Err(tine_storage::sqlite::MaterializationError::InvalidQuery(
+                                "plain-reference candidate has no page path".into(),
+                            ));
+                        };
+                        insert_block(path, row.get(1), row.get(4))?;
+                        let path = PathBuf::from(path);
+                        paths.insert(path.clone());
+                        match row.get(3) {
+                            Some(PhysicalQueryValue::Integer(0)) => {
+                                if let Some(page_owners) = page_owners.as_mut() {
+                                    page_owners.insert(path);
+                                }
+                            }
+                            Some(PhysicalQueryValue::Integer(1)) => {}
+                            _ => {
+                                return Err(
+                                    tine_storage::sqlite::MaterializationError::InvalidQuery(
+                                        "plain-reference candidate has an invalid entity kind"
+                                            .into(),
+                                    ),
+                                );
+                            }
+                        }
+                        Ok(std::ops::ControlFlow::Continue(()))
+                    })
+                    .reported(self)?;
                 }
             }
         }
-        let mut paths = std::collections::BTreeSet::new();
-        for page_id in page_ids {
-            let page = read
-                .page_with_header_validation(page_id, |_, _| Ok(()))
-                .ok()??;
-            paths.insert(PathBuf::from(page.path));
-        }
-        self.ready_at(cache_generation)
-            .then_some(ReferenceCandidateIndex {
-                paths,
-                blocks: blocks_are_complete.then_some(blocks),
-            })
+        self.answers(at).then_some(ReferenceCandidateIndex {
+            paths,
+            blocks: Some(blocks),
+            page_owners,
+        })
     }
 
     /// Outer `None` means projection unavailable/stale and requires parser
     /// fallback. Inner `None` is an exact current-generation miss.
-    pub(crate) fn block_page_hint(
-        &self,
-        cache_generation: u64,
-        uuid: &str,
-    ) -> Option<Option<String>> {
-        if !self.ready_at(cache_generation) {
-            return None;
-        }
-        let uuid = Uuid::parse_str(uuid).ok()?.into_bytes();
-        let mut reader = self.shared.reader.lock().unwrap();
-        if reader.is_none() {
-            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
-        }
+    pub(crate) fn block_page_hint(&self, at: ReadAt, uuid: &str) -> Option<Option<String>> {
+        let parsed_uuid = Uuid::parse_str(uuid).ok()?.into_bytes();
+        let reader = self.shared_reader_at(at)?;
         let read = reader.as_ref()?.read();
-        let block = match read.block(uuid).ok()? {
+        // A live id this session gave a block is stored as the block's
+        // structural id (R3). A hint needs only the page, and the page of the
+        // row found is checked against the page that recorded the id.
+        let recorded = Arc::clone(&self.shared.session_ids.lock().unwrap());
+        let live = recorded.iter().find_map(|(path, entries)| {
+            entries.iter().find_map(|entry| {
+                entry
+                    .ids
+                    .iter()
+                    .find_map(|(stored, live)| (live == uuid).then_some((path, stored)))
+            })
+        });
+        let stored = live.map_or(uuid, |(_, stored)| stored.as_str());
+        let block = match read
+            .block(stored)
+            .reported(self)?
+            .filter(|block| live.is_none_or(|(path, _)| block.page_path == *path))
+        {
             Some(block) => crate::query::logseq_uuid_owner([block], false),
-            None => {
-                crate::query::logseq_uuid_owner(read.blocks_by_logseq_uuid(uuid, 2).ok()?, false)
-            }
+            None => crate::query::logseq_uuid_owner(
+                read.blocks_by_logseq_uuid(parsed_uuid, 2).reported(self)?,
+                false,
+            ),
         };
         let page = match block {
             Some(block) => read
-                .page_with_header_validation(block.page_id, |_, _| Ok(()))
-                .ok()?
+                .page_with_header_validation(&block.page_path, |_, _| Ok(()))
+                .reported(self)?
                 .map(|page| page.name),
             None => None,
         };
-        self.ready_at(cache_generation).then_some(page)
+        self.answers(at).then_some(page)
     }
 
     pub(crate) fn block_ref_counts(
         &self,
-        cache_generation: u64,
+        at: ReadAt,
     ) -> Option<std::collections::HashMap<String, usize>> {
-        if !self.ready_at(cache_generation) {
-            return None;
-        }
-        let mut reader = self.shared.reader.lock().unwrap();
-        if reader.is_none() {
-            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
-        }
+        let reader = self.shared_reader_at(at)?;
         let read = reader.as_ref()?.read();
         let mut counts = std::collections::HashMap::new();
         drain_after(
@@ -1738,47 +2425,49 @@ impl DirectProjection {
             },
             |_, _| None,
         )
-        .ok()?;
-        self.ready_at(cache_generation).then_some(counts)
+        .reported(self)?;
+        self.answers(at).then_some(counts)
     }
 
     pub(crate) fn block_referrer_candidate_paths(
         &self,
-        cache_generation: u64,
+        at: ReadAt,
         uuid: &str,
     ) -> Option<std::collections::BTreeSet<PathBuf>> {
-        if !self.ready_at(cache_generation) {
-            return None;
-        }
         let uuid = Uuid::parse_str(uuid).ok()?.into_bytes();
-        let mut reader = self.shared.reader.lock().unwrap();
-        if reader.is_none() {
-            *reader = PhysicalGraphProjectionDatabase::open_read_only(&self.shared.path).ok();
-        }
+        let reader = self.shared_reader_at(at)?;
         let read = reader.as_ref()?.read();
-        let mut page_ids = std::collections::BTreeSet::new();
+        let mut paths = std::collections::BTreeSet::new();
         drain_after(
             |after, batch| read.block_referrer_candidates_after(uuid, after, batch),
-            |row| (row.source_page_id, row.source_block_id),
+            |row| (row.page_cursor, row.block_cursor),
             |row| {
-                page_ids.insert(row.source_page_id);
+                paths.insert(PathBuf::from(row.source_page_path));
                 Ok(())
             },
             |_, _| None,
         )
-        .ok()?;
-        let mut paths = std::collections::BTreeSet::new();
-        for page_id in page_ids {
-            let page = read
-                .page_with_header_validation(page_id, |_, _| Ok(()))
-                .ok()??;
-            paths.insert(PathBuf::from(page.path));
-        }
-        self.ready_at(cache_generation).then_some(paths)
+        .reported(self)?;
+        self.answers(at).then_some(paths)
     }
 
     pub(crate) fn ready_at(&self, generation: u64) -> bool {
         self.shared.ready_at(generation)
+    }
+
+    /// Whether the index may answer a read at `at`: ready at its generation,
+    /// or, for a [`Currency::LaunchStored`] read, serving the stored image
+    /// during the launch check ([`owner::serving_stored`]).
+    pub(crate) fn answers(&self, at: ReadAt) -> bool {
+        self.ready_at(at.generation)
+            || (at.currency == Currency::LaunchStored && self.serving_stored())
+    }
+
+    /// Whether the index answers `LaunchStored` reads from the image the last
+    /// session left, before the launch check has validated it (design D2).
+    pub(crate) fn serving_stored(&self) -> bool {
+        let pending = self.shared.pending.lock().unwrap();
+        owner::serving_stored(&self.shared, &pending)
     }
 
     /// RET2's readiness lifecycle: why this generation is not ready, and what
@@ -1787,127 +2476,33 @@ impl DirectProjection {
     /// The order of the tests is the order of authority.
     ///
     /// * `worker_available` is stored `false` exactly where the worker thread
-    ///   gives up for good — no parent directory, an unopenable database, a
-    ///   writer lease another instance owns, or a `stop` turn. Nothing this
+    ///   gives up for good — no parent directory, an unopenable database, or
+    ///   a `stop` turn. A writer waiting for the lease reads the same way
+    ///   while it waits, but takes its queue once it has the lease. Nothing this
     ///   graph enqueues afterwards is ever taken, so retrying is endless by
     ///   construction and the caller owes a bounded error instead.
     /// * A queued turn is progress even when the LAST turn failed:
     ///   `worker_failed` stays set until the next successful turn, and the
     ///   repair that clears it is exactly the `full`/`rebuild` work below.
     /// * A failed worker with an EMPTY queue is the stale-idle case: the turn
-    ///   failed, `requires_full_rebuild` latched inside the worker, and until
-    ///   a complete source inventory arrives every further delta turn refuses.
-    ///   That is a repair, not a wait.
+    ///   failed on a damaged image, `rebuild` is owed, and only a fresh build
+    ///   clears it. That is a repair, not a wait.
     pub(crate) fn progress_at(&self, generation: u64) -> ProjectionProgress {
-        use crate::query::QueryReadinessReason as Reason;
+        // Readiness is published under this lock, by the turn that empties
+        // the queue. Read before the lock, "not ready" and "nothing queued"
+        // came from either side of that publication, and a projection that
+        // had just become ready read as stale (GH #543).
+        let pending = self.shared.pending.lock().unwrap();
         if self.ready_at(generation) {
             return ProjectionProgress::Ready;
         }
-        let pending = self.shared.pending.lock().unwrap();
-        if pending.stop || !self.shared.worker_available.load(Ordering::Acquire) {
-            return ProjectionProgress::Stopped;
+        // One state function answers this and "is work coming" (GH #594 L2).
+        match owner::index_state(&self.shared, &pending) {
+            owner::IndexState::Stopped => ProjectionProgress::Stopped,
+            owner::IndexState::Failed(class) => ProjectionProgress::Failed(class),
+            owner::IndexState::Working(reason) => ProjectionProgress::Working(reason),
+            owner::IndexState::Idle => ProjectionProgress::Stale,
         }
-        if pending.rebuild || pending.needs_full || pending.full.is_some() {
-            return ProjectionProgress::Working(Reason::Recovering);
-        }
-        if self.shared.repairs_in_flight.load(Ordering::Acquire) > 0 {
-            return ProjectionProgress::Working(Reason::Recovering);
-        }
-        if pending.warm.is_some() || pending.warm_stream.is_some() || pending.order.is_some() {
-            return ProjectionProgress::Working(Reason::Indexing);
-        }
-        if !pending.deltas.is_empty() {
-            return ProjectionProgress::Working(Reason::PendingEdits);
-        }
-        if self.shared.worker_failed.load(Ordering::Acquire) {
-            // The queue is empty and the last turn failed: nothing is coming.
-            return ProjectionProgress::Stale;
-        }
-        if self.shared.worker_busy.load(Ordering::Acquire) {
-            return ProjectionProgress::Working(Reason::Busy);
-        }
-        ProjectionProgress::Stale
-    }
-
-    /// Test diagnostic: the queue and readiness state in one line, for a
-    /// convergence failure that would otherwise be a bare timeout.
-    #[cfg(test)]
-    pub(crate) fn debug_state_test(&self) -> String {
-        let pending = self.shared.pending.lock().unwrap();
-        format!(
-            "ready={} validated={} ready_generation={} latest_generation={} full={} deltas={} warm={} warm_outcome={:?} warm_stream={:?} order={:?} superseded={} needs_full={} rebuild={} stop={} page_order={} worker_available={} worker_failed={} worker_busy={}",
-            self.shared.ready.load(Ordering::Acquire),
-            self.shared.validated.load(Ordering::Acquire),
-            self.shared.ready_generation.load(Ordering::Acquire),
-            pending.latest_generation,
-            pending.full.is_some(),
-            pending.deltas.len(),
-            pending.warm.is_some(),
-            pending.warm_outcome.as_ref().map(|outcome| match outcome {
-                WarmOutcome::Clean => "Clean".to_owned(),
-                WarmOutcome::Replacements(pages) => format!("Replacements({})", pages.len()),
-                WarmOutcome::Superseded => "Superseded".to_owned(),
-                WarmOutcome::Failed => "Failed".to_owned(),
-            }),
-            pending.warm_stream,
-            pending.order,
-            pending.warm_superseded,
-            pending.needs_full,
-            pending.rebuild,
-            pending.stop,
-            pending.page_order.len(),
-            self.shared.worker_available.load(Ordering::Acquire),
-            self.shared.worker_failed.load(Ordering::Acquire),
-            self.shared.worker_busy.load(Ordering::Acquire),
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn indexed_reads(&self) -> u64 {
-        self.shared.indexed_reads.load(Ordering::Relaxed)
-    }
-
-    /// Close this projection's query-job admission, the way `Drop` does when a
-    /// graph is closing. Every later `open_query_job` is `Cancelled`, which is
-    /// the ONE §5.9 state a public query must never repair or retry.
-    #[cfg(test)]
-    pub(crate) fn close_query_jobs_test(&self) {
-        let fence = self.shared.query_jobs.begin_close();
-        self.shared.query_jobs.wait_for_drain(fence);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn inject_next_statement_failure(&self) {
-        self.shared
-            .inject_read_failure
-            .store(true, Ordering::Release);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn statement_reads(&self) -> u64 {
-        self.shared.statement_reads.load(Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn take_registry_capture_attempts(&self) -> u64 {
-        self.shared
-            .registry_capture_attempts
-            .swap(0, Ordering::AcqRel)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fallback_reads(&self) -> u64 {
-        self.shared.fallback_reads.load(Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn referenced_name_reads(&self) -> u64 {
-        self.shared.referenced_name_reads.load(Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fuzzy_candidate_reads(&self) -> u64 {
-        self.shared.fuzzy_candidate_reads.load(Ordering::Relaxed)
     }
 
     /// R3: refuse new jobs, interrupt the active ones and wait for their slots
@@ -1941,6 +2536,12 @@ impl DirectProjection {
     ///
     /// A `stop` turn is taken as soon as the worker reaches the top of its
     /// loop, so the bound is one in-flight apply, never a queue.
+    /// [`DirectProjection::close`] without waiting: callable from the worker.
+    #[cfg(test)]
+    pub(crate) fn close_test(&self) {
+        self.close();
+    }
+
     pub(crate) fn close_and_wait_for_worker(&self, timeout: std::time::Duration) -> bool {
         self.close();
         let started = std::time::Instant::now();
@@ -1988,12 +2589,47 @@ const PROJECTION_UPDATE_FAILURE: &str = "is stale; indexed reads are unavailable
 ///
 /// The always-on line names the failure family in fixed words and carries
 /// nothing else. I-5: the detail at both call sites is free-form prose from the
-/// projection WRITE path, and that path names the graph — `apply_pending`
+/// projection WRITE path, and that path names the graph — `apply_deltas`
 /// formats `entry.rel_path` straight into its error string, and
 /// `MaterializationError`'s payloads are free-form `String`s produced while
 /// storing parsed page text. I-9: the family still reaches the always-on
 /// record, because a user who is not running under `TINE_DEBUG` otherwise sees
 /// only an unavailable index. The prose stays on the directed debug channel.
+/// Process-relative clock for [`projection_diag`], started at the first line.
+static PROJECTION_DIAG_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Lines emitted this process, so the gating is checkable rather than asserted
+/// in a comment (I-11); a test cannot read stderr.
+#[cfg(test)]
+static PROJECTION_DIAG_LINES: AtomicU64 = AtomicU64::new(0);
+
+/// One directed projection-lifecycle line, on the SAME opt-in channel as every
+/// other runtime diagnostic (`TINE_DEBUG=1` / `--debug`, I-12).
+///
+/// GH #543: the Windows verify probe could say only that a 10,000-page cold
+/// open took 139 s with the switcher stuck on "Indexing 0 of 10,001"; the
+/// app's debug log stopped at "Direct Files publish" and the next 105 s were
+/// unobserved, so no run could say which worker turn was running or why. The
+/// message is built behind a `FnOnce` so a process without diagnostics pays
+/// one relaxed atomic load and formats nothing.
+pub(crate) fn projection_diag(message: impl FnOnce() -> String) {
+    if !crate::backend_error::runtime_debug_diagnostics_enabled() {
+        return;
+    }
+    #[cfg(test)]
+    PROJECTION_DIAG_LINES.fetch_add(1, Ordering::Relaxed);
+    let elapsed = PROJECTION_DIAG_EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis();
+    eprintln!("[tine] projection +{elapsed}ms {}", message());
+}
+
+#[cfg(test)]
+pub(crate) fn projection_diag_lines_test() -> u64 {
+    PROJECTION_DIAG_LINES.load(Ordering::Relaxed)
+}
+
 fn report_projection_failure(family: &str, detail: &dyn std::fmt::Display) {
     #[cfg(test)]
     REPORTED_PROJECTION_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -2017,25 +2653,12 @@ pub(crate) fn reported_projection_failures_test() -> u64 {
     REPORTED_PROJECTION_FAILURES.load(Ordering::Relaxed)
 }
 
-/// Why one worker turn produced no serving image.
-///
-/// The two arms leave the SAME state behind — `requires_full_rebuild` latched,
-/// `worker_failed` set, readiness withdrawn — because in both cases only a
-/// complete source inventory may publish readiness again. They differ in ONE
-/// thing: whether a user is told the index broke.
-///
-/// `AwaitingFullInventory` is not a failure and must never reach the always-on
-/// channel. It is the ordinary cold-open handoff: an edit or an external write
-/// (Syncthing, an external editor) raced the warm stream, `stream_warm_replacements`
-/// abandoned it, `abandon_warm_stream` set `needs_full`, and the next turn
-/// carried only deltas. The parser fallback is ALREADY on its way with the full
-/// snapshot that repairs this; nothing is wrong and nothing is owed by the user.
-/// Reporting it printed `PROJECTION_UPDATE_FAILURE` once per delta turn, so a
-/// cold open under sync traffic emitted the alarming line hundreds of times
-/// (Martin, 2026-09-10) while queries answered correctly throughout.
+/// Why one worker turn produced no serving image: a write failed (the user
+/// is told, and K1 decides whether a new image is owed), or the projection is
+/// closing (nothing is owed and nothing is reported).
 enum ProjectionRefusal {
-    AwaitingFullInventory,
     Failed(String),
+    Stopped,
 }
 
 impl ProjectionRefusal {
@@ -2049,16 +2672,25 @@ impl ProjectionRefusal {
 impl std::fmt::Display for ProjectionRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::AwaitingFullInventory => {
-                f.write_str("a complete source inventory is owed before deltas can lower again")
-            }
             Self::Failed(error) => f.write_str(error),
+            Self::Stopped => f.write_str("projection stopped before staged publication"),
         }
     }
 }
 
 /// Lives for one repair attempt; see `DirectProjection::begin_repair`.
 pub(crate) struct RepairInFlight(Arc<ProjectionShared>);
+
+/// Lives from a generation move until the mover has queued the delta that
+/// describes it; see `DirectProjection::delta_coming`.
+pub(crate) struct DeltaComing(Arc<ProjectionShared>);
+
+impl Drop for DeltaComing {
+    fn drop(&mut self) {
+        self.0.deltas_coming.fetch_sub(1, Ordering::AcqRel);
+        self.0.changed.notify_all();
+    }
+}
 
 impl Drop for RepairInFlight {
     fn drop(&mut self) {
@@ -2067,7 +2699,19 @@ impl Drop for RepairInFlight {
     }
 }
 
-fn projection_worker(shared: Arc<ProjectionShared>) {
+/// The worker could not set up its image and exits: the index is `Failed`
+/// with the error's class, as after its last attempt, so readers are told and
+/// the user can retry, instead of a silent "unavailable" (GH #594 L1).
+fn worker_cannot_start(shared: &ProjectionShared, error: &str) {
+    owner::note_failed(
+        &mut shared.pending.lock().unwrap(),
+        crate::query::IndexFailureClass::of_message(error),
+    );
+    shared.worker_available.store(false, Ordering::Release);
+    shared.changed.notify_all();
+}
+
+fn projection_worker(shared: Arc<ProjectionShared>, launch_config: Option<Arc<ParseConfig>>) {
     // FIRST local, so it is the LAST thing dropped: the writer connection and
     // the exclusive lease below are both released before the exit is published.
     let _exit = ProjectionWorkerExit(Arc::clone(&shared));
@@ -2078,50 +2722,75 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
     };
     if let Err(error) = std::fs::create_dir_all(parent) {
         eprintln!("[tine] Direct Files SQLite projection disabled: create directory: {error}");
+        worker_cannot_start(&shared, &error.to_string());
+        return;
+    }
+    // Waits, retrying, while another writer holds the lease; `None` only
+    // when this projection is closed meanwhile.
+    let Some(_lease) = lease::take_writer_lease(&shared) else {
         shared.worker_available.store(false, Ordering::Release);
         shared.changed.notify_all();
         return;
+    };
+    let publication_directory =
+        projection_publication_names(&shared.path).and_then(|(parent, _, destination)| {
+            let directory = Dir::open_ambient_dir(&parent, ambient_authority())
+                .map_err(|error| error.to_string())?;
+            cleanup_projection_stages(&directory, &destination)
+        });
+    if let Err(error) = publication_directory {
+        report_projection_failure(PROJECTION_UPDATE_FAILURE, &error);
+        worker_cannot_start(&shared, &error);
+        return;
     }
-    let lease_path = shared.path.with_extension("sqlite.writer.lock");
-    let lease = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lease_path)
-        .and_then(|file| {
-            file.try_lock_exclusive()?;
-            Ok(file)
-        }) {
-        Ok(lease) => lease,
-        Err(error) => {
-            eprintln!(
-                "[tine] Direct Files SQLite projection unavailable; another graph instance owns it or its lease cannot be opened: {error}"
-            );
-            shared.worker_available.store(false, Ordering::Release);
-            shared.changed.notify_all();
-            return;
+    let mut writer_slot = open_existing_projection_database(&shared);
+    // Every stored row was written under this facts version and this parse
+    // configuration: the image may answer display reads before the launch
+    // check validates it. After a configuration or facts change it answers
+    // nothing until the fresh build the check then owes (design D2).
+    let stored_config = launch_config.filter(|config| {
+        writer_slot.is_some()
+            && derived_reads::stored_facts_are(
+                &shared.path,
+                &projection_source_revision("", config.digest()),
+            )
+    });
+    {
+        let mut pending = shared.pending.lock().unwrap();
+        // No image: only a fresh build can give it one.
+        pending.rebuild |= writer_slot.is_none();
+        pending.set_up = true;
+        pending.stored_servable = stored_config.is_some();
+        // Queries capture beside the committed property registry: read it
+        // now, so a stored image answers them before the check (design D2).
+        if pending.registry_owed.is_none() {
+            pending.registry_owed = stored_config;
         }
-    };
-    let mut writer_slot = match open_projection_database(&shared.path) {
-        Ok(database) => Some(database),
-        Err(error) => {
-            report_projection_failure("disabled: its database could not be opened", &error);
-            shared.worker_available.store(false, Ordering::Release);
-            shared.changed.notify_all();
-            return;
-        }
-    };
-    // The lock file is app-private disposable state. Retain its exclusive lock
-    // for the complete writer lifetime so another Graph instance cannot replace
-    // this database's facts behind a locally-ready generation watermark.
-    let _lease = lease;
-    let mut requires_full_rebuild = false;
+    }
+    shared.changed.notify_all();
+    if writer_slot.is_some() {
+        integrity::start_if_due(&shared);
+    }
     loop {
         let turn = {
             let mut pending = shared.pending.lock().unwrap();
-            while !pending.has_work() && pending.captures.is_empty() && !pending.stop {
-                pending = shared.changed.wait(pending).unwrap();
+            while !pending.worker_can_take() && pending.captures.is_empty() && !pending.stop {
+                // Marks a failed turn returned wait out the backoff; wake at
+                // its end rather than on the next unrelated notification.
+                let wait = pending
+                    .retry_after
+                    .filter(|_| !pending.marks.is_empty() || pending.registry_owed.is_some())
+                    .map(|at| at.saturating_duration_since(std::time::Instant::now()));
+                pending = match wait {
+                    Some(wait) => {
+                        shared
+                            .changed
+                            .wait_timeout(pending, wait.max(std::time::Duration::from_millis(1)))
+                            .unwrap()
+                            .0
+                    }
+                    None => shared.changed.wait(pending).unwrap(),
+                };
             }
             if pending.stop {
                 shared.worker_available.store(false, Ordering::Release);
@@ -2143,70 +2812,47 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
             if pending.stop {
                 return;
             }
-            if !pending.has_work() {
+            if !pending.worker_can_take() {
                 continue;
             }
             shared.worker_busy.store(true, Ordering::Release);
-            if std::mem::take(&mut pending.needs_full) {
-                requires_full_rebuild = true;
-            }
-            let rebuild = (pending.full.is_some() || pending.warm.is_some())
-                && std::mem::take(&mut pending.rebuild);
-            // R6: a full snapshot queued beside a warm validation owns
-            // readiness; the warm is dropped as superseded.
-            let warm = if pending.full.is_some() {
-                if pending.warm.take().is_some() {
-                    pending.warm_stream = None;
-                    pending.warm_superseded = true;
-                    pending.warm_outcome = Some(WarmOutcome::Superseded);
-                }
+            let full = pending.full.take();
+            pending.building = full.is_some();
+            let marks = std::mem::take(&mut pending.marks);
+            pending.in_flight = marks.clone();
+            let registry_owed = if full.is_some() {
+                pending.registry_owed = None;
                 None
             } else {
-                pending.warm.take()
+                pending.registry_owed.take()
             };
-            let order = pending.order.take();
-            let deltas = std::mem::take(&mut pending.deltas);
-            let unordered = deltas.values().any(|(_, delta)| {
-                matches!(
-                    delta,
-                    PageDelta::Replace {
-                        query_page_order: None,
-                        ..
-                    }
-                )
-            });
-            let inventory = (order.is_some() || warm.is_some() || unordered)
-                .then(|| pending.ordered_inventory());
             WorkerTurn {
-                full: pending.full.take(),
-                warm,
-                deltas,
-                order,
-                inventory,
-                stream_open: pending.warm_stream.is_some(),
+                full,
+                marks,
+                registry_owed,
                 latest_generation: pending.latest_generation,
-                rebuild,
             }
         };
         let WorkerTurn {
             full,
-            warm,
-            deltas,
-            order,
-            inventory,
-            stream_open,
+            marks,
+            registry_owed,
             latest_generation,
-            rebuild,
         } = turn;
-        let had_full = full.is_some();
-        let had_warm = warm.is_some();
-        let stream_closed = order.is_some();
+        let fresh_build = full.is_some();
+        let turn_started = std::time::Instant::now();
+        projection_diag(|| {
+            format!(
+                "turn begin fresh_build={fresh_build} marks={} generation={latest_generation}",
+                marks.len(),
+            )
+        });
         let registry_config = full
             .as_ref()
             .map(|full| Arc::clone(&full.parse_config))
-            .or_else(|| warm.as_ref().map(|warm| Arc::clone(&warm.parse_config)))
+            .or_else(|| registry_owed.clone())
             .or_else(|| {
-                deltas
+                marks
                     .values()
                     .filter_map(|(generation, delta)| match delta {
                         PageDelta::Replace { parse_config, .. } => Some((generation, parse_config)),
@@ -2215,7 +2861,8 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                     .max_by_key(|(generation, _)| *generation)
                     .map(|(_, config)| Arc::clone(config))
             });
-        let registry_reset = had_full || had_warm || rebuild || requires_full_rebuild;
+        // A changed parse configuration differs on every page: marks lowered
+        // under it replace rows the open query jobs read under the old one.
         let config_changed = registry_config.as_ref().is_some_and(|config| {
             shared
                 .committed_registry
@@ -2224,211 +2871,249 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
                 .as_ref()
                 .is_some_and(|owner| owner.config.digest() != config.digest())
         });
-        let touched_pages = deltas
+        shared
+            .fresh_build_running
+            .store(fresh_build, Ordering::Release);
+        let registry_reset = fresh_build || registry_owed.is_some();
+        let touched_pages = marks
             .values()
-            .map(|(_, delta)| page_id(&delta.entry().rel_path))
+            .map(|(_, delta)| delta.entry().rel_path.clone())
             .collect::<std::collections::BTreeSet<_>>();
+        // The launch's registry-only turn (design D2) applies nothing: a test
+        // holding "the next apply" means the survey's work after it.
         #[cfg(test)]
-        run_before_apply_pending_hook();
-        let applied: Result<AppliedTurn, ProjectionRefusal> = if requires_full_rebuild
-            && !had_full
-            && !had_warm
-        {
-            // NOT necessarily a prior failure: `abandon_warm_stream` sets
-            // `needs_full` on ordinary generation drift. See `ProjectionRefusal`.
-            Err(ProjectionRefusal::AwaitingFullInventory)
-        } else {
-            (|| {
-                if config_changed && !(rebuild || requires_full_rebuild || writer_slot.is_none()) {
-                    let fence = shared.cancel_queued_captures(false);
-                    shared.query_jobs.wait_for_drain(fence);
-                }
-                if rebuild || requires_full_rebuild || writer_slot.is_none() {
-                    // R3: interrupt and drain every query job first, so no
-                    // owned snapshot retains a handle to the file about to be
-                    // reset or removed, and the rebuild never waits on a read
-                    // nobody will finish. In-scope scenario: a torn projection
-                    // rebuilt under a live reader (D-3).
-                    let fence = shared.cancel_queued_captures(false);
-                    shared.query_jobs.wait_for_drain(fence);
-                    // Drop every connection before the disposable file can be
-                    // replaced; a reader must not retain an old file handle.
-                    let mut reader = shared.reader.lock().unwrap();
-                    reader.take();
-                    writer_slot.take();
-                    let mut database = open_projection_database(&shared.path)
-                        .map_err(|error| error.to_string())?;
-                    // Even repaired DDL leaves unchanged source stamps behind.
-                    // Reset them so the complete inventory relowers every source page.
-                    database.reset().map_err(|error| error.to_string())?;
-                    writer_slot = Some(database);
-                }
-                let registry_before = if !registry_reset
+        if fresh_build || !marks.is_empty() || shared.validated.load(Ordering::Acquire) {
+            run_before_apply_deltas_hook(&shared.path);
+        }
+        let applied: Result<AppliedTurn, ProjectionRefusal> = (|| {
+            #[cfg(test)]
+            if shared
+                .inject_turn_failure
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(ProjectionRefusal::Failed(
+                    "injected turn failure".to_owned(),
+                ));
+            }
+            if config_changed && !fresh_build {
+                let fence = shared.cancel_queued_captures(false);
+                shared.query_jobs.wait_for_drain(fence);
+            }
+            let registry_before = if !registry_reset
+                && !touched_pages.is_empty()
+                && shared.committed_registry.lock().unwrap().is_some()
+            {
+                let mut snapshot =
+                    PhysicalProjectionQuerySnapshot::open_direct(&shared.path, || Ok(()))
+                        .map_err(|error| ProjectionRefusal::Failed(error.to_string()))?;
+                registry_sql::read_page_registry_metadata(&mut snapshot, &touched_pages)
+                    .map_err(|error| ProjectionRefusal::Failed(error.to_string()))?
+            } else {
+                PageRegistryMetadata::new()
+            };
+
+            let mut applied = if let Some(full) = full {
+                // A healthy image lends the build the rows of the pages the
+                // snapshot could not read (`carried`).
+                let carry = writer_slot
+                    .as_ref()
+                    .is_some_and(|database| projection_image_is_healthy(&shared, database));
+                let (database, applied) = build_and_publish_fresh_projection(
+                    &shared,
+                    writer_slot.take(),
+                    full,
+                    marks,
+                    carry,
+                )
+                .map_err(ProjectionRefusal::from)?;
+                writer_slot = Some(database);
+                applied
+            } else if marks.is_empty() {
+                // Only the registry was owed.
+                AppliedTurn::default()
+            } else {
+                let database = writer_slot.as_mut().ok_or_else(|| {
+                    ProjectionRefusal::Failed("no stored image to apply marks to".to_owned())
+                })?;
+                apply_deltas(database, &shared, marks).map_err(ProjectionRefusal::from)?
+            };
+
+            let (revision, registry_after) = {
+                let mut snapshot =
+                    PhysicalProjectionQuerySnapshot::open_direct(&shared.path, || Ok(()))
+                        .map_err(|error| ProjectionRefusal::Failed(error.to_string()))?;
+                let revision = snapshot
+                    .query_revision()
+                    .map_err(|error| ProjectionRefusal::Failed(error.to_string()))?;
+                let registry_after = if !registry_reset
                     && !touched_pages.is_empty()
                     && shared.committed_registry.lock().unwrap().is_some()
                 {
-                    let mut snapshot =
-                        PhysicalProjectionQuerySnapshot::open_direct(&shared.path, || Ok(()))
-                            .map_err(|error| error.to_string())?;
                     registry_sql::read_page_registry_metadata(&mut snapshot, &touched_pages)
-                        .map_err(|error| error.to_string())?
+                        .map_err(|error| ProjectionRefusal::Failed(error.to_string()))?
                 } else {
                     PageRegistryMetadata::new()
                 };
-                let mut applied =
-                    apply_pending(writer_slot.as_mut().unwrap(), full, warm.as_ref(), deltas)?;
-                // R6: the stream's closing turn (or a `Clean` warm turn, or a
-                // turn that lowered mid-stream deltas without positions)
-                // reconciles the order table over the queue's inventory. The
-                // queue's map tracks every applied replacement and deletion
-                // since its seed, so it names exactly the projected pages.
-                let warm_clean = matches!(applied.warm_outcome, Some(WarmOutcome::Clean));
-                applied.stream_open = if had_warm {
-                    matches!(applied.warm_outcome, Some(WarmOutcome::Replacements(_)))
-                } else {
-                    stream_open && !stream_closed
-                };
-                if !applied.stream_open
-                    && (stream_closed || warm_clean || applied.unordered_replacements)
-                {
-                    let inventory = inventory.ok_or_else(|| {
-                        "the order turn ran without its queue inventory".to_owned()
-                    })?;
-                    writer_slot
-                        .as_mut()
-                        .unwrap()
-                        .apply_with_source_revisions_aliases_and_page_order(
-                            &PhysicalGraphProjectionChange {
-                                replacements: Vec::new(),
-                                deletions: Vec::new(),
-                                reference_postings: Vec::new(),
-                            },
-                            &[],
-                            &[],
-                            &inventory,
-                        )
-                        .map_err(|error| error.to_string())?;
-                }
-                // All SQL writes, including the separate ordering transaction,
-                // have completed. No maintenance transaction survives a write.
-                let revision = {
-                    let mut snapshot =
-                        PhysicalProjectionQuerySnapshot::open_direct(&shared.path, || Ok(()))
-                            .map_err(|error| error.to_string())?;
-                    snapshot
-                        .query_revision()
-                        .map_err(|error| error.to_string())?
-                };
-                #[cfg(test)]
-                if let Some(hook) = shared.after_sql_commit.lock().unwrap().take() {
+                (revision, registry_after)
+            };
+            applied.registry_pages = registry_after;
+            #[cfg(test)]
+            {
+                let hook = shared.after_sql_commit.lock().unwrap().take();
+                if let Some(hook) = hook {
                     hook();
                 }
-                shared.record_session_pages(&applied.pages);
-                let changes =
-                    registry_sql::registry_changes(&registry_before, &applied.registry_pages);
-                let mut registry = shared.committed_registry.lock().unwrap();
-                let config = registry_config
-                    .as_ref()
-                    .cloned()
-                    .or_else(|| registry.as_ref().map(|owner| Arc::clone(&owner.config)));
-                if let Some(config) = config {
-                    match registry.as_mut() {
-                        Some(owner)
-                            if !registry_reset && owner.config.digest() == config.digest() =>
-                        {
-                            owner
-                                .cache
-                                .committed(
-                                    revision,
-                                    changes.normalized_keys,
-                                    changes.declaration_page_names,
-                                )
-                                .map_err(|error| error.to_string())?;
-                        }
-                        Some(owner) => {
-                            owner.cache.reset(revision, &config);
-                            owner.config = config;
-                        }
-                        None => {
-                            *registry = Some(CommittedRegistryOwner {
-                                cache: CommittedRegistryCache::new(revision, &config),
-                                config,
-                            })
-                        }
+            }
+            shared.record_deleted_pages(&applied.pages);
+            let changes = registry_sql::registry_changes(&registry_before, &applied.registry_pages);
+            let mut registry = shared.committed_registry.lock().unwrap();
+            let config = registry_config
+                .as_ref()
+                .cloned()
+                .or_else(|| registry.as_ref().map(|owner| Arc::clone(&owner.config)));
+            if let Some(config) = config {
+                match registry.as_mut() {
+                    Some(owner) if !registry_reset && owner.config.digest() == config.digest() => {
+                        owner
+                            .cache
+                            .committed(
+                                revision,
+                                changes.normalized_keys,
+                                changes.declaration_page_names,
+                            )
+                            .map_err(|error| ProjectionRefusal::Failed(error.to_string()))?;
+                    }
+                    Some(owner) => {
+                        owner.cache.reset(revision, &config);
+                        owner.config = config;
+                    }
+                    None => {
+                        *registry = Some(CommittedRegistryOwner {
+                            cache: CommittedRegistryCache::new(revision, &config),
+                            config,
+                        })
                     }
                 }
-                drop(registry);
-                Ok(applied)
-            })()
-            .map_err(ProjectionRefusal::Failed)
-        };
+            }
+            Ok(applied)
+        })();
         let applied = match applied {
             Ok(applied) => applied,
             Err(error) => {
-                shared.committed_registry.lock().unwrap().take();
-                requires_full_rebuild = true;
                 shared.ready.store(false, Ordering::Release);
-                shared.worker_failed.store(true, Ordering::Release);
-                {
-                    let mut pending = shared.pending.lock().unwrap();
-                    if had_warm {
-                        pending.warm_outcome = Some(WarmOutcome::Failed);
+                // K1: a failed turn owes a new image only when it was building
+                // one (the old image went with it) or the image is damaged.
+                // On an intact image the turn committed nothing (it is one
+                // transaction), and the marks it returns below re-lower its
+                // pages (audit R11-07). Asked before `pending`:
+                // the check reads the image.
+                let failure = match &error {
+                    ProjectionRefusal::Failed(message) => {
+                        Some(owner::IndexFailure::of_turn(message))
                     }
-                    if had_warm || stream_closed {
-                        pending.warm_stream = None;
-                        pending.order = None;
-                    }
+                    ProjectionRefusal::Stopped => None,
+                };
+                let owes_new_image = failure.is_some_and(|failure| {
+                    fresh_build || owner::failure_owes_new_image(&shared, failure)
+                });
+                // A fresh build that violates a constraint (a Tine defect no
+                // rebuild fixes) is not relowered on every backoff: like any
+                // failure it has `INDEX_ATTEMPTS`, then the index is `Failed`
+                // (audit R15-08; GH #594 L1).
+                if matches!(error, ProjectionRefusal::Failed(_)) {
+                    // Taken before `pending`: never hold both.
+                    shared.committed_registry.lock().unwrap().take();
+                    #[cfg(test)]
+                    shared.last_turn_failed.store(true, Ordering::Release);
                 }
+                let mut pending = shared.pending.lock().unwrap();
+                pending.building = false;
+                if pending.full.is_none() {
+                    pending.snapshot = None;
+                }
+                shared.fresh_build_running.store(false, Ordering::Release);
+                if matches!(error, ProjectionRefusal::Stopped) {
+                    shared.worker_busy.store(false, Ordering::Release);
+                    shared.worker_available.store(false, Ordering::Release);
+                    drop(pending);
+                    shared.changed.notify_all();
+                    return;
+                }
+                // The turn's marks go back, unless a newer one arrived.
+                for (_, (generation, delta)) in std::mem::take(&mut pending.in_flight) {
+                    pending.record_mark(generation, delta);
+                }
+                if pending.registry_owed.is_none() && pending.full.is_none() {
+                    pending.registry_owed = registry_owed;
+                }
+                if owes_new_image {
+                    shared.worker_failed.store(true, Ordering::Release);
+                }
+                if owes_new_image {
+                    pending.rebuild = true;
+                }
+                let class = match &error {
+                    ProjectionRefusal::Failed(message) => {
+                        crate::query::IndexFailureClass::of_message(message)
+                    }
+                    ProjectionRefusal::Stopped => crate::query::IndexFailureClass::Other,
+                };
+                note_unsettled(&mut pending, class);
                 shared.worker_busy.store(false, Ordering::Release);
+                drop(pending);
                 shared.changed.notify_all();
                 if error.is_reportable_failure() {
                     report_projection_failure(PROJECTION_UPDATE_FAILURE, &error);
-                } else if crate::backend_error::runtime_debug_diagnostics_enabled() {
-                    eprintln!("[tine] Direct Files SQLite projection deferred this turn: {error}");
+                } else {
+                    projection_diag(|| {
+                        format!(
+                            "turn deferred after {}ms: {error}",
+                            turn_started.elapsed().as_millis()
+                        )
+                    });
                 }
                 continue;
             }
         };
-        if had_full || had_warm {
-            requires_full_rebuild = false;
-        }
-        if had_full || stream_closed || matches!(applied.warm_outcome, Some(WarmOutcome::Clean)) {
+        shared.worker_failed.store(false, Ordering::Release);
+        #[cfg(test)]
+        shared.last_turn_failed.store(false, Ordering::Release);
+        projection_diag(|| {
+            format!(
+                "turn applied in {}ms lowered={} deleted={} fresh_build={fresh_build}",
+                turn_started.elapsed().as_millis(),
+                applied.pages.lowered.len(),
+                applied.pages.deleted.len(),
+            )
+        });
+        let mut pending = shared.pending.lock().unwrap();
+        if fresh_build {
+            // A rebuild asked for while this build ran was asked of the image
+            // it has just replaced (audit R12-01; IT-10's second build).
+            pending.rebuild = false;
             shared.validated.store(true, Ordering::Release);
         }
-        shared.worker_failed.store(false, Ordering::Release);
-        let mut pending = shared.pending.lock().unwrap();
+        shared.fresh_build_running.store(false, Ordering::Release);
+        for (path, (generation, _)) in std::mem::take(&mut pending.in_flight) {
+            let held = pending.applied.entry(path).or_insert(0);
+            *held = (*held).max(generation);
+        }
+        pending.building = false;
+        if pending.full.is_none() {
+            pending.snapshot = None;
+        }
         shared.worker_busy.store(false, Ordering::Release);
-        if had_warm {
-            // A `Replacements` outcome keeps the stream open at its generation
-            // and readiness waits for the closing order turn; any other
-            // outcome closes the stream this warm opened.
-            if !applied.stream_open {
-                pending.warm_stream = None;
-            }
-            if pending.warm_outcome.is_none() && !pending.warm_superseded {
-                pending.warm_outcome = applied.warm_outcome.clone();
-            }
-        }
-        if stream_closed {
-            pending.warm_stream = None;
-        }
-        if !pending.rebuild
-            && !pending.has_work()
-            && pending.warm_stream.is_none()
-            && pending.latest_generation == latest_generation
-            && shared.validated.load(Ordering::Acquire)
-        {
-            shared
-                .ready_generation
-                .store(latest_generation, Ordering::Release);
-            shared.ready.store(true, Ordering::Release);
-        }
+        publish_if_current(&shared, &mut pending);
         drop(pending);
         shared.changed.notify_all();
+        checkpoint::start_if_due(&shared);
         // Source-change events may have preceded this commit. Wake the existing
         // application watcher after every serving-image publication, without
         // retaining a query or requiring any edit to be covered by its read.
-        if shared.validated.load(Ordering::Acquire) && !applied.stream_open {
+        if shared.validated.load(Ordering::Acquire) {
             shared.commit_notification.fetch_add(1, Ordering::Release);
             if let Some(wake) = shared.commit_waker.lock().unwrap().as_ref() {
                 let _ = wake.send(());
@@ -2437,662 +3122,492 @@ fn projection_worker(shared: Arc<ProjectionShared>) {
     }
 }
 
-/// One worker turn's queued work (R6 widened it beyond full + deltas).
-struct WorkerTurn {
-    full: Option<PendingFull>,
-    warm: Option<PendingWarm>,
-    deltas: BTreeMap<String, (u64, PageDelta)>,
-    order: Option<u64>,
-    /// The queue's inventory captured with the deltas, so the order turn
-    /// reconciles exactly the pages this turn leaves projected.
-    inventory: Option<Vec<[u8; 16]>>,
-    /// Whether a warm stream was open when the turn was taken.
-    stream_open: bool,
-    latest_generation: u64,
-    rebuild: bool,
+/// Publish readiness at the latest generation when the image answers for it
+/// ([`image_is_current`]), and withdraw it otherwise. The one place readiness
+/// is claimed: at the end of a worker turn, when the survey validates, when a
+/// dropped mark leaves nothing to wait for, and on a generation move with no
+/// index effect.
+fn publish_if_current(shared: &ProjectionShared, pending: &mut PendingProjection) {
+    if shared.worker_busy.load(Ordering::Acquire) {
+        return;
+    }
+    if image_is_current(shared, pending) {
+        let ready_generation = pending.latest_generation;
+        shared
+            .ready_generation
+            .store(ready_generation, Ordering::Release);
+        shared.ready.store(true, Ordering::Release);
+        pending.unsettled_passes = 0;
+        pending.retry_after = None;
+        projection_diag(|| format!("ready at generation={ready_generation}"));
+    } else {
+        shared.ready.store(false, Ordering::Release);
+    }
 }
 
-fn open_projection_database(
-    path: &Path,
-) -> Result<PhysicalGraphProjectionDatabase, tine_storage::sqlite::MaterializationError> {
-    let database = PhysicalGraphProjectionDatabase::open_writable(path)?;
-    if database.validate_schema().is_ok() && database.quick_check().is_ok() {
-        return Ok(database);
+/// One worker turn's queued work.
+struct WorkerTurn {
+    full: Option<PendingFull>,
+    marks: BTreeMap<String, Mark>,
+    registry_owed: Option<Arc<ParseConfig>>,
+    latest_generation: u64,
+}
+
+fn projection_image_is_healthy(
+    _shared: &ProjectionShared,
+    database: &PhysicalGraphProjectionDatabase,
+) -> bool {
+    #[cfg(test)]
+    _shared
+        .projection_health_checks
+        .fetch_add(1, Ordering::Relaxed);
+    database.validate_schema().is_ok() && database.quick_check().is_ok()
+}
+
+/// The stored image, if there is one this build can read. Only its schema is
+/// checked here: its integrity is checked in the background, and only when
+/// the OS may have gone down since the last check ([`integrity`], D1).
+fn open_existing_projection_database(
+    shared: &ProjectionShared,
+) -> Option<PhysicalGraphProjectionDatabase> {
+    if !shared.path.exists() {
+        return None;
     }
-    if database.initialize_schema().is_ok()
-        && database.validate_schema().is_ok()
-        && database.quick_check().is_ok()
-    {
-        return Ok(database);
+    let database = PhysicalGraphProjectionDatabase::open_writable(&shared.path).ok()?;
+    (database.validate_schema().is_ok() && configure_live_writer(&database).is_ok())
+        .then_some(database)
+}
+
+/// The worker's writer applies bounded turns: its statement journals fit in
+/// memory, and a cascaded multi-page delete then writes no second copy of the
+/// pages it touches (16-30 MB per 32-page batch on 10k pages, GH #543).
+/// Its commits never checkpoint the WAL either: [`checkpoint`] copies it on a
+/// thread of its own, so a turn publishes as soon as it commits.
+fn configure_live_writer(database: &PhysicalGraphProjectionDatabase) -> Result<(), String> {
+    database
+        .keep_temporary_files_in_memory()
+        .and_then(|()| database.disable_automatic_checkpoints())
+        .map_err(|error| error.to_string())
+}
+
+const PROJECTION_STAGE_MARKER: &str = ".tine-projection-build-";
+
+fn projection_publication_names(path: &Path) -> Result<(PathBuf, String, String), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "projection path has no parent directory".to_owned())?
+        .to_path_buf();
+    let destination = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "projection filename is not UTF-8".to_owned())?
+        .to_owned();
+    let source = format!(
+        ".{destination}{PROJECTION_STAGE_MARKER}{}",
+        Uuid::new_v4().simple()
+    );
+    Ok((parent, source, destination))
+}
+
+fn cleanup_projection_stages(directory: &Dir, destination: &str) -> Result<(), String> {
+    let prefix = format!(".{destination}{PROJECTION_STAGE_MARKER}");
+    for entry in directory.entries().map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let base = name
+            .strip_suffix("-wal")
+            .or_else(|| name.strip_suffix("-shm"))
+            .or_else(|| name.strip_suffix("-journal"))
+            .unwrap_or(name);
+        let Some(id) = base.strip_prefix(&prefix) else {
+            continue;
+        };
+        if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let metadata = directory
+            .symlink_metadata(name)
+            .map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "projection staging entry is not a regular file: {name}"
+            ));
+        }
+        directory
+            .remove_file(name)
+            .map_err(|error| error.to_string())?;
     }
-    drop(database);
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    Ok(())
+}
+
+fn cleanup_projection_stage_artifacts(directory: &Dir, stage_name: &str) -> Result<(), String> {
+    for name in [
+        stage_name.to_owned(),
+        format!("{stage_name}-wal"),
+        format!("{stage_name}-shm"),
+        format!("{stage_name}-journal"),
+    ] {
+        let metadata = match directory.symlink_metadata(&name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "projection staging artifact is not a regular file: {name}"
+            ));
+        }
+        directory
+            .remove_file(&name)
+            .map_err(|error| error.to_string())?;
     }
-    let database = PhysicalGraphProjectionDatabase::open_writable(path)?;
-    database.initialize_schema()?;
-    database.validate_schema()?;
-    Ok(database)
+    Ok(())
+}
+
+fn remove_projection_sidecar(directory: &Dir, name: &str) -> Result<(), String> {
+    let metadata = match directory.symlink_metadata(name) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!("projection sidecar is not a regular file: {name}"));
+    }
+    directory
+        .remove_file(name)
+        .map_err(|error| error.to_string())
+}
+
+use lowering::{delta_inputs, lower_in_batches, LoweringError, LoweringInput};
+
+impl From<LoweringError> for ProjectionRefusal {
+    fn from(error: LoweringError) -> Self {
+        match error {
+            LoweringError::Stopped => ProjectionRefusal::Stopped,
+            LoweringError::Failed(error) => ProjectionRefusal::Failed(error),
+        }
+    }
+}
+
+fn fresh_build_stopped(shared: &ProjectionShared) -> bool {
+    shared.pending.lock().unwrap().stop
+}
+
+/// Build `full` into a staged file and publish it over the image. The pages
+/// `full` could not read are lowered from what `old_writer`'s image stored for
+/// them when `carry` says that image is healthy (see `carried`), so an
+/// incomplete snapshot is built fresh like any other.
+fn build_and_publish_fresh_projection(
+    shared: &ProjectionShared,
+    old_writer: Option<PhysicalGraphProjectionDatabase>,
+    full: PendingFull,
+    deltas: BTreeMap<String, Mark>,
+    carry: bool,
+) -> Result<(PhysicalGraphProjectionDatabase, AppliedTurn), LoweringError> {
+    #[cfg(test)]
+    shared.fresh_builds.fetch_add(1, Ordering::SeqCst);
+
+    let (parent, stage_name, destination_name) =
+        projection_publication_names(&shared.path).map_err(LoweringError::Failed)?;
+    let directory = Dir::open_ambient_dir(&parent, ambient_authority())
+        .map_err(|error| LoweringError::Failed(error.to_string()))?;
+    cleanup_projection_stages(&directory, &destination_name).map_err(LoweringError::Failed)?;
+    let stage_path = parent.join(&stage_name);
+
+    let build = (|| {
+        if fresh_build_stopped(shared) {
+            return Err(LoweringError::Stopped);
+        }
+        let PendingFull {
+            pages,
+            revisions,
+            parse_config,
+            retained,
+        } = full;
+        let config_digest = parse_config.digest();
+        let mut inputs = pages
+            .iter()
+            .map(|(entry, document)| {
+                let revision = revisions.get(&entry.path).ok_or_else(|| {
+                    LoweringError::Failed(format!(
+                        "parsed page has no exact source revision: {}",
+                        entry.rel_path
+                    ))
+                })?;
+                Ok(LoweringInput {
+                    entry: entry.clone(),
+                    document: Arc::clone(document),
+                    revision: projection_source_revision(revision, config_digest),
+                    parse_config: Arc::clone(&parse_config),
+                })
+            })
+            .collect::<Result<Vec<_>, LoweringError>>()?;
+        // Storage takes the complete page order of the image it finishes. It
+        // is path order: a function of the page, never of history (design
+        // §6), so nothing here tracks positions across turns.
+        let mut inventory = pages
+            .iter()
+            .map(|(entry, _)| entry.rel_path.clone())
+            .collect::<BTreeSet<_>>();
+        projection_diag(|| {
+            format!(
+                "fresh build: {} page(s), {} unread source(s), carry={carry}",
+                pages.len(),
+                retained.len()
+            )
+        });
+        if carry && !retained.is_empty() {
+            let superseded = pages
+                .iter()
+                .map(|(entry, _)| entry.rel_path.as_str())
+                .chain(deltas.keys().map(String::as_str))
+                .collect::<HashSet<_>>();
+            // A read that fails keeps the build going without them rather
+            // than refusing to rebuild: the pages come back when their files
+            // can be read again, and a build that cannot run keeps nothing.
+            match carried::stored_unread_pages(&shared.path, &retained, &superseded, &parse_config)
+            {
+                Ok(carried) => {
+                    projection_diag(|| {
+                        format!("fresh build: carrying {} unread page(s)", carried.len())
+                    });
+                    inventory.extend(carried.iter().map(|page| page.entry.rel_path.clone()));
+                    inputs.extend(carried);
+                }
+                Err(error) => report_projection_failure("could not carry unread pages", &error),
+            }
+        }
+        drop(pages);
+        let stage_publication = tine_storage::DurableDirectoryPublication::open(&directory)
+            .map_err(|error| LoweringError::Failed(error.to_string()))?;
+        let mut database =
+            PhysicalGraphProjectionDatabase::create_fresh_build(&stage_path, stage_publication)
+                .map_err(|error| LoweringError::Failed(error.to_string()))?;
+        let mut applied = AppliedTurn::default();
+        let mut text_bytes = 0u64;
+        applied.pages.lowered =
+            lower_in_batches(shared, inputs, Vec::new(), |change, revisions, aliases| {
+                text_bytes = text_bytes.saturating_add(projected_text_bytes(&change.replacements));
+                database
+                    .set_page_cache_budget(crate::projection_budget::build_page_cache_budget(
+                        text_bytes,
+                        crate::projection_budget::physical_memory_bytes(),
+                    ))
+                    .map_err(|error| error.to_string())?;
+                database
+                    .append_with_source_revisions_and_aliases(&change, &revisions, &aliases)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })?;
+
+        // The updates taken with the snapshot land in `finish`, as one tail.
+        let (tail, tail_deletions) = delta_inputs(deltas);
+        inventory.extend(tail.iter().map(|page| page.entry.rel_path.clone()));
+        for deleted in &tail_deletions {
+            inventory.remove(deleted);
+        }
+        let inventory = inventory.into_iter().collect::<Vec<_>>();
+        let mut tail_change = PhysicalGraphProjectionChange {
+            replacements: Vec::new(),
+            deletions: Vec::new(),
+            reference_postings: Vec::new(),
+        };
+        let (mut tail_revisions, mut tail_aliases) = (Vec::new(), Vec::new());
+        applied.pages.deleted.extend(tail_deletions.iter().cloned());
+        let tail_lowered = lower_in_batches(
+            shared,
+            tail,
+            tail_deletions,
+            |change, revisions, aliases| {
+                tail_change.replacements.extend(change.replacements);
+                tail_change.deletions.extend(change.deletions);
+                tail_change
+                    .reference_postings
+                    .extend(change.reference_postings);
+                tail_revisions.extend(revisions);
+                tail_aliases.extend(aliases);
+                Ok(())
+            },
+        )?;
+        applied.pages.lowered.extend(tail_lowered);
+        if fresh_build_stopped(shared) {
+            return Err(LoweringError::Stopped);
+        }
+        let finalized = database
+            .finish(&tail_change, &tail_revisions, &tail_aliases, &inventory)
+            .map_err(|error| LoweringError::Failed(error.to_string()))?;
+        Ok((finalized, applied, text_bytes))
+    })();
+
+    let (finalized, applied, text_bytes) = match build {
+        Ok(built) => built,
+        Err(error) => {
+            let _ = cleanup_projection_stage_artifacts(&directory, &stage_name);
+            return Err(error);
+        }
+    };
+
+    let publication = (|| {
+        if fresh_build_stopped(shared) {
+            return Err(LoweringError::Stopped);
+        }
+        let fence = shared.cancel_queued_captures(false);
+        shared.query_jobs.wait_for_drain(fence);
+        #[cfg(test)]
+        {
+            let hook = shared
+                .before_shared_reader_drain_lock
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let mut reader = shared.reader.lock().unwrap();
+        #[cfg(test)]
+        {
+            let hook = shared.after_shared_reader_drain_lock.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        reader.take();
+        drop(reader);
+        if let Some(database) = old_writer {
+            database
+                .checkpoint_truncate()
+                .map_err(|error| LoweringError::Failed(error.to_string()))?;
+            drop(database);
+        }
+        remove_projection_sidecar(&directory, &format!("{destination_name}-wal"))
+            .map_err(LoweringError::Failed)?;
+        remove_projection_sidecar(&directory, &format!("{destination_name}-shm"))
+            .map_err(LoweringError::Failed)?;
+
+        #[cfg(test)]
+        {
+            let hook = shared.before_fresh_publication.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook().map_err(LoweringError::Failed)?;
+            }
+            let failure = shared.fresh_publication_failure.lock().unwrap().clone();
+            if let Some(message) = failure {
+                return Err(LoweringError::Failed(message));
+            }
+        }
+        // This is the cancellation boundary. Once the storage primitive below
+        // starts, its atomic name operation owns the outcome; a stop arriving
+        // after this check may leave the complete new image installed.
+        if fresh_build_stopped(shared) {
+            return Err(LoweringError::Stopped);
+        }
+
+        finalized
+            .publish_replace_single_writer(&destination_name)
+            .map_err(|error| LoweringError::Failed(error.to_string()))?;
+
+        #[cfg(test)]
+        {
+            let hook = shared.after_fresh_publication.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook().map_err(LoweringError::Failed)?;
+            }
+        }
+        if fresh_build_stopped(shared) {
+            return Err(LoweringError::Stopped);
+        }
+
+        let database = PhysicalGraphProjectionDatabase::open_writable(&shared.path)
+            .map_err(|error| LoweringError::Failed(error.to_string()))?;
+        database
+            .validate_schema()
+            .map_err(|error| LoweringError::Failed(error.to_string()))?;
+        database
+            .quick_check()
+            .map_err(|error| LoweringError::Failed(error.to_string()))?;
+        integrity::record_pass_now(&shared.path);
+        database
+            .checkpoint_truncate()
+            .map_err(|error| LoweringError::Failed(error.to_string()))?;
+        configure_live_writer(&database).map_err(LoweringError::Failed)?;
+        database
+            .shrink_page_cache_budget(crate::projection_budget::resting_page_cache_budget(
+                text_bytes,
+            ))
+            .map_err(|error| LoweringError::Failed(error.to_string()))?;
+        #[cfg(test)]
+        shared.serving_writer_cache_budget.store(
+            database
+                .page_cache_budget()
+                .map_err(|error| LoweringError::Failed(error.to_string()))?,
+            Ordering::Release,
+        );
+        Ok(database)
+    })();
+    match publication {
+        Ok(database) => {
+            cleanup_projection_stage_artifacts(&directory, &stage_name)
+                .map_err(LoweringError::Failed)?;
+            Ok((database, applied))
+        }
+        Err(error) => {
+            let _ = cleanup_projection_stage_artifacts(&directory, &stage_name);
+            Err(error)
+        }
+    }
 }
 
 /// Which pages one worker turn actually WROTE (R3 identity policy): the pages
 /// whose rows now carry this process's live runtime ids, and the pages whose
-/// rows are gone. A full snapshot on a warm reopen reuses every unchanged
-/// page's rows, so "a full snapshot was applied" is not "every page was
-/// lowered" — only the source delta's replacements were.
+/// rows are gone.
 #[derive(Default)]
 struct AppliedPages {
-    lowered: Vec<[u8; 16]>,
-    deleted: Vec<[u8; 16]>,
-    /// R6: pages relowered from a fresh parse; they leave the session set.
-    relowered_structurally: Vec<[u8; 16]>,
+    lowered: Vec<String>,
+    deleted: Vec<String>,
 }
 
 #[derive(Default)]
 struct AppliedTurn {
     pages: AppliedPages,
     registry_pages: PageRegistryMetadata,
-    /// R6: the warm validation's verdict, when this turn ran one.
-    warm_outcome: Option<WarmOutcome>,
-    /// R6: this turn lowered replacements that carried no order position
-    /// (queued while a stream was open), so the order table must be
-    /// reconciled once the stream is closed.
-    unordered_replacements: bool,
-    stream_open: bool,
 }
 
-/// R6 warm validation inside one worker turn: compare the walk inventory's
-/// exact revisions with `direct_source_revisions`, delete what the walk no
-/// longer has, and name what must be relowered. Nothing here parses.
-fn validate_warm(
+fn apply_deltas(
     database: &mut PhysicalGraphProjectionDatabase,
-    warm: &PendingWarm,
-    applied: &mut AppliedPages,
-) -> Result<WarmOutcome, String> {
-    let config_digest = warm.parse_config.digest();
-    let sources = warm
-        .sources
-        .iter()
-        .map(|(entry, revision)| PhysicalGraphProjectionSourceRevision {
-            page_id: page_id(&entry.rel_path),
-            revision: projection_source_revision(revision, config_digest),
-        })
-        .collect::<Vec<_>>();
-    let source_delta = database
-        .source_delta(&sources)
-        .map_err(|error| error.to_string())?;
-    if !source_delta.deletions.is_empty() {
-        applied
-            .deleted
-            .extend(source_delta.deletions.iter().copied());
-        database
-            .apply_with_source_revisions_and_aliases(
-                &PhysicalGraphProjectionChange {
-                    replacements: Vec::new(),
-                    deletions: source_delta.deletions,
-                    reference_postings: Vec::new(),
-                },
-                &[],
-                &[],
-            )
-            .map_err(|error| error.to_string())?;
-    }
-    if source_delta.replacements.is_empty() {
-        return Ok(WarmOutcome::Clean);
-    }
-    let needed = source_delta
-        .replacements
-        .iter()
-        .copied()
-        .collect::<std::collections::BTreeSet<_>>();
-    Ok(WarmOutcome::Replacements(
-        warm.sources
-            .iter()
-            .filter(|(entry, _)| needed.contains(&page_id(&entry.rel_path)))
-            .map(|(entry, _)| entry.clone())
-            .collect(),
-    ))
+    shared: &ProjectionShared,
+    deltas: BTreeMap<String, Mark>,
+) -> Result<AppliedTurn, LoweringError> {
+    let (pages, deletions) = delta_inputs(deltas);
+    let mut applied = AppliedTurn::default();
+    applied.pages.deleted = deletions.clone();
+    // One transaction for the whole turn: an index page every batch touches
+    // is then written once, not once per batch (GH #543: a 261-page rename
+    // wrote 620 MB as nine transactions). A stopped or failed turn commits
+    // nothing, and its marks re-lower every page.
+    let mut turn = database
+        .begin_turn()
+        .map_err(|error| LoweringError::Failed(error.to_string()))?;
+    applied.pages.lowered =
+        lower_in_batches(shared, pages, deletions, |change, revisions, aliases| {
+            turn.apply_with_source_revisions_and_aliases(&change, &revisions, &aliases)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })?;
+    turn.commit()
+        .map_err(|error| LoweringError::Failed(error.to_string()))?;
+    Ok(applied)
 }
 
-fn apply_pending(
-    database: &mut PhysicalGraphProjectionDatabase,
-    full: Option<PendingFull>,
-    warm: Option<&PendingWarm>,
-    deltas: BTreeMap<String, (u64, PageDelta)>,
-) -> Result<AppliedTurn, String> {
-    let mut turn = AppliedTurn::default();
-    let applied = &mut turn.pages;
-    if let Some(PendingFull {
-        pages,
-        revisions,
-        parse_config,
-    }) = full
-    {
-        let parse_config = parse_config.as_ref();
-        let config_digest = parse_config.digest();
-        let sources = pages
-            .iter()
-            .map(|(entry, _)| {
-                Ok(PhysicalGraphProjectionSourceRevision {
-                    page_id: page_id(&entry.rel_path),
-                    revision: projection_source_revision(
-                        revisions.get(&entry.path).ok_or_else(|| {
-                            format!(
-                                "parsed page has no exact source revision: {}",
-                                entry.rel_path
-                            )
-                        })?,
-                        config_digest,
-                    ),
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let source_delta = database
-            .source_delta(&sources)
-            .map_err(|error| error.to_string())?;
-        let replacements_needed = source_delta
-            .replacements
-            .iter()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        let inventory = sources
-            .iter()
-            .map(|source| source.page_id)
-            .collect::<Vec<_>>();
-        let lowered = pages
-            .iter()
-            .enumerate()
-            .filter(|(_, (entry, _))| replacements_needed.contains(&page_id(&entry.rel_path)))
-            .map(|(position, (entry, document))| {
-                let (mut page, postings, aliases) = physical_page(entry, document, parse_config)?;
-                page.query_page_order = Some(position as u64);
-                Ok::<_, String>((page, postings, aliases))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut replacements = Vec::with_capacity(lowered.len());
-        let mut reference_postings = Vec::new();
-        let mut aliases = Vec::new();
-        for (page, mut postings, mut page_aliases) in lowered {
-            replacements.push(page);
-            reference_postings.append(&mut postings);
-            aliases.append(&mut page_aliases);
-        }
-        let replacement_sources = sources
-            .into_iter()
-            .filter(|source| replacements_needed.contains(&source.page_id))
-            .collect::<Vec<_>>();
-        applied.lowered.extend(replacements_needed.iter().copied());
-        applied
-            .deleted
-            .extend(source_delta.deletions.iter().copied());
-        database
-            .apply_with_source_revisions_aliases_and_page_order(
-                &PhysicalGraphProjectionChange {
-                    replacements,
-                    deletions: source_delta.deletions,
-                    reference_postings,
-                },
-                &replacement_sources,
-                &aliases,
-                &inventory,
-            )
-            .map_err(|error| error.to_string())?;
-    }
-    if let Some(warm) = warm {
-        turn.warm_outcome = Some(validate_warm(database, warm, applied)?);
-    }
-    if !deltas.is_empty() {
-        let mut replacements = Vec::new();
-        let mut reference_postings = Vec::new();
-        let mut aliases = Vec::new();
-        let mut replacement_sources = Vec::new();
-        let mut deletions = Vec::new();
-        for (_, (_, delta)) in deltas {
-            match delta {
-                // Each replacement lowers under the config it was queued with,
-                // never under a later page's or a default (F11).
-                PageDelta::Replace {
-                    entry,
-                    document,
-                    revision,
-                    parse_config,
-                    query_page_order,
-                    identity,
-                } => {
-                    replacement_sources.push(PhysicalGraphProjectionSourceRevision {
-                        page_id: page_id(&entry.rel_path),
-                        revision: projection_source_revision(&revision, parse_config.digest()),
-                    });
-                    let (mut page, mut postings, mut page_aliases) =
-                        physical_page(&entry, &document, &parse_config)?;
-                    page.query_page_order = query_page_order;
-                    if query_page_order.is_none() {
-                        turn.unordered_replacements = true;
-                    }
-                    match identity {
-                        DeltaIdentity::Live => applied.lowered.push(page.page_id),
-                        DeltaIdentity::Structural => {
-                            applied.relowered_structurally.push(page.page_id)
-                        }
-                    }
-                    turn.registry_pages.insert(
-                        page.page_id,
-                        registry_sql::registry_metadata_from_physical_page(&page)?,
-                    );
-                    replacements.push(page);
-                    reference_postings.append(&mut postings);
-                    aliases.append(&mut page_aliases);
-                }
-                PageDelta::Delete { entry } => {
-                    let id = page_id(&entry.rel_path);
-                    applied.deleted.push(id);
-                    deletions.push(id);
-                }
-            }
-        }
-        database
-            .apply_with_source_revisions_and_aliases(
-                &PhysicalGraphProjectionChange {
-                    replacements,
-                    deletions,
-                    reference_postings,
-                },
-                &replacement_sources,
-                &aliases,
-            )
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(turn)
-}
-
-/// The revision Direct Files compares to decide whether a page's rows are still
-/// current. Folding the parse-config digest in is what makes a config edit a
-/// full re-lowering (§5.8 J7): reconciliation compares only source revisions,
-/// so without it an unchanged file would keep rows built under the old config.
-fn projection_source_revision(
-    content_revision: &str,
-    parse_config_digest: tine_storage::ContentDigest,
-) -> String {
-    let digest = parse_config_digest
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("direct-facts-v{DIRECT_PROJECTION_FACTS_VERSION}:{digest}:{content_revision}")
-}
-
-/// The Direct Files producer, reachable from the cross-backend parity guard.
-///
-/// Named as a seam rather than widened: the guard has to compare the rows this
-/// exact function emits against the walk's,
-/// and a reimplementation in the test would prove only that the test agrees
-/// with itself (§5.8 G1, I-19).
+/// Whether this graph's worker has found the writer lease held.
 #[cfg(test)]
-pub(crate) fn physical_page_for_test(
-    entry: &PageEntry,
-    document: &Document,
-    parse_config: &ParseConfig,
-) -> Result<PhysicalPage, String> {
-    physical_page(entry, document, parse_config).map(|(page, _, _)| page)
-}
-
-fn physical_page(
-    entry: &PageEntry,
-    document: &Document,
-    parse_config: &ParseConfig,
-) -> Result<
-    (
-        PhysicalPage,
-        Vec<PhysicalReferencePosting>,
-        Vec<PhysicalAliasDeclaration>,
-    ),
-    String,
-> {
-    #[cfg(test)]
-    {
-        let mut receipt = PHYSICAL_PAGE_LOWERINGS.lock().unwrap();
-        if receipt
-            .0
-            .as_ref()
-            .is_some_and(|root| entry.path.starts_with(root))
-        {
-            receipt.1 += 1;
-        }
-    }
-    let id = page_id(&entry.rel_path);
-    let format = Format::from_path(Path::new(&entry.rel_path));
-    let is_org = format == Format::Org;
-    // `Format::from_path` and never `reference_source_is_org`: the latter is a
-    // case-sensitive `ends_with(".org")` and would type an `Outline.ORG` page
-    // Markdown here while Direct Files types it Org (§5.8 E4).
-    let atom_format = crate::query::atom::AtomFormat::from(format);
-    let (preamble_search, properties, tags) = document
-        .pre_block
-        .as_deref()
-        .map(|raw| facets(raw, is_org))
-        .unwrap_or_default();
-    let searchable_text = if preamble_search.is_empty() {
-        entry.name.clone()
-    } else {
-        format!("{} {preamble_search}", entry.name)
-    };
-    let mut blocks = Vec::new();
-    let mut reference_postings = Vec::new();
-    let aliases = crate::query::document_aliases(document)
-        .into_iter()
-        .enumerate()
-        .map(|(ordinal, alias)| {
-            Ok(PhysicalAliasDeclaration {
-                source_page_id: id,
-                source_entity: PhysicalEntityId::Page(id),
-                source_locator: b"page-alias".to_vec(),
-                ordinal: u32::try_from(ordinal)
-                    .map_err(|_| "one page exceeds u32::MAX aliases".to_string())?,
-                raw_alias: alias.clone(),
-                normalized_alias: alias,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    if let Some(preamble) = document.pre_block.as_deref() {
-        append_reference_postings(
-            &mut reference_postings,
-            id,
-            PhysicalEntityId::Page(id),
-            b"preamble",
-            std::iter::empty(),
-            crate::doc::property_reference_page_names(preamble).into_iter(),
-        )?;
-    }
-    let mut block_refs_norm: Vec<Vec<String>> = Vec::new();
-    lower_blocks(
-        &document.roots,
-        id,
-        None,
-        &mut Vec::new(),
-        &mut blocks,
-        &mut reference_postings,
-        &mut block_refs_norm,
-        parse_config,
-        atom_format,
-    )?;
-    // The two derived tables come from the ONE tine-core computation (§5.8):
-    // this side only hands it the block's own `refs_norm` and its parent.
-    let flat = blocks
-        .iter()
-        .zip(block_refs_norm.iter())
-        .map(|(block, refs)| crate::query::path_refs::PathRefBlock {
-            id: block.block_id,
-            parent: block.parent,
-            refs: refs.as_slice(),
-        })
-        .collect::<Vec<_>>();
-    let mut path_refs = crate::query::derived::path_ref_rows(&entry.name, &flat);
-    for block in &mut blocks {
-        block.path_refs = path_refs.remove(&block.block_id).unwrap_or_default();
-    }
-    let journal_days = crate::query::derived::JournalDays::new(parse_config);
-    let page_property_atoms = crate::query::derived::property_atom_rows(
-        &properties
-            .iter()
-            .map(|property| (property.name.clone(), property.value.clone()))
-            .collect::<Vec<_>>(),
-        atom_format,
-        parse_config,
-    );
-    Ok((
-        PhysicalPage {
-            page_id: id,
-            query_page_order: None,
-            home_document_id: id,
-            name: entry.name.clone(),
-            name_key: crate::refs::page_key(&entry.name),
-            path: entry.rel_path.clone(),
-            text_kind: page_kind_to_sql(entry.kind),
-            journal_day: journal_days.day(&entry.rel_path, entry.kind == PageKind::Journal),
-            preamble: document.pre_block.clone(),
-            normalized_searchable_text: searchable_text.to_lowercase().nfc().collect(),
-            searchable_text,
-            references: Vec::new(),
-            properties,
-            tags: crate::query::derived::tag_rows(&tags),
-            property_atoms: page_property_atoms,
-            blocks,
-        },
-        reference_postings,
-        aliases,
-    ))
-}
-
-/// The 16-byte key a block's rows are stored under.
-///
-/// A parsed page carries structural UUIDs. A page saved from the editor keeps
-/// the FRONTEND's live ids (`src/store.ts` `freshId()`: `b<base36 time>-<n>`),
-/// which `cache_upsert_inner` deliberately preserves so the editor can keep
-/// addressing the block; the public identity of a row is `query_result_id`,
-/// the id STRING, so a non-UUID live id only needs a deterministic key here.
-/// This used to be a refusal, and a refusal scoped to the whole page: one
-/// block created in the editor failed the page's delta, the failed turn
-/// latched a full rebuild, and every rebuild re-lowered the same live document
-/// and failed the same way — so after one such save every query in the app
-/// answered "Rebuilding the query index…" until restart (2026-09-11,
-/// master d61cfb3d). `a_block_created_in_the_editor_keeps_queries_answering`
-/// (`tests/search_edit.rs`) pins the user outcome.
-fn block_projection_key(runtime_id: &str) -> [u8; 16] {
-    match Uuid::parse_str(runtime_id) {
-        Ok(uuid) => uuid.into_bytes(),
-        Err(_) => crate::vocab::live_runtime_id_key(runtime_id).into_bytes(),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn lower_blocks(
-    source: &[DocBlock],
-    page_id: [u8; 16],
-    parent: Option<[u8; 16]>,
-    structural_path: &mut Vec<u32>,
-    out: &mut Vec<PhysicalBlock>,
-    reference_postings: &mut Vec<PhysicalReferencePosting>,
-    refs_norm: &mut Vec<Vec<String>>,
-    parse_config: &ParseConfig,
-    atom_format: crate::query::atom::AtomFormat,
-) -> Result<(), String> {
-    for (position, block) in source.iter().enumerate() {
-        let position = u32::try_from(position)
-            .map_err(|_| "page has more than u32::MAX sibling blocks".to_string())?;
-        structural_path.push(position);
-        let block_id = block_projection_key(&block.uuid);
-        let projection = block.projection();
-        let order = structural_path
-            .iter()
-            .map(|part| format!("{part:08x}"))
-            .collect::<Vec<_>>()
-            .join("/");
-        append_reference_postings(
-            reference_postings,
-            page_id,
-            PhysicalEntityId::Block(block_id),
-            order.as_bytes(),
-            projection.refs_page.iter().cloned(),
-            crate::doc::property_reference_page_names(&block.raw).into_iter(),
-        )?;
-        for raw_claim in &projection.block_refs {
-            let Ok(raw_claim) = Uuid::parse_str(raw_claim) else {
-                continue;
-            };
-            reference_postings.push(PhysicalReferencePosting {
-                source_page_id: page_id,
-                source_entity: PhysicalEntityId::Block(block_id),
-                source_locator: order.as_bytes().to_vec(),
-                ordinal: u32::try_from(reference_postings.len())
-                    .map_err(|_| "one page exceeds u32::MAX reference postings".to_string())?,
-                kind: 6,
-                target: PhysicalReferenceTarget::ExternalUuid {
-                    raw_claim: raw_claim.into_bytes(),
-                    resolved_block_id: None,
-                },
-            });
-        }
-        let searchable_text = projection
-            .visible
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        // The query columns are the EXACT visible text and its fold, never the
-        // whitespace-collapsed `searchable_text` beside them (§5.10).
-        // `visible_lower` is exactly `search_query::canonical_fold(visible)`.
-        let (query_visible, query_visible_folded) =
-            (projection.visible.clone(), projection.visible_lower.clone());
-        let properties = projection
-            .properties
-            .iter()
-            .map(|(name, value)| PhysicalProperty {
-                name: name.clone(),
-                normalized_name: property_key_norm(name),
-                value: value.clone(),
-            })
-            .collect();
-        let property_atoms = crate::query::derived::property_atom_rows(
-            &projection.properties,
-            atom_format,
-            parse_config,
-        );
-        refs_norm.push(projection.refs_norm.clone());
-        let logseq_uuid = block
-            .property("id")
-            .and_then(|value| Uuid::parse_str(value.trim()).ok())
-            .map(Uuid::into_bytes);
-        out.push(PhysicalBlock {
-            block_id,
-            query_result_id: block.uuid.clone(),
-            own_refs: projection.refs_norm.clone(),
-            home_document_id: page_id,
-            parent,
-            order,
-            content: block.raw.clone(),
-            normalized_searchable_text: searchable_text.to_lowercase().nfc().collect(),
-            searchable_text,
-            query_visible,
-            query_visible_folded,
-            heading_level: projection.heading_level,
-            collapsed: block.collapsed(),
-            logseq_uuid,
-            logseq_identity_origin: logseq_uuid.map(|_| 0),
-            references: Vec::new(),
-            properties,
-            tags: crate::query::derived::tag_rows(&projection.tags),
-            task: projection.marker.as_ref().map(|marker| PhysicalTask {
-                marker: marker.to_ascii_uppercase(),
-                priority: projection.priority.clone(),
-                scheduled: projection.scheduled.clone(),
-                deadline: projection.deadline.clone(),
-            }),
-            // Written from the three projection fields alone, so a markerless
-            // block gets a row exactly as a marked one does (§3.2 M2).
-            planning: crate::query::derived::planning_row(
-                projection.priority.as_deref(),
-                projection.scheduled.as_deref(),
-                projection.deadline.as_deref(),
-            ),
-            // Filled once per page, after the whole flat block list exists.
-            path_refs: Vec::new(),
-            property_atoms,
-        });
-        lower_blocks(
-            &block.children,
-            page_id,
-            Some(block_id),
-            structural_path,
-            out,
-            reference_postings,
-            refs_norm,
-            parse_config,
-            atom_format,
-        )?;
-        structural_path.pop();
-    }
-    Ok(())
-}
-
-fn append_reference_postings(
-    out: &mut Vec<PhysicalReferencePosting>,
-    page_id: [u8; 16],
-    source: PhysicalEntityId,
-    source_locator: &[u8],
-    inline_names: impl IntoIterator<Item = String>,
-    property_names: impl IntoIterator<Item = String>,
-) -> Result<(), String> {
-    let mut ordinal = 0_u32;
-    for (kind, names) in [
-        (0_i64, inline_names.into_iter().collect::<Vec<_>>()),
-        (3_i64, property_names.into_iter().collect::<Vec<_>>()),
-    ] {
-        for raw_name in names {
-            out.push(PhysicalReferencePosting {
-                source_page_id: page_id,
-                source_entity: source,
-                source_locator: source_locator.to_vec(),
-                ordinal,
-                kind,
-                target: PhysicalReferenceTarget::PageName {
-                    normalized_name: crate::refs::page_key(&raw_name),
-                    raw_name,
-                    resolved_page_id: None,
-                },
-            });
-            ordinal = ordinal
-                .checked_add(1)
-                .ok_or_else(|| "one reference source exceeds u32::MAX postings".to_string())?;
-        }
-    }
-    Ok(())
-}
-
-fn facets(raw: &str, is_org: bool) -> (String, Vec<PhysicalProperty>, Vec<String>) {
-    let block = DocBlock::preamble(raw, is_org);
-    let searchable = block
-        .visible_text()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let properties = block
-        .projection()
-        .properties
-        .iter()
-        .map(|(name, value)| PhysicalProperty {
-            name: name.clone(),
-            normalized_name: property_key_norm(name),
-            value: value.clone(),
-        })
-        .collect();
-    (searchable, properties, block.projection().tags.clone())
-}
-
-pub(crate) fn page_id(relative_path: &str) -> [u8; 16] {
-    let mut digest = Sha256::new();
-    digest.update(b"tine-direct-page-v1\0");
-    digest.update(relative_path.as_bytes());
-    let bytes = digest.finalize();
-    let mut id = [0; 16];
-    id.copy_from_slice(&bytes[..16]);
-    id
-}
-
-fn page_kind_to_sql(kind: PageKind) -> i64 {
-    match kind {
-        PageKind::Page => 0,
-        PageKind::Journal => 1,
-    }
-}
-
-/// `pages.text_kind` back to the parser's `PageKind`. A value outside the two
-/// the producer writes is projection damage, not a third kind, so every reader
-/// treats `None` as a failed read (D-3).
-pub(crate) fn page_kind_from_sql(kind: i64) -> Option<PageKind> {
-    match kind {
-        0 => Some(PageKind::Page),
-        1 => Some(PageKind::Journal),
-        _ => None,
-    }
+pub(crate) fn lease_wait_started_test<G: crate::query::graph::QueryGraph>(graph: &G) -> bool {
+    graph
+        .direct_projection_test()
+        .is_some_and(|projection| projection.shared.lease_contended.load(Ordering::Acquire))
 }
 
 #[cfg(test)]
@@ -3124,17 +3639,22 @@ pub(crate) fn release_projection<G: crate::query::graph::QueryGraph>(graph: &G) 
 }
 
 #[cfg(test)]
-/// Drive projection recovery the way the app does: by retrying.
+/// Retry projection recovery until it converges.
 ///
 /// `direct_projection_recover_after_failed_read` is ONE attempt and is allowed
-/// to accomplish nothing -- `model.rs` says so itself where it turns "the
-/// repair did not take" into `Unavailable(ReadFailed)`. The mechanism is that
-/// recovery latches `pending.rebuild`, but the worker consumes that flag only
-/// together with a `full` or `warm` payload (`rebuild = (full|warm) &&
-/// take(rebuild)`). If the turn carrying that payload fails, the payload is
-/// gone and the rebuild stays latched with nothing left to ride in on, so the
-/// projection stays failed until something enqueues work again. In the running
-/// app that something is the user's next query, which calls recovery again.
+/// to accomplish nothing: a read whose repair did not take answers
+/// `Unavailable` and the next read asks again. If the turn carrying a
+/// rebuild's payload fails, the payload is gone and the attempt achieved
+/// nothing, so the projection stays failed until something enqueues work again.
+///
+/// This helper calls the recovery entry point DIRECTLY, which the running app
+/// does not do: the app issues ordinary queries and the dispatcher decides. So
+/// this cannot be the proof that public recovery converges, and it once hid the
+/// fact that it did not — a latched `rebuild` made every query retryable rather
+/// than repairing, and nothing called recovery again (GH #543). That property
+/// is proved separately through the public query route by
+/// `a_failed_statement_read_repairs_and_retries_the_same_statement`. Keep it
+/// that way: do not "fix" a convergence failure by reaching for this helper.
 ///
 /// A fixture that calls recovery once and then waits has assumed a convergence
 /// guarantee the contract does not make. It fails about one run in twenty on a
@@ -3171,6 +3691,18 @@ pub(crate) fn recover_until_ready<G: crate::query::graph::QueryGraph>(graph: &G)
     }
 }
 
+mod carried;
+mod checkpoint;
+pub(crate) mod derived_reads;
+mod integrity;
+#[cfg(test)]
+pub(crate) use integrity::CHECK_INTERVAL as INDEX_INTEGRITY_CHECK_INTERVAL;
+mod lowering;
+#[cfg(test)]
+mod test_hooks;
+pub(crate) use lowering::*;
 #[cfg(test)]
 #[path = "direct_projection_tests.rs"]
 mod tests;
+
+mod observers;

@@ -194,6 +194,7 @@ Banner-class conflicts use the existing tagged kind:
 | `ConflictReplacePostPublication` | `conflict.replace_post_publication` | banner | post-publish validation |
 | `ConflictPinnedOwner` | `conflict.pinned_owner` | banner | exact pinned owner |
 | `ConflictBaseRev` | `conflict.base_rev` | banner | base revision |
+| `RefusedDataPreservation` | `refused.data_preservation` | no retry | data-preservation firewall |
 | `Unknown` | `unknown` | retry | unclassified source failure |
 
 The frontend save-policy vocabulary (`isRetryableSaveFailure` in
@@ -293,7 +294,7 @@ Exemplar to imitate: `android_media::call`.
 
 ### `Prose` census
 
-The syntactic census is 47 production sites (35 in `commands.rs`, 12 in
+The syntactic census is 46 production sites (34 in `commands.rs`, 12 in
 `state.rs`; test modules excluded). `CommandError::prose` is an identity
 adapter when a phase-B helper already returns `CommandError`, so those retained
 E2 call sites do not erase the typed variant. The rows below have no typed

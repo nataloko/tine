@@ -45,6 +45,17 @@ graph object, split it:
 `crates/tine-core/src/direct_projection.rs::report_projection_failure` is the
 exemplar — the fixed failure family always-on, the raw error behind the flag.
 
+The projection's lifecycle channel, `direct_projection.rs::projection_diag`, is
+a class (a) core line of this kind: it records when the reopen survey announces
+itself, how long its inventory read took, how many pages it queued, each worker
+turn's duration and applied rows, how far a partial build has streamed, and the
+generation at which readiness is published (GH #543). Its payload is written at
+every call site rather than at the print site, so the function-anchored census
+cannot see a caller that begins interpolating a page name;
+`projection_lifecycle_lines_carry_no_graph_content` scans the call sites for
+exactly that. What may be interpolated is counts, byte totals, durations,
+generations, booleans and fixed refusal families.
+
 Frontend `console` output is not captured, persisted, or transmitted, and is
 included in no report — but the WebView inspector ships in release builds, so a
 console line is one panel away on a user's machine. Variable-bearing calls
@@ -56,6 +67,13 @@ is represented by a count, never a page name.
 Every failed page save has one fixed-shape native receipt: Direct Files records
 its closed save-failure code and guarded-index counters as `direct.save`. Page
 identity, paths, error prose, and draft content never enter the event.
+
+Every failed index build or update attempt has one fixed-shape native receipt,
+`index.failure`: its class (`IndexFailureClass::as_str`), its attempt number and
+whether it left the index failed for the session. Core reports it through
+`tine_core::set_index_failure_observer`, which `debug.rs::flight_init` installs;
+the error text itself stays behind the debug flag (GH #594, see
+`docs/contracts/index-readiness.md`).
 
 ## Print-site classes
 
@@ -106,7 +124,7 @@ type.
 
 `crates/tine-core/tests/content_out_of_logs.rs` walks production Rust library
 sources, excluding standalone CLI output and cfg(test) regions. Its exact
-allowlist currently contains 18 Rust production print sites, each with a class,
+allowlist currently contains 19 Rust production print sites, each with a class,
 reason, and gate. A deletion changes the census just as an addition does.
 
 `src/contentOutOfLogs.ratchet.test.ts` walks production TypeScript and TSX and

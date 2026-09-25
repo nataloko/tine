@@ -50,8 +50,9 @@ impl Graph {
         limits: GraphTextInventoryLimits,
         budget: Option<&RetainedContentBudget>,
     ) -> io::Result<(Vec<PageEntry>, Option<RetainedContentReservation>)> {
-        let roots = self.configured_text_inventory_roots(permit)?;
-        let (entries, reservation, _) = self.text_entries_with_limits_and_budget(
+        let config = self.config();
+        let roots = self.configured_text_inventory_roots(&config, permit)?;
+        let (entries, reservation, _, _) = self.text_entries_with_limits_and_budget(
             permit,
             include_sync_conflicts,
             limits,
@@ -67,6 +68,16 @@ impl Graph {
         permit: &GraphTextWritePermit,
     ) -> io::Result<Vec<PageEntry>> {
         Ok(self.graph_text_inventory(permit)?.0)
+    }
+
+    /// [`Self::graph_text_entries`] plus the entries the read walk had to skip
+    /// (GH #332), which a page build records as page index failures.
+    pub(super) fn graph_text_entries_and_skipped(
+        &self,
+        permit: &GraphTextWritePermit,
+    ) -> io::Result<(Vec<PageEntry>, Vec<String>)> {
+        let (entries, _, skipped) = self.graph_text_inventory(permit)?;
+        Ok((entries, skipped))
     }
 
     /// Enumerate every user-visible Markdown/Org source file using the same
@@ -171,7 +182,7 @@ impl Graph {
         }
 
         let limits = graph_text_inventory_limits();
-        let root_depth = configured_root_components(&self.config.pages_dir)
+        let root_depth = configured_root_components(&self.config().pages_dir)
             .ok_or_else(bad_path)?
             .len();
         if root_depth > limits.directory_depth {
@@ -196,7 +207,7 @@ impl Graph {
         if directory_count > limits.directories {
             return Err(graph_text_inventory_limit_error("directory count"));
         }
-        let mut path_bytes = usize_to_u64(self.config.pages_dir.len())?;
+        let mut path_bytes = usize_to_u64(self.config().pages_dir.len())?;
         if path_bytes > limits.path_bytes {
             return Err(graph_text_inventory_limit_error("aggregate path bytes"));
         }
@@ -206,7 +217,7 @@ impl Graph {
         }
         pending.push(PendingDirectory {
             directory: target.parent().try_clone()?,
-            relative: self.config.pages_dir.clone(),
+            relative: self.config().pages_dir.clone(),
             depth: root_depth,
         });
 
@@ -263,7 +274,7 @@ impl Graph {
                         continue;
                     };
                     if crate::refs::same_page(
-                        &decode_page_name(stem, self.config.file_name_format),
+                        &decode_page_name(stem, self.config().file_name_format),
                         page_name,
                     ) {
                         return Ok(true);
@@ -315,8 +326,9 @@ impl Graph {
     ) -> io::Result<(
         Vec<PageEntry>,
         std::collections::HashMap<PathBuf, ContentDigest>,
+        Vec<String>,
     )> {
-        let (entries, _, identities) = self.text_entries_with_limits_and_budget(
+        let (entries, _, identities, skipped) = self.text_entries_with_limits_and_budget(
             permit,
             false,
             graph_text_inventory_limits(),
@@ -324,6 +336,6 @@ impl Graph {
             vec![("", 0)],
             true,
         )?;
-        Ok((entries, identities))
+        Ok((entries, identities, skipped))
     }
 }

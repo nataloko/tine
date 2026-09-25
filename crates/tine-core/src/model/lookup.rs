@@ -16,9 +16,9 @@ impl Graph {
     pub fn find_entry(&self, name: &str, kind: PageKind) -> Option<PageEntry> {
         let key = (kind, crate::refs::page_key(name));
         loop {
-            let gen = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+            let generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
             if let Some((g, index)) = self.find_entry_cache.read().unwrap().as_ref() {
-                if *g == gen && index.has_kind(kind) {
+                if *g == generation && index.has_kind(kind) {
                     return index.entries.get(&key).cloned();
                 }
             }
@@ -28,7 +28,20 @@ impl Graph {
                 let entry_key = (entry.kind, crate::refs::page_key(&entry.name));
                 match built.entries.get_mut(&entry_key) {
                     Some(winner) => {
-                        if !is_date_stem_entry(winner) && is_date_stem_entry(&entry) {
+                        let prefer = match entry.kind {
+                            PageKind::Journal => {
+                                !is_date_stem_entry(winner) && is_date_stem_entry(&entry)
+                            }
+                            // The file named for the page beats a file that
+                            // claims its name through `title::`, which is also
+                            // the file `load_page_by_file_name` opens while
+                            // the page list is not yet available.
+                            PageKind::Page => {
+                                !self.is_file_named_page(&winner.name, &winner.path)
+                                    && self.is_file_named_page(&entry.name, &entry.path)
+                            }
+                        };
+                        if prefer {
                             *winner = entry;
                         }
                     }
@@ -40,10 +53,13 @@ impl Graph {
             built.mark_kind_loaded(PageKind::Page);
             built.mark_kind_loaded(PageKind::Journal);
 
+            if !self.answer_is_complete() {
+                return built.entries.get(&key).cloned();
+            }
             let found = {
                 let mut guard = self.find_entry_cache.write().unwrap();
                 match guard.as_mut() {
-                    Some((g, index)) if *g == gen => {
+                    Some((g, index)) if *g == generation => {
                         if !index.has_kind(kind) {
                             index.entries.extend(built.entries);
                             index.mark_kind_loaded(kind);
@@ -52,12 +68,12 @@ impl Graph {
                     }
                     _ => {
                         let found = built.entries.get(&key).cloned();
-                        *guard = Some((gen, built));
+                        *guard = Some((generation, built));
                         found
                     }
                 }
             };
-            if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == gen {
+            if self.cache_gen.load(std::sync::atomic::Ordering::Acquire) == generation {
                 return found;
             }
         }
@@ -77,6 +93,16 @@ impl Graph {
                 Err(e) => Err(e),
             }
         };
+        if kind == PageKind::Journal {
+            if let Some(page) = self.load_journal_by_date(name)? {
+                return Ok(Some(page));
+            }
+        }
+        if kind == PageKind::Page {
+            if let Some(page) = self.load_page_by_file_name(name)? {
+                return Ok(Some(page));
+            }
+        }
         if let Some(entry) = self.find_entry(name, kind) {
             return load(&entry);
         }
@@ -95,13 +121,131 @@ impl Graph {
         Ok(None)
     }
 
+    /// Whether `path` is the file named for page `name`: the pages directory,
+    /// the name encoded in the graph's filename format, any text extension.
+    fn is_file_named_page(&self, name: &str, path: &Path) -> bool {
+        path.parent() == Some(self.pages_path().as_path())
+            && path.file_stem().and_then(|stem| stem.to_str())
+                == Some(encode_page_name(name, self.config().file_name_format).as_str())
+    }
+
+    /// GH #543 (IT-05): open a named page from the file named for it, without
+    /// the whole-graph page list `find_entry` builds. While the launch check
+    /// runs that list is not available, so a restored tab, the home page, a
+    /// favourite or a link waited for the whole check.
+    ///
+    /// Answers only when the answer is the one `find_entry` would give:
+    /// exactly one file is named for the page, and the page loaded from it
+    /// carries that name (a `title::` can rename it). `find_entry` prefers
+    /// such a file over any that claims the name through `title::`. Anything
+    /// else returns `None`, and the caller falls back to the page list.
+    fn load_page_by_file_name(&self, name: &str) -> io::Result<Option<PageDto>> {
+        let stem = encode_page_name(name, self.config().file_name_format);
+        if stem.is_empty() {
+            return Ok(None);
+        }
+        let permit = self.admit_retained_graph_text_writer()?;
+        let mut found = None;
+        for path in configured_text_variant_paths(&self.pages_path(), &stem) {
+            if self.graph_text_exists(&permit, &path)? {
+                if found.is_some() {
+                    return Ok(None);
+                }
+                found = Some(path);
+            }
+        }
+        drop(permit);
+        // GH #597: on a case- (or normalization-) insensitive filesystem the
+        // probe above also answers for a file spelled differently on disk
+        // (`Contents.md` finds `contents.md`). Only the on-disk spelling is the
+        // page's file; handing out another one publishes a second page for the
+        // same file and gives the editor a path `resolve_rel` refuses. Fall back
+        // to the page list, which resolves the name case-insensitively.
+        if found
+            .as_deref()
+            .is_some_and(|path| path_uses_graph_text_alias(&self.root, path))
+        {
+            return Ok(None);
+        }
+        let Some(entry) = found.and_then(|path| self.entry_for_path(&path)) else {
+            return Ok(None);
+        };
+        if entry.kind != PageKind::Page {
+            return Ok(None);
+        }
+        let page = match self.load_page(&entry) {
+            Ok(page) => page,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let named_for_it = page.kind == PageKind::Page
+            && crate::refs::page_key(&page.name) == crate::refs::page_key(name)
+            && self.is_file_named_page(&page.name, &entry.path);
+        Ok(named_for_it.then_some(page))
+    }
+
+    /// GH #550: open a journal day from its date, without the whole-graph
+    /// inventory `find_entry` builds. On a cold phone that inventory was most
+    /// of an 8 s `get_page` for today's journal at every launch.
+    ///
+    /// Answers only when the answer is the one `find_entry` would give: the
+    /// title parses as a date, exactly one date-stem file exists for it, and
+    /// the page loaded from it carries the requested name (a `title::` can
+    /// rename a journal file away from its date). A duplicate day, an absent
+    /// day, or a title-named stray returns `None`, and the caller falls back
+    /// to `find_entry`'s canonical-file rule.
+    fn load_journal_by_date(&self, name: &str) -> io::Result<Option<PageDto>> {
+        let Some(date) = self.journal_format.parse(name) else {
+            return Ok(None);
+        };
+        let stem = self.journal_format.file_stem(date);
+        let permit = self.admit_retained_graph_text_writer()?;
+        let mut found = None;
+        for path in configured_text_variant_paths(&self.journals_path(), &stem) {
+            if self.graph_text_exists(&permit, &path)? {
+                if found.is_some() {
+                    return Ok(None);
+                }
+                found = Some(path);
+            }
+        }
+        drop(permit);
+        // GH #597: the same alias rule as `load_page_by_file_name`.
+        if found
+            .as_deref()
+            .is_some_and(|path| path_uses_graph_text_alias(&self.root, path))
+        {
+            return Ok(None);
+        }
+        let Some(entry) = found.and_then(|path| self.entry_for_path(&path)) else {
+            return Ok(None);
+        };
+        if entry.kind != PageKind::Journal {
+            return Ok(None);
+        }
+        let page = match self.load_page(&entry) {
+            Ok(page) => page,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let requested = crate::refs::page_key(name);
+        Ok(
+            (page.kind == PageKind::Journal && crate::refs::page_key(&page.name) == requested)
+                .then_some(page),
+        )
+    }
+
     /// The `icon::` property value of each named page that has one (for rendering
     /// page icons next to titles / in the namespace tree, like OG). Scans the
     /// cached pages once, then answers the requested names; only pages WITH an
     /// icon appear in the result. On-demand (e.g. a `{{namespace}}` macro), not at
     /// index time.
     pub fn page_icons(&self, names: &[String]) -> std::collections::HashMap<String, String> {
-        let (mut icons_by_name, real_page_names) = self.with_pages(|pages| {
+        let fallback = match self.indexed_or_fallback(|| self.indexed_page_icons(names)) {
+            Ok(icons) => return icons,
+            Err(fallback) => fallback,
+        };
+        let (mut icons_by_name, real_page_names) = fallback.with_pages(self, |pages| {
             let mut icons = std::collections::HashMap::new();
             let mut real = std::collections::HashSet::new();
             for (entry, doc) in pages {
@@ -117,11 +261,12 @@ impl Graph {
             (icons, real)
         });
         for (alias, canon) in self.page_aliases() {
-            if real_page_names.contains(&alias) {
+            let alias_key = crate::refs::page_key(&alias);
+            if real_page_names.contains(&alias_key) {
                 continue; // `load_named` prefers a real page over an alias fallback.
             }
             if let Some(icon) = icons_by_name.get(&crate::refs::page_key(&canon)).cloned() {
-                icons_by_name.entry(alias).or_insert(icon);
+                icons_by_name.entry(alias_key).or_insert(icon);
             }
         }
         let mut out = std::collections::HashMap::new();
@@ -155,7 +300,7 @@ impl Graph {
             .map(|entry| crate::refs::page_key(&entry.name))
             .collect();
         for (alias, _canonical) in self.page_aliases() {
-            known.insert(alias);
+            known.insert(crate::refs::page_key(&alias));
         }
         names
             .iter()
@@ -173,10 +318,12 @@ impl Graph {
     }
 
     pub(crate) fn page_aliases_with_owners(&self) -> Vec<(String, String, String)> {
-        if let Some(aliases) = self.direct_projection_page_aliases_with_owners() {
-            return aliases;
+        match self.indexed_or_fallback(|| self.direct_projection_page_aliases_with_owners()) {
+            Ok(aliases) => aliases,
+            Err(fallback) => {
+                fallback.with_pages(self, crate::query::page_aliases_with_owners_from_pages)
+            }
         }
-        crate::query::page_aliases_with_owners(self)
     }
 
     /// The page that owns a block UUID / UUID-valued `id::`, selected from the
@@ -184,9 +331,11 @@ impl Graph {
     /// still verify parser evidence, and unsupported/stale projection state
     /// falls back to an exact parser scan.
     pub fn block_page_hint(&self, uuid: &str) -> Option<String> {
-        if let Some(hint) = self.direct_projection_block_page_hint(uuid) {
-            return hint;
-        }
+        let fallback =
+            match self.indexed_or_fallback(|| self.direct_projection_block_page_hint(uuid)) {
+                Ok(hint) => return hint,
+                Err(fallback) => fallback,
+            };
         fn walk_idx(
             blocks: &[DocBlock],
             name: &str,
@@ -204,7 +353,7 @@ impl Graph {
                 walk_idx(&b.children, name, m);
             }
         }
-        let map = self.with_pages(|pages| {
+        let map = fallback.with_pages(self, |pages| {
             let mut m = std::collections::HashMap::new();
             for (entry, doc) in pages {
                 walk_idx(&doc.roots, &entry.name, &mut m);
@@ -226,26 +375,39 @@ impl Graph {
     pub(crate) fn reference_candidate_pages(
         &self,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
     ) -> ReferenceCandidatePages {
-        if let Some((pages, blocks)) =
-            self.direct_projection_reference_candidate_pages(names_norm, kind)
-        {
-            // R6: the inventory is the projection's (memoized), never a reason
-            // to build the whole parsed graph.
-            let full_page_count = self.list_pages().len();
-            return ReferenceCandidatePages {
-                pages,
-                blocks,
-                indexed: true,
-                full_page_count,
-            };
-        }
-        let pages = self.with_pages(|pages| pages.iter().cloned().collect::<Vec<_>>());
+        let indexed = self.indexed_or_fallback(|| {
+            self.direct_projection_reference_candidate_pages(
+                names_norm,
+                self_page,
+                kind,
+                crate::query::candidate::CandidateMode::Exhaustive,
+                super::direct_query::IndexWait::WhileComing,
+            )
+        });
+        let fallback = match indexed {
+            Ok((pages, blocks, page_owners)) => {
+                // R6: the inventory is the projection's (memoized), never a reason
+                // to build the whole parsed graph.
+                let full_page_count = self.list_pages().len();
+                return ReferenceCandidatePages {
+                    pages,
+                    blocks,
+                    page_owners,
+                    indexed: true,
+                    full_page_count,
+                };
+            }
+            Err(fallback) => fallback,
+        };
+        let pages = fallback.with_pages(self, |pages| pages.to_vec());
         ReferenceCandidatePages {
             full_page_count: pages.len(),
             pages,
             blocks: None,
+            page_owners: None,
             indexed: false,
         }
     }
@@ -273,29 +435,95 @@ impl Graph {
     ///   narrow (`reference_narrowing_supported`) — nothing is coming for any of
     ///   these, and refusing would remove the only route to an answer rather
     ///   than delay it.
+    ///
+    /// `Failed` refuses with `IndexFailed`: the index stopped trying this
+    /// session, and the panel shows that with a Retry instead of a whole-graph
+    /// walk (Martin, 2026-09-24, index liveness L4; GH #594).
     pub(crate) fn reference_candidate_pages_indexed(
         &self,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
     ) -> Result<ReferenceCandidatePages, crate::query::QueryExecutionError> {
         use crate::direct_projection::ProjectionProgress;
-        if let Some((pages, blocks)) =
-            self.direct_projection_reference_candidate_pages(names_norm, kind)
+        if let Some((pages, blocks, page_owners)) = self
+            .direct_projection_reference_candidate_pages(
+                names_norm,
+                self_page,
+                kind,
+                if kind == ReferenceKind::Plain {
+                    crate::query::candidate::CandidateMode::interactive()
+                } else {
+                    crate::query::candidate::CandidateMode::Exhaustive
+                },
+                super::direct_query::IndexWait::Bounded,
+            )
         {
             let full_page_count = self.list_pages().len();
             return Ok(ReferenceCandidatePages {
                 pages,
                 blocks,
+                page_owners,
                 indexed: true,
                 full_page_count,
             });
         }
         if crate::direct_projection::reference_narrowing_supported(names_norm, kind) {
-            if let Some(ProjectionProgress::Working(reason)) = self.direct_projection_progress() {
-                return Err(crate::query::QueryExecutionError::NotReady(reason));
+            match self.direct_projection_progress() {
+                Some(ProjectionProgress::Working(reason)) => {
+                    return Err(crate::query::QueryExecutionError::NotReady(reason));
+                }
+                Some(ProjectionProgress::Failed(class)) => {
+                    return Err(crate::query::QueryExecutionError::Unavailable(
+                        crate::query::QueryUnavailableReason::IndexFailed(class),
+                    ));
+                }
+                _ => {}
             }
         }
-        Ok(self.reference_candidate_pages(names_norm, kind))
+        Ok(self.reference_candidate_pages(names_norm, self_page, kind))
+    }
+
+    /// A reference panel's first question, before its alias and page-name
+    /// lookups: can the index answer it now? Those lookups wait for index
+    /// work that is coming, so a panel asked while the index built waited up
+    /// to their patience, only to be told "not ready" by the bounded step
+    /// after them (GH #594: the first backlinks read never completed). The
+    /// panel is told at once what the index is doing, within the same bounded
+    /// wait the candidate read makes, and the reader retries or shows the
+    /// failure (index liveness L3/L4). A target the index cannot narrow
+    /// passes: its answer is the page walk whatever the index does.
+    pub(crate) fn reference_readiness(
+        &self,
+        target: &str,
+        kind: ReferenceKind,
+    ) -> Result<(), crate::query::QueryExecutionError> {
+        use crate::direct_projection::ProjectionProgress;
+        let Some(projection) = self.direct_projection.get() else {
+            return Ok(());
+        };
+        if !crate::direct_projection::reference_narrowing_supported(&[target.to_owned()], kind) {
+            return Ok(());
+        }
+        let at = crate::direct_projection::ReadAt {
+            generation: self.cache_generation(),
+            currency: Self::read_currency(),
+        };
+        // A display read may take the stored image during the launch check.
+        if projection.wait_for_reference_generation(at) {
+            return Ok(());
+        }
+        match projection.progress_at(self.cache_generation()) {
+            ProjectionProgress::Working(reason) => {
+                Err(crate::query::QueryExecutionError::NotReady(reason))
+            }
+            ProjectionProgress::Failed(class) => {
+                Err(crate::query::QueryExecutionError::Unavailable(
+                    crate::query::QueryUnavailableReason::IndexFailed(class),
+                ))
+            }
+            _ => Ok(()),
+        }
     }
 
     pub(crate) fn reference_real_page_names(&self) -> Option<crate::query::RealPageNames> {
@@ -309,10 +537,12 @@ impl Graph {
     /// The exact-generation SQLite projection is the ready route; its parser
     /// fallback is used only while that disposable projection is unavailable.
     pub fn block_ref_counts(&self) -> io::Result<Arc<std::collections::HashMap<String, usize>>> {
-        if let Some(counts) = self.direct_projection_block_ref_counts() {
-            return Ok(Arc::new(counts));
-        }
-        let map = self.with_pages(|pages| -> io::Result<_> {
+        let fallback = match self.indexed_or_fallback(|| self.direct_projection_block_ref_counts())
+        {
+            Ok(counts) => return Ok(Arc::new(counts)),
+            Err(fallback) => fallback,
+        };
+        let map = fallback.with_pages(self, |pages| -> io::Result<_> {
             let mut counts = std::collections::HashMap::new();
             for (_entry, doc) in pages {
                 for (id, count) in document_block_ref_counts(doc)? {
@@ -383,6 +613,45 @@ impl Graph {
     /// stable and consistent with queries / refs / the sidebar. Falls back to a
     /// disk parse for a page not yet in the cache (e.g. just created externally).
     pub fn load_page(&self, entry: &PageEntry) -> io::Result<PageDto> {
+        match self.load_exact_path(&entry.path)? {
+            Some(dto) => Ok(dto),
+            None => {
+                self.forget_file(&entry.path);
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            }
+        }
+    }
+
+    /// Load a page from a SPECIFIC file by its graph-root-relative path. This
+    /// is how a duplicate-day stray (`journals/Friday, 26-06-2026.org`) --
+    /// which shares a `(kind,name)` with the canonical `2026_06_26.org` and so
+    /// is unreachable by name -- gets opened and edited (#21). The cache is
+    /// keyed by path, so the stray's own slot is what it reads and publishes.
+    /// Returns `Ok(None)` if the path is invalid (see [`resolve_rel`]) or the
+    /// file is gone. A path spelled in another case than its file on disk
+    /// opens that file (GH #597); the returned `path` is the disk spelling.
+    pub fn load_by_path(&self, rel: &str) -> io::Result<Option<PageDto>> {
+        let Some(abs) = self
+            .resolve_rel(rel)
+            .or_else(|| self.resolve_rel_disk_spelling(rel))
+        else {
+            return Ok(None);
+        };
+        if self.entry_for_path(&abs).is_none() {
+            return Ok(None);
+        }
+        self.load_exact_path(&abs)
+    }
+
+    /// The one way a page is opened, by name or by path: read the exact file,
+    /// publish what was read through the page-delta path (so the index is
+    /// sent the same bytes the editor shows) unless the ready index already
+    /// holds those bytes, and answer from the cache when it holds them. `load_by_path` used to publish the page's ids on its
+    /// own, with no delta and outside the cache lock: a warm then took the
+    /// page as already sent to the index, and the watcher's later delivery of
+    /// the same bytes was suppressed, so search and queries missed the edit
+    /// for good (GH #543, audit R4-02).
+    fn load_exact_path(&self, path: &Path) -> io::Result<Option<PageDto>> {
         // A read is NOT an activation, and must not revoke one. Re-hydrating a
         // page that is already open — which this path does constantly — would
         // otherwise disarm a live banner the user can still see. The genuine
@@ -396,65 +665,28 @@ impl Graph {
             content,
             revision,
             file_identity,
-        }) = self.load_validated_graph_text_target(&permit, &entry.path)?
+        }) = self.load_validated_graph_text_target(&permit, path)?
         else {
-            self.forget_file(&entry.path);
-            return Err(io::Error::from(io::ErrorKind::NotFound));
+            return Ok(None);
         };
-        self.sync_file_content(None, &entry.path, &content, false)?;
+        if !self.publish_page_the_index_holds(path, &revision, &document) {
+            self.sync_file_content(None, path, &content, false)?;
+        }
         self.loaded_file_identities
             .write()
             .unwrap()
-            .insert(entry.path.clone(), (revision.clone(), file_identity));
+            .insert(path.to_path_buf(), (revision.clone(), file_identity));
 
         if let Some(mut dto) = self.peek_cached_page(&effective) {
-            dto.read_only = read_only_org(&entry.path, &content);
+            dto.read_only = read_only_org(path, &content);
             dto.rev = Some(revision);
-            dto.path = self.rel_path(&entry.path);
-            return Ok(dto);
+            dto.path = self.rel_path(path);
+            return Ok(Some(dto));
         }
         let mut dto = page_dto_checked(&effective, &document)?;
-        dto.read_only = read_only_org(&entry.path, &content);
+        dto.read_only = read_only_org(path, &content);
         dto.rev = Some(revision);
-        dto.path = self.rel_path(&entry.path);
-        Ok(dto)
-    }
-
-    /// Load a page from a SPECIFIC file by its graph-root-relative path, parsing it
-    /// directly and bypassing the `(kind,name)` page cache + `disk_revs`. This is
-    /// how a duplicate-day stray (`journals/Friday, 26-06-2026.org`) — which shares
-    /// a `(kind,name)` with the canonical `2026_06_26.org` and so is unreachable by
-    /// name — gets opened and edited (#21). The direct parse is deliberate: the
-    /// cache slot for that `(kind,name)` holds the CANONICAL file, so a cache lookup
-    /// here would serve the wrong file's content. Returns `Ok(None)` if the path is
-    /// invalid (see [`resolve_rel`]) or the file is gone.
-    pub fn load_by_path(&self, rel: &str) -> io::Result<Option<PageDto>> {
-        let Some(abs) = self.resolve_rel(rel) else {
-            return Ok(None);
-        };
-        // A read is NOT an activation — see `load_page`. (GH #254 increment 3.)
-        if self.entry_for_path(&abs).is_none() {
-            return Ok(None);
-        }
-        let permit = self.admit_retained_graph_text_writer()?;
-        let Some(ExactGraphLoadedPage {
-            entry: effective,
-            document,
-            content,
-            revision,
-            file_identity,
-        }) = self.load_validated_graph_text_target(&permit, &abs)?
-        else {
-            return Ok(None);
-        };
-        self.loaded_file_identities
-            .write()
-            .unwrap()
-            .insert(abs.clone(), (revision.clone(), file_identity));
-        let mut dto = page_dto_checked(&effective, &document)?;
-        dto.read_only = read_only_org(&abs, &content);
-        dto.rev = Some(revision);
-        dto.path = self.rel_path(&abs);
+        dto.path = self.rel_path(path);
         Ok(Some(dto))
     }
 

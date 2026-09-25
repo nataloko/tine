@@ -1,7 +1,9 @@
 //! Graph's page rename and delete: the rename transaction (with its editor
 //! lifecycle), page deletion, and the page-mutation target and external-scope guards.
 
+use super::graph_text_targets::PortableListingBatch;
 use super::*;
+use crate::direct_projection::PageSetChange;
 
 impl Graph {
     /// Rename a page, OG-style. Moves its file to the new name and rewrites every
@@ -37,7 +39,26 @@ impl Graph {
         new: &str,
         expected_path: Option<&str>,
     ) -> io::Result<RenameOutcome> {
+        self.rename_page_guarded(old, new, expected_path, &[])
+    }
+
+    /// `rename_page_reporting`, refusing to move or rewrite any file in
+    /// `unsaved_paths` (graph-root-relative).
+    ///
+    /// The frontend passes the pages whose edits it could not save. A rename
+    /// no longer needs every page in the graph saved first, only the ones it
+    /// touches, and it cannot know which those are until the transaction has
+    /// read the graph; rewriting a file under an unsaved edit would turn that
+    /// edit into a conflict against bytes the user never saw (GH #535).
+    pub fn rename_page_guarded(
+        &self,
+        old: &str,
+        new: &str,
+        expected_path: Option<&str>,
+        unsaved_paths: &[String],
+    ) -> io::Result<RenameOutcome> {
         let write = self.admit_graph_text_writer()?;
+        self.list_pages_before_identity_lock();
         let _identity = self.lock_graph_text_identity_mutation()?;
         let old = old.trim();
         let new = new.trim();
@@ -45,7 +66,6 @@ impl Graph {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty name"));
         }
         if old.is_empty() || crate::refs::same_page(old, new) {
-            self.finish_successful_rename_editor_lifecycle();
             return Ok(RenameOutcome::default()); // nothing to do (case-only rename is intentionally a no-op)
         }
         self.block_external_scope_mutation(&write, old, PageKind::Page, expected_path, "rename")?;
@@ -139,7 +159,7 @@ impl Graph {
             };
             // Keep the page's own physical extension on rename (an .markdown page
             // stays .markdown; an .org page stays .org).
-            let encoded_new = encode_page_name(&new_name, self.config.file_name_format);
+            let encoded_new = encode_page_name(&new_name, self.config().file_name_format);
             let entry_extension = text_extension_from_path(&entry.path).ok_or_else(bad_path)?;
             let new_path = self
                 .pages_path()
@@ -231,6 +251,10 @@ impl Graph {
             _new_reservation: RetainedContentReservation,
             base_rev: String,
             is_move: bool,
+            /// The page as it was BEFORE this edit. A move retires its old
+            /// `rel_path` from the projection, which is the only way the
+            /// index learns that the file it holds rows for is gone.
+            src_entry: PageEntry,
         }
         let _move_map_charge = content_budget.reserve(
             checked_mul_bytes(
@@ -267,12 +291,19 @@ impl Graph {
         let mut edits_charge =
             RetainedHeapCharge::new(Some(&content_budget), "graph rename edit vector")?;
         for entry in entries.iter() {
-            let content = self.graph_text_read_to_string_with_budget(
-                &write,
-                &entry.path,
-                &mut content_budget,
-                "graph rename baseline bytes",
-            )?;
+            // A file the rename cannot read fails it, naming that file: an
+            // error that named none left the user no way to find it (audit
+            // R15-09).
+            let content = self
+                .graph_text_read_to_string_with_budget(
+                    &write,
+                    &entry.path,
+                    &mut content_budget,
+                    "graph rename baseline bytes",
+                )
+                .map_err(|error| {
+                    io::Error::new(error.kind(), format!("{}: {error}", entry.rel_path))
+                })?;
             let is_org = Format::from_path(&entry.path) == Format::Org;
             // One inline-ref pass + one `tags::` pass per file (each computes code
             // ranges once), regardless of how many descendants are being renamed.
@@ -284,7 +315,7 @@ impl Graph {
                 &content,
                 &rename_map,
                 is_org,
-                self.config.file_name_format,
+                self.config().file_name_format,
             );
             inline_reservation.resize(
                 usize_to_u64(inline.capacity())?,
@@ -355,7 +386,10 @@ impl Graph {
                                 owned_path_upper_bound(&entry.path)?,
                                 checked_add_bytes(
                                     owned_path_upper_bound(dst)?,
-                                    owned_string_upper_bound(&base_rev)?,
+                                    checked_add_bytes(
+                                        owned_string_upper_bound(&base_rev)?,
+                                        Self::retained_page_entry_bytes(&entry)?,
+                                    )?,
                                 )?,
                             )?,
                         )?,
@@ -370,6 +404,7 @@ impl Graph {
                         new_content: updated,
                         _new_reservation: updated_reservation,
                         is_move: true,
+                        src_entry: entry.clone(),
                     });
                 }
                 None if changed => {
@@ -378,7 +413,10 @@ impl Graph {
                             conservative_vec_entry_bytes::<Edit>()?,
                             checked_add_bytes(
                                 checked_mul_bytes(owned_path_upper_bound(&entry.path)?, 2)?,
-                                owned_string_upper_bound(&base_rev)?,
+                                checked_add_bytes(
+                                    owned_string_upper_bound(&base_rev)?,
+                                    Self::retained_page_entry_bytes(&entry)?,
+                                )?,
                             )?,
                         )?,
                         "graph rename edit vector",
@@ -392,6 +430,7 @@ impl Graph {
                         new_content: updated,
                         _new_reservation: updated_reservation,
                         is_move: false,
+                        src_entry: entry.clone(),
                     });
                 }
                 None => {
@@ -403,8 +442,20 @@ impl Graph {
             }
         }
         if edits.is_empty() {
-            self.finish_successful_rename_editor_lifecycle();
             return Ok(RenameOutcome::default()); // page doesn't exist / nothing references it
+        }
+        if let Some(blocked) = edits
+            .iter()
+            .find(|edit| unsaved_paths.contains(&self.rel_path(&edit.src)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "“{}” has changes Tine could not save, and this rename would rewrite it. \
+                     Save or discard those changes, then rename again.",
+                    blocked.src_entry.name
+                ),
+            ));
         }
 
         // Phase 1 — lock every touched path (src + move dst), sorted + deduped
@@ -473,6 +524,9 @@ impl Graph {
         // external replacement at the syscall boundary is preserved as an inode.
         let mut written: Vec<(&Edit, Option<PathBuf>)> = Vec::new();
         let result: io::Result<()> = (|| {
+            // GH #406: list each directory once for the whole write phase
+            // instead of once per written file (see `PortableListingBatch`).
+            let listings = PortableListingBatch::begin();
             for e in &edits {
                 // Phase 2 can be far in the past for a large graph. Recheck this
                 // exact file immediately before its write so an external editor or
@@ -486,12 +540,19 @@ impl Graph {
                         self.graph_text_create_dir_all(&write, parent)?;
                     }
                 }
-                self.graph_text_atomic_write_from_transaction_inventory(
-                    &write,
-                    &e.dst,
-                    e.new_content.as_bytes(),
-                    e.is_move && e.dst != e.src,
-                )?;
+                let publish = || {
+                    self.graph_text_atomic_write_from_transaction_inventory(
+                        &write,
+                        &e.dst,
+                        e.new_content.as_bytes(),
+                        e.is_move && e.dst != e.src,
+                    )
+                };
+                if e.is_move && e.dst != e.src {
+                    listings.suspended(publish)?;
+                } else {
+                    publish()?;
+                }
                 written.push((e, None));
                 if e.is_move && e.dst != e.src {
                     rename_source_remove_failpoint()?;
@@ -511,6 +572,7 @@ impl Graph {
                     }
                 }
             }
+            drop(listings);
             Ok(())
         })();
         if let Err(err) = result {
@@ -560,7 +622,20 @@ impl Graph {
                     }
                 }
             }
-            self.invalidate_cache_after_tine_mutation();
+            let coming = self.index_delta_coming();
+            self.discard_parsed_cache(
+                edits
+                    .iter()
+                    .flat_map(|edit| [edit.src.clone(), edit.dst.clone()])
+                    .collect(),
+                graph_drift::IndexEffect::Sent(&coming),
+            );
+            self.reconcile_failed_graph_text_paths(
+                &write,
+                edits
+                    .iter()
+                    .flat_map(|edit| [edit.src.as_path(), edit.dst.as_path()]),
+            );
             return Err(err);
         }
         // The rename transaction already retains every changed document's final
@@ -568,50 +643,151 @@ impl Graph {
         // the parsed cache: unchanged entries preserve their exact physical and
         // effective identity, while only the edited subset is reparsed. A cold or
         // already-stale memo remains cold and retains the ordinary disk rebuild.
-        let updated_page_inventory =
-            page_inventory_snapshot.map(|(mut inventory, mut failures)| {
-                for edit in &edits {
-                    inventory.retain(|entry| entry.path != edit.src);
-                    let src_rel = self.rel_path(&edit.src);
-                    let dst_rel = self.rel_path(&edit.dst);
-                    failures.retain(|failure| failure != &src_rel && failure != &dst_rel);
-                    let parsed = self
-                        .graph_inventory_entry(&edit.dst)
-                        .ok()
-                        .flatten()
-                        .and_then(|entry| {
-                            parse_exact_page(self, &entry, &edit.new_content)
-                                .ok()
-                                .map(|(effective, _, _)| effective)
-                        });
-                    if let Some(entry) = parsed {
-                        inventory.push(entry);
-                    } else {
-                        failures.push(dst_rel);
-                    }
-                }
-                (inventory, failures)
-            });
-        self.invalidate_cache_after_tine_mutation();
-        if let Some((inventory, failures)) = updated_page_inventory {
-            self.publish_page_inventory_snapshot(inventory, failures);
+        let outcomes = edits
+            .iter()
+            .map(|edit| {
+                self.graph_inventory_entry(&edit.dst)
+                    .ok()
+                    .flatten()
+                    .and_then(|entry| {
+                        parse_exact_page(self, &entry, &edit.new_content)
+                            .ok()
+                            .map(|(effective, _, _)| effective)
+                    })
+            })
+            .collect::<Vec<_>>();
+        // What the rename wrote is what the disk holds now: a moved page's
+        // old path owns nothing, and a replacement that does not parse is
+        // unreadable. Recorded by path, before the discard moves the
+        // generation; the discard no longer clears the record (audit R15-02).
+        for (edit, parsed) in edits.iter().zip(&outcomes) {
+            if edit.dst != edit.src {
+                self.note_graph_text_state(&edit.src, true);
+            }
+            self.note_graph_text_state(&edit.dst, parsed.is_some());
         }
-        self.finish_successful_rename_editor_lifecycle();
+        let updated_page_inventory = page_inventory_snapshot.map(|mut inventory| {
+            for (edit, parsed) in edits.iter().zip(outcomes) {
+                inventory.retain(|entry| entry.path != edit.src);
+                if let Some(entry) = parsed {
+                    inventory.push(entry);
+                }
+            }
+            inventory
+        });
+        let coming = self.index_delta_coming();
+        self.discard_parsed_cache(
+            edits
+                .iter()
+                .flat_map(|edit| [edit.src.clone(), edit.dst.clone()])
+                .collect(),
+            graph_drift::IndexEffect::Sent(&coming),
+        );
+        if let Some(inventory) = updated_page_inventory {
+            self.publish_page_inventory_snapshot(inventory);
+        }
+        // GH #543: a rename is a PRODUCER, exactly as a delete is.
+        // Discarding the parsed cache only moves the generation, and an
+        // existing complete committed image may still answer while an
+        // ordinary queued delta converges it. With no producer there
+        // was nothing to converge and nothing to refuse, so
+        // search went on answering with the renamed page's OLD name and path
+        // indefinitely, offering a page that no longer existed; and because
+        // the query SUCCEEDED it never reached the repair a refusal starts
+        // (third audit A3-F1). `cache_remove` has always published its own
+        // delta for a delete; the rename published none.
+        //
+        // The transaction still holds every changed page's final bytes, so
+        // these deltas are exact and need no graph-wide reparse. A page whose
+        // replacement cannot be parsed keeps its existing rows rather than
+        // losing them: stale beats absent, and `page_index_failures` already
+        // names it (the same rule as an unreadable page in a warm).
+        let projection_generation = self.cache_gen.load(std::sync::atomic::Ordering::Acquire);
+        let mut page_set = Vec::new();
+        for edit in &edits {
+            let replacement = self
+                .graph_inventory_entry(&edit.dst)
+                .ok()
+                .flatten()
+                .and_then(|entry| parse_exact_page(self, &entry, &edit.new_content).ok());
+            let Some((effective, document, revision)) = replacement else {
+                continue;
+            };
+            if edit.is_move && edit.dst != edit.src {
+                page_set.push(PageSetChange::Delete {
+                    entry: edit.src_entry.clone(),
+                });
+            }
+            page_set.push(PageSetChange::Replace {
+                entry: effective,
+                document: Arc::new(document),
+                revision,
+            });
+        }
+        self.direct_projection_publish_page_set(projection_generation, page_set);
+        let touched = edits
+            .iter()
+            .map(|edit| RenameTouchedPage {
+                name: edit.src_entry.name.clone(),
+                kind: edit.src_entry.kind,
+                path: self.rel_path(&edit.src),
+                renamed_to: (edit.is_move && edit.dst != edit.src)
+                    .then(|| {
+                        rename_map
+                            .get(&crate::refs::normalize(&edit.src_entry.name))
+                            .cloned()
+                    })
+                    .flatten(),
+            })
+            .collect();
+        self.finish_successful_rename_editor_lifecycle(
+            &edits
+                .iter()
+                .map(|edit| (&edit.src, &edit.dst, edit.is_move && edit.dst != edit.src))
+                .collect::<Vec<_>>(),
+        );
         Ok(RenameOutcome {
             skipped_conflicted_referrers,
+            touched,
         })
     }
 
-    /// An ordinary rename resets the frontend's entire working set because the
-    /// transaction can rewrite references in every open page.  The Graph itself
-    /// remains bound, so its activation registry would otherwise outlive those
-    /// destroyed editor instances and a later `Reuse` could inherit a dead
-    /// editor's authority.  Burn the whole graph-wide editor generation only
-    /// after a successful rename; an error leaves the still-mounted editors and
-    /// their conflict banners intact.
-    fn finish_successful_rename_editor_lifecycle(&self) {
-        self.editor_activations.lock().unwrap().live.clear();
-        self.revoke_all_conflict_authority();
+    /// The owned bytes a retained [`PageEntry`] adds to the edit vector, so
+    /// carrying the pre-edit page through the transaction is charged like every
+    /// other retained string in it.
+    fn retained_page_entry_bytes(entry: &PageEntry) -> io::Result<u64> {
+        checked_add_bytes(
+            owned_string_upper_bound(&entry.name)?,
+            checked_add_bytes(
+                owned_string_upper_bound(&entry.rel_path)?,
+                owned_path_upper_bound(&entry.path)?,
+            )?,
+        )
+    }
+
+    /// The frontend reloads only the pages a rename touched (GH #535), so only
+    /// those lose their editor state here. A MOVED page's editor is destroyed
+    /// with its old name, so its activation is retired and a later `Reuse` on
+    /// that path cannot inherit it. A page rewritten in place keeps its editor:
+    /// a clean one is reloaded by the frontend, which replaces the activation
+    /// itself, and one edited during the rename must still save against its own
+    /// activation, where the rewrite surfaces as an ordinary reviewable
+    /// conflict. Conflict authority observed before the rewrite is revoked for
+    /// every touched path. Untouched pages keep everything. An error leaves the
+    /// still-mounted editors and their conflict banners intact.
+    fn finish_successful_rename_editor_lifecycle(&self, touched: &[(&PathBuf, &PathBuf, bool)]) {
+        {
+            let mut activations = self.editor_activations.lock().unwrap();
+            for (src, _, moved) in touched {
+                if *moved {
+                    activations.live.remove(*src);
+                }
+            }
+        }
+        for (src, dst, _) in touched {
+            self.revoke_conflict_authority(src);
+            self.revoke_conflict_authority(dst);
+        }
     }
 
     /// Delete a page/journal file. Rather than unlinking, the file is moved to a
@@ -630,6 +806,7 @@ impl Graph {
         expected_path: Option<&str>,
     ) -> io::Result<()> {
         let write = self.admit_graph_text_writer()?;
+        self.list_pages_before_identity_lock();
         let _identity = self.lock_graph_text_identity_mutation()?;
         self.block_external_scope_mutation(&write, name, kind, expected_path, "delete")?;
         let entries = self.configured_text_entries(&write, false)?;
@@ -693,7 +870,7 @@ impl Graph {
                 ),
             ));
         }
-        if self.list_pages().iter().any(|entry| {
+        if self.try_list_pages()?.iter().any(|entry| {
             entry.kind == kind
                 && crate::refs::same_page(&entry.name, name)
                 && self
@@ -708,6 +885,15 @@ impl Graph {
             ));
         }
         Ok(())
+    }
+
+    /// Wait for the page list before taking the identity lock, so that the
+    /// scope check under it ([`Self::block_external_scope_mutation`]) reads
+    /// the list memo instead of waiting for the index while every save and
+    /// page creation waits on the lock (GH #406, GH #594 L3). The check
+    /// itself still runs under the lock, on the list current there.
+    fn list_pages_before_identity_lock(&self) {
+        let _ = self.try_list_pages();
     }
 
     /// Validate the snapshot captured by a page menu/title before any mutation.

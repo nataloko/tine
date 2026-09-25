@@ -114,7 +114,7 @@ impl Graph {
                         .parse(base_stem)
                         .map(|d| self.journal_format.title(d))
                         .unwrap_or_else(|| base_stem.to_string()),
-                    PageKind::Page => decode_page_name(base_stem, self.config.file_name_format),
+                    PageKind::Page => decode_page_name(base_stem, self.config().file_name_format),
                 };
                 let tag = stem[base_stem.len()..]
                     .trim_matches(|c: char| c == '.' || c == ' ' || c == '(' || c == ')')
@@ -184,7 +184,7 @@ impl Graph {
                         .parse(stem)
                         .map(|d| self.journal_format.title(d))
                         .unwrap_or_else(|| stem.to_string()),
-                    PageKind::Page => decode_page_name(stem, self.config.file_name_format),
+                    PageKind::Page => decode_page_name(stem, self.config().file_name_format),
                 };
                 out.push(VcsMarkerConflict {
                     path: self.rel_path(&p),
@@ -219,6 +219,27 @@ impl Graph {
         }
     }
 
+    /// Everything the conflicts UI shows, from one pass over the graph: the
+    /// conflict copies, the marker-bearing pages, and the queue derived from
+    /// both. The marker scan reads every page file; the UI used to ask for the
+    /// three separately, and the queue asked for both lists again, so each
+    /// refresh read every page twice (GH #543, audit R8-09).
+    pub fn conflict_inventory(&self) -> ConflictInventory {
+        let sync_conflicts = self.list_sync_conflicts();
+        let vcs_markers = self.list_vcs_marker_conflicts();
+        let queue = self.conflict_queue_from(&sync_conflicts, &vcs_markers);
+        ConflictInventory {
+            sync_conflicts,
+            vcs_markers,
+            queue,
+        }
+    }
+
+    /// The queue alone; see [`Graph::conflict_inventory`].
+    pub fn conflict_queue(&self) -> Vec<crate::concord_queue::ConflictObject> {
+        self.conflict_inventory().queue
+    }
+
     /// The Concord conflict queue (L3): ONE derived inventory of everything on
     /// disk that needs the user's judgement, from both artifact sources.
     ///
@@ -226,14 +247,18 @@ impl Graph {
     /// and no cache is consulted, so the queue survives a restart trivially: the
     /// same on-disk state recomputes the same objects with the same ids. Block
     /// counts are computed here because conflicts are few (a handful at most) and
-    /// each costs one parse of two small texts; the two directory walks the
-    /// sources already do dominate.
-    pub fn conflict_queue(&self) -> Vec<crate::concord_queue::ConflictObject> {
+    /// each costs one parse of two small texts; the directory walks that list
+    /// the sources dominate.
+    fn conflict_queue_from(
+        &self,
+        copies: &[SyncConflict],
+        marked_pages: &[VcsMarkerConflict],
+    ) -> Vec<crate::concord_queue::ConflictObject> {
         use crate::concord_queue::{
             decidable_row_count, ConflictObject, ConflictSide, ConflictSource, SideRole,
         };
         let mut out = Vec::new();
-        for copy in self.list_sync_conflicts() {
+        for copy in copies {
             let Some(winner) = copy.base_path.clone() else {
                 // The page it shadowed is gone — it is a stray, not a two-sided
                 // conflict; the Settings panel offers to discard it. Nothing to
@@ -275,7 +300,7 @@ impl Graph {
                 markers: Vec::new(),
             });
         }
-        for marked in self.list_vcs_marker_conflicts() {
+        for marked in marked_pages {
             let parsed = self.vcs_marker_conflict_diff(&marked.path).ok().flatten();
             let label = |pick: fn(&crate::concord_queue::MarkerConflictDiff) -> &str,
                          fallback: &str| {
@@ -615,9 +640,19 @@ impl Graph {
         })
     }
 
-    /// Capture the complete restart-recoverable presentation while the original
-    /// one-shot editor authority is still live. This inspects but does not
-    /// consume that authority.
+    /// Capture the complete restart-recoverable presentation. While the
+    /// original one-shot editor authority is still live this inspects (never
+    /// consumes) it, so the review shows the exact disk bytes that were refused.
+    ///
+    /// When that authority is already gone -- any watcher reconcile of the path
+    /// (including the echo of the write that caused the conflict) or, on
+    /// Windows, any uncertain delete/rename anywhere in the graph revokes it
+    /// in the gap before this call -- the capture is taken from the disk as it
+    /// is now instead (GH #490). That is exactly the capture a restart
+    /// recovers from, and resolution rechecks its `disk_rev` under the page
+    /// lock, so nothing is authorized that the durable path would not.
+    /// Refusing here used to leave a banner whose review could never load
+    /// after a restart.
     pub fn capture_live_save_conflict(
         &self,
         page: &PageDto,
@@ -625,7 +660,12 @@ impl Graph {
         presented: ConflictOverride,
     ) -> io::Result<LiveSaveConflictCapture> {
         let (path, theirs_text, base_text) =
-            self.live_save_conflict_parts(page, base_rev, presented)?;
+            match self.live_save_conflict_parts(page, base_rev, presented) {
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    return self.durable_live_save_conflict_capture(page, base_rev);
+                }
+                parts => parts?,
+            };
         let theirs_text = theirs_text.unwrap_or_default();
         let mine = page_dto_document(page)?;
         let theirs = parse_doc(&path, &theirs_text);
@@ -640,6 +680,75 @@ impl Graph {
             diff,
             base_text,
         })
+    }
+
+    /// The durable capture: the review against the disk as it is now, with the
+    /// editor's loaded base when this process still holds it.
+    fn durable_live_save_conflict_capture(
+        &self,
+        page: &PageDto,
+        base_rev: Option<&str>,
+    ) -> io::Result<LiveSaveConflictCapture> {
+        let base_text = {
+            let write = self.admit_graph_text_writer()?;
+            let (path, _) = self.save_target(&write, page)?;
+            page.activation
+                .map(EditorActivation::from_u64)
+                .and_then(|activation| self.editor_activation_baseline(&path, activation, base_rev))
+        };
+        let diff = self.durable_live_save_conflict_diff(page, base_text.as_deref())?;
+        Ok(LiveSaveConflictCapture {
+            disk_rev: diff.conflict_rev.clone(),
+            diff,
+            base_text,
+        })
+    }
+
+    /// Review an app-private live-conflict capsule. A capsule with a captured
+    /// `disk_rev`, or one whose session-scoped authority is gone (after a
+    /// restart, or revoked by a watcher event before the capture ran), is
+    /// reviewed durably against the disk as it is now. Only a capsule still
+    /// holding live authority in this process uses it (GH #490: a restored
+    /// captureless capsule used to fail this review on every attempt).
+    pub fn review_live_save_conflict_capsule(
+        &self,
+        page: &PageDto,
+        base_rev: Option<&str>,
+        conflict_epoch: i64,
+        base_text: Option<&str>,
+        disk_rev: Option<&str>,
+    ) -> io::Result<(
+        crate::sync_diff::SyncConflictDiff,
+        LiveSaveConflictReviewAuthority,
+    )> {
+        if disk_rev.is_none() {
+            if let Ok(observation_epoch) = u64::try_from(conflict_epoch) {
+                match self.live_save_conflict_diff(
+                    page,
+                    base_rev,
+                    ConflictOverride { observation_epoch },
+                ) {
+                    Ok(diff) => {
+                        return Ok((
+                            diff,
+                            LiveSaveConflictReviewAuthority::Live {
+                                conflict_epoch: observation_epoch,
+                            },
+                        ))
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        let diff = self.durable_live_save_conflict_diff(page, base_text)?;
+        // The capsule selects recovery mode; the newly displayed disk snapshot
+        // supplies authority for this review.
+        let expected_disk_rev = diff.conflict_rev.clone();
+        Ok((
+            diff,
+            LiveSaveConflictReviewAuthority::Durable { expected_disk_rev },
+        ))
     }
 
     /// Recompute a durable live-conflict review against the disk as it exists
@@ -1155,6 +1264,12 @@ impl Graph {
         let win_cacheable = self.graph_text_path_is_cacheable(&write, &win)?;
         // Stage-before-commit (L5): move the conflict copy out first, then write the
         // merged winner; roll the move back if the write fails.
+        // Retained for the projection before the move takes the path away. A
+        // provider conflict copy is not eligible graph text, so this is `None`
+        // for the ordinary sync-copy resolve and `Some` exactly when this
+        // shared implementation is reconciling a DUPLICATE JOURNAL DAY, whose
+        // stray is a real indexed page (GH #543, fifth audit A5-N1).
+        let retired = self.entry_for_path(&conf);
         let trash = typed_trash_dir(&self.root, TrashEntryKind::Conflict);
         self.graph_text_create_dir_all(&write, &trash)?;
         let conf_name = conf.file_name().and_then(|s| s.to_str()).unwrap_or("file");
@@ -1182,9 +1297,17 @@ impl Graph {
             Err(error) => {
                 let _ = graph_text_write_during_rollback_hook();
                 let _ = self.graph_text_move_noreplace(&write, &staged, &conf);
+                self.reconcile_failed_graph_text_paths(&write, [conf.as_path(), win.as_path()]);
                 return Err(error);
             }
         };
+        // The stray is in the trash and its line has been folded into the
+        // winner. Nothing retired its rows, so the folded-in text was served
+        // TWICE — once from the live file and once from a file that no longer
+        // exists — with the index ready, nothing queued and no progress shown.
+        if let Some(entry) = retired {
+            self.cache_remove_path(&entry);
+        }
         // The conflict copy is resolved and trashed — its pinned base (if any)
         // has served its purpose; let the ledger forget it (best-effort).
         if let Some(ledger) = self.concord_ledger.get() {

@@ -271,8 +271,9 @@ fn search_reflects_toggle_on_named_page() {
     let mut dto = g.load_named("Tasks", PageKind::Page).unwrap().unwrap();
     dto.blocks[0].raw = dto.blocks[0].raw.replace("TODO", "DOING");
     g.save_page(&dto, dto.rev.as_deref()).expect("save");
-    assert!(
-        !ready_query::when_ready(|| g.search("DOING", 20)).is_empty(),
+    assert_eq!(
+        ready_query::when_search_hits(&g, "DOING", 1),
+        1,
         "named: DOING found after save"
     );
     assert!(
@@ -296,8 +297,9 @@ fn search_reflects_toggle_on_journal_page() {
     let mut dto = g.load_named(&title, PageKind::Journal).unwrap().unwrap();
     dto.blocks[0].raw = dto.blocks[0].raw.replace("TODO", "DOING");
     g.save_page(&dto, dto.rev.as_deref()).expect("journal save");
-    assert!(
-        !ready_query::when_ready(|| g.search("DOING", 20)).is_empty(),
+    assert_eq!(
+        ready_query::when_search_hits(&g, "DOING", 1),
+        1,
         "journal: DOING found after save"
     );
     assert!(
@@ -751,7 +753,12 @@ fn page_icons_answer_from_cached_pages_with_page_key_lookup() {
     let root = mk("page-icons-cache");
     std::fs::write(
         root.join("pages").join("IconPage.md"),
-        "icon:: star\nalias:: Icon Alias\n- body\n",
+        "icon:: star\nalias:: Icon Alias, MiXeD Alias, Shadow Name\n- body\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pages").join("shadow name.md"),
+        "icon:: moon\n- real page wins over alias identity\n",
     )
     .unwrap();
     std::fs::write(root.join("pages").join("NoIcon.md"), "- body\n").unwrap();
@@ -762,13 +769,30 @@ fn page_icons_answer_from_cached_pages_with_page_key_lookup() {
     let icons = g.page_icons(&[
         "iconpage".to_string(),
         "Icon Alias".to_string(),
+        "mixed alias".to_string(),
+        "SHADOW NAME".to_string(),
         "NoIcon".to_string(),
         "Missing".to_string(),
     ]);
     assert_eq!(icons.get("iconpage").map(String::as_str), Some("star"));
     assert_eq!(icons.get("Icon Alias").map(String::as_str), Some("star"));
+    assert_eq!(icons.get("mixed alias").map(String::as_str), Some("star"));
+    assert_eq!(
+        icons.get("SHADOW NAME").map(String::as_str),
+        Some("moon"),
+        "a real page identity must take precedence over an alias owner"
+    );
     assert!(!icons.contains_key("NoIcon"));
     assert!(!icons.contains_key("Missing"));
+    assert_eq!(
+        g.existing_page_names(&[
+            "MIXED ALIAS".to_string(),
+            "shadow NAME".to_string(),
+            "missing".to_string(),
+        ]),
+        vec!["MIXED ALIAS".to_string(), "shadow NAME".to_string()],
+        "raw alias spelling must be normalized at identity consumers"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -830,13 +854,14 @@ fn resolve_block_refreshes_after_cache_change() {
     // Prime resolution against the first exact cache generation.
     assert_eq!(g.resolve_block("aaaa-1111").unwrap().page, "A");
 
-    // A new page appears on disk; invalidate the cache as the watcher would.
+    // A new page appears on disk, and the watcher reports it.
     std::fs::write(
         root.join("pages").join("B.md"),
         "- beta\n  id:: bbbb-2222\n",
     )
     .unwrap();
-    g.invalidate_cache();
+    g.sync_file_checked(&root.join("pages").join("B.md"))
+        .unwrap();
     // Resolution must use the fresh cache — not serve a stale "not found" for
     // the new block, nor lose the old one.
     assert_eq!(g.resolve_block("bbbb-2222").unwrap().page, "B");

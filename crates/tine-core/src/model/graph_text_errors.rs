@@ -1,4 +1,4 @@
-//! Graph-text validation and error constructors: single-link and event-parent
+//! Graph-text validation and error constructors: event-parent
 //! checks, exact-feed path validation, bounded admission causes, the Direct
 //! save failure code, and the limit and alias errors.
 
@@ -33,22 +33,6 @@ pub(super) fn projection_file_link_count(_file: &fs::File) -> io::Result<u64> {
         io::ErrorKind::Unsupported,
         "file link-count proof is unavailable on this platform",
     ))
-}
-
-pub(super) fn validate_graph_text_single_link(file: &fs::File, relative: &str) -> io::Result<()> {
-    let link_count = projection_file_link_count(file)?;
-    if link_count != 1 {
-        return Err(DirectSaveError::into_io(
-            DirectSaveFailureCode::PrecheckResourceAlias,
-            io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "graph text files alias one physical resource: {relative} has link count {link_count}"
-                ),
-            ),
-        ));
-    }
-    Ok(())
 }
 
 pub(super) fn validate_graph_text_event_parent(
@@ -178,12 +162,35 @@ pub fn direct_save_conflict_epoch(error: &io::Error) -> Option<u64> {
 /// `direct_save_precheck_helpers_produce_their_own_codes` drives the free
 /// helpers, and `every_direct_save_failure_code_has_a_production_producer`
 /// scans shipped source for a construction site per variant.
+///
+/// A data-preservation refusal (`ProjectionSemanticRefusal`: merge markers,
+/// a preamble the DTO would drop, a header property moved into the outline, an
+/// Org file that cannot round-trip) is a verdict on the DTO's CONTENT, so
+/// resending the same draft can only be refused again. It used to fall through
+/// to `Unknown`, which the frontend retries twice and then reports as a failure
+/// "after 3 tries" while the user is still typing (GH #546, GH #535). It gets
+/// its own no-retry code here, in one place, so every producer of that marker
+/// type is covered without stamping each call site.
 pub fn direct_save_failure_code(error: &io::Error) -> &'static str {
-    error
+    if super::is_projection_semantic_refusal(error) {
+        return DirectSaveFailureCode::RefusedDataPreservation.as_str();
+    }
+    let Some(typed) = error
         .get_ref()
         .and_then(|inner| inner.downcast_ref::<DirectSaveError>())
-        .map(|typed| typed.code().as_str())
-        .unwrap_or(DirectSaveFailureCode::Unknown.as_str())
+    else {
+        return DirectSaveFailureCode::Unknown.as_str();
+    };
+    // The command boundary tags every error before classifying it
+    // (`DirectSaveError::ensure_io`), so a refusal arrives wrapped as
+    // `Unknown`. Classified as `unknown` it was retried and shown as
+    // `unknown`: the v0.6.985 GH #535/#546 fix never reached the app.
+    if typed.code() == DirectSaveFailureCode::Unknown
+        && super::is_projection_semantic_refusal(&typed.source)
+    {
+        return DirectSaveFailureCode::RefusedDataPreservation.as_str();
+    }
+    typed.code().as_str()
 }
 
 pub(super) fn graph_text_capture_limit_error(resource: &'static str) -> io::Error {

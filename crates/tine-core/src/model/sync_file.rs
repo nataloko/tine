@@ -47,7 +47,10 @@ impl Graph {
                 }
             }
         }
-        if self.entry_for_path(path).is_none() {
+        // GH #597: a spelling that reaches the file only because the
+        // filesystem ignores case is not that file's page; the file's own
+        // spelling is.
+        if self.entry_for_path(path).is_none() || path_uses_graph_text_alias(&self.root, path) {
             return Ok(None);
         }
         // This checked watcher entrypoint is itself an exact external
@@ -60,27 +63,21 @@ impl Graph {
             match self.graph_text_read_optional_text_with_identity(&write, path) {
                 Ok(Some(snapshot)) => snapshot,
                 Ok(None) => {
-                    self.record_watcher_identity_failure(path);
+                    self.record_watcher_identity_failure(path, true);
                     return Ok(None);
                 }
-                Err(error) => {
-                    self.record_watcher_identity_failure(path);
-                    return Err(error);
-                }
+                Err(error) => return self.watcher_failure(path, error),
             };
         let current = match self.graph_text_read_optional_text_with_identity(&write, path) {
             Ok(Some(snapshot)) => snapshot,
             Ok(None) => {
-                self.record_watcher_identity_failure(path);
+                self.record_watcher_identity_failure(path, true);
                 return Ok(None);
             }
-            Err(error) => {
-                self.record_watcher_identity_failure(path);
-                return Err(error);
-            }
+            Err(error) => return self.watcher_failure(path, error),
         };
         if current.1 != identity || current.0 != content {
-            self.record_watcher_identity_failure(path);
+            self.record_watcher_identity_failure(path, false);
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "graph text watcher snapshot changed before reconciliation",
@@ -92,24 +89,35 @@ impl Graph {
         // bounded to in-flight writes.
         let reconciled = match self.sync_file_content(Some(&write), path, &content, true) {
             Ok(reconciled) => reconciled,
-            Err(error) => {
-                self.record_watcher_identity_failure(path);
-                return Err(error);
-            }
+            Err(error) => return self.watcher_failure(path, error),
         };
         let entry = if let Some(entry) = reconciled.as_ref() {
             entry.clone()
         } else {
             let physical = self.entry_for_path(path).ok_or_else(bad_path)?;
-            let (effective, _, _) =
-                parse_exact_page(self, &physical, &content).map_err(|error| {
-                    self.record_watcher_identity_failure(path);
-                    error
-                })?;
-            effective
+            match parse_exact_page(self, &physical, &content) {
+                Ok((effective, _, _)) => effective,
+                Err(error) => return self.watcher_failure(path, error),
+            }
         };
         self.clear_watcher_identity_failure_after_reconciliation(&entry);
         Ok(reconciled)
+    }
+
+    /// Record a page the watcher could not reconcile. Content Tine cannot
+    /// accept (a parser rejection, text that is not UTF-8) is the file's
+    /// reconciled state: the failure is recorded and the path is done until
+    /// the file changes, so one such file neither fails every watcher cycle
+    /// nor keeps its observation unacknowledged, which refused every
+    /// name-only creation for the session. Any other error may pass, and the
+    /// watcher retries it.
+    fn watcher_failure(&self, path: &Path, error: io::Error) -> io::Result<Option<PageEntry>> {
+        self.record_watcher_identity_failure(path, false);
+        if is_page_content_rejection(&error) {
+            Ok(None)
+        } else {
+            Err(error)
+        }
     }
 
     /// Reconcile the cache for `path` given its already-read `content` — so a
@@ -152,6 +160,39 @@ impl Graph {
                     None => self.is_shadow_journal(path, date),
                 };
                 if shadow {
+                    // GH #543 (sixth audit A6-N2): "not in the `(kind,name)`
+                    // cache" had become "not in the INDEX either", the same
+                    // conflation the pinned save path carried (A5-N2/A6-N1). An
+                    // externally delivered edit to a shadow file — Syncthing,
+                    // Dropbox, an external editor — reached search never, with
+                    // the index idle, validated and ready, because nothing was
+                    // ever queued for it. Cache slots are keyed by PATH, and name
+                    // resolution does not read this cache's `by_name` map at
+                    // all — `find_entry` builds its own index and prefers the
+                    // date-stem file (`lookup.rs`) — so writing the shadow's own
+                    // slot publishes its rows without taking the day from the
+                    // canonical file.
+                    //
+                    // An UNCHANGED delivery publishes nothing (seventh audit
+                    // A7-N2). Sync tools and watchers redeliver the same bytes
+                    // routinely, and Tine's own save of this file echoes back
+                    // through here; the ordinary path has the disk_rev and
+                    // self-write comparisons below for exactly that, and this
+                    // branch returns before reaching them. Each needless
+                    // publication bumps the generation, which invalidates every
+                    // memoized whole-graph result and can invalidate an
+                    // inventory read that was in flight.
+                    let disk_rev = content_rev(content);
+                    // The parsed cache reflecting the bytes is not the index
+                    // having them (audit R8-02).
+                    let unchanged = self.page_revision_current(
+                        self.cache.read().unwrap().is_none(),
+                        path,
+                        &disk_rev,
+                    );
+                    if !unchanged {
+                        self.cache_upsert(entry, newdoc, disk_rev);
+                    }
                     return Ok(None);
                 }
             }
@@ -189,32 +230,15 @@ impl Graph {
         // the guard is dropped before the reconcile path below re-locks the cache.
         // A missing/mismatched entry falls through to the exact comparison, so this
         // can only ever save work, never serve stale content.
+        //
+        // The cache reflecting these bytes is not the index having them: a
+        // whole-graph read installs revisions it never sent
+        // (`page_revision_current`, audit R8-02). With no parsed cache, the
+        // session record cache_upsert writes stands in for it, so a repeated
+        // watcher delivery still enqueues nothing.
         {
             let cache_guard = self.cache.read().unwrap();
-            if self
-                .disk_revs
-                .read()
-                .unwrap()
-                .get(path)
-                .is_some_and(|r| *r == disk_rev)
-            {
-                return Ok(None);
-            }
-            // With no parsed cache, the existing session identity owner still
-            // records the exact revision/config admitted by cache_upsert.
-            // Repeated watcher delivery must not enqueue the same delta again.
-            // The cache lock pairs this read with that producer's publication.
-            if cache_guard.is_none()
-                && self
-                    .session_page_ids
-                    .read()
-                    .unwrap()
-                    .get(path)
-                    .is_some_and(|ids| {
-                        ids.revision == disk_rev
-                            && ids.config == self.config.parse_config().digest()
-                    })
-            {
+            if self.page_revision_current(cache_guard.is_none(), path, &disk_rev) {
                 return Ok(None);
             }
         }
@@ -243,7 +267,7 @@ impl Graph {
                             Some(content),
                         )),
                     };
-                    if cached_norm == newdoc {
+                    if cached_norm == newdoc && self.index_has_revision(path, &disk_rev) {
                         return Ok(None); // unchanged / our own write
                     }
                 }

@@ -91,7 +91,7 @@ in `src-tauri/tauri.conf.json` (`createUpdaterArtifacts: false` and the
   correcting them buys nothing and costs merge cleanliness. Note `REPO`
   deliberately points at `martinkoutecky/tine`: the toast announces *upstream*
   releases, which is the signal to run this sync.
-- Fork CSS: `src/styles/app/50-mine.css`, imported last from
+- Fork CSS: `src/styles/app/70-mine.css`, imported last from
   `src/styles/app.css`. Upstream split `app.css` into `src/styles/app/00..40-*.css`
   at v0.6.984 and those modules sit at their B1 budget, so fork rules appended
   into them push the file over the cap AND collide every sync. Everything the

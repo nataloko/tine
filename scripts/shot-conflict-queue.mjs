@@ -1,7 +1,7 @@
 import { waitForHttpServer } from "./e2e-capabilities.mjs";
 // Concord P4 visual check: the calm sidebar badge and the in-page conflict
 // resolver on a marker-bearing page. Usage: npm run build && node scripts/shot-conflict-queue.mjs
-import { chromium } from "playwright";
+import { chromium } from "./lib/playwright.mjs";
 import { spawn } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -20,12 +20,17 @@ try {
   // The badge is the whole global surface: quiet, in the sidebar footer.
   await page.waitForSelector(".conflict-queue-badge", { timeout: 5000 });
   await page.locator(".conflict-queue-badge").screenshot({ path: "/tmp/shot-conflict-badge.png" });
-  // Clicking it walks to a conflicted page; walk until the marker one is up.
-  for (let i = 0; i < 3; i++) {
-    await page.locator(".conflict-queue-badge").click();
-    await sleep(400);
-    if (await page.locator(".page-conflict").count()) break;
-  }
+  // Clicking it opens the conflict overview (GH #536); a row opens its page.
+  await page.locator(".conflict-queue-badge").click();
+  await page.waitForSelector(".conflict-overview-row", { timeout: 5000 });
+  await sleep(300);
+  await page.screenshot({ path: "/tmp/shot-conflict-overview.png" });
+  await page.setViewportSize({ width: 390, height: 800 });
+  await sleep(300);
+  await page.screenshot({ path: "/tmp/shot-conflict-overview-narrow.png" });
+  await page.setViewportSize({ width: 1180, height: 900 });
+  await sleep(300);
+  await page.locator(".conflict-overview-group[aria-label='Version-control merge markers'] .conflict-overview-open").first().click();
   await page.waitForSelector(".page-conflict", { timeout: 5000 });
   const paneBox = await page.locator(".main-content").boundingBox();
   const conflictBox = await page.locator(".page-conflict").boundingBox();

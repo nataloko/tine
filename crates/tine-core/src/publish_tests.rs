@@ -124,6 +124,19 @@ fn block_refs_resolve_via_decoration() {
     let u = render_body("[X](((deadbeef-0000-0000-0000-000000000000)))", &refs);
     assert!(u.contains(r#"<span class="block-ref">X</span>"#), "{u}");
     assert!(!u.contains("((deadbeef"), "{u}");
+    // Unresolved bare ref → its source text in full, as OG shows it, not
+    // lsdoc's eight-character placeholder (GH #589).
+    let bare = render_body("((deadbeef-0000-0000-0000-000000000000))", &refs);
+    assert!(
+        bare.contains(r#"<span class="block-ref">((deadbeef-0000-0000-0000-000000000000))</span>"#),
+        "{bare}"
+    );
+    // `(((uuid)))` parses (mldoc and lsdoc alike) as the id `(uuid` plus `)`.
+    let wrapped = render_body("(((deadbeef-0000-0000-0000-000000000000)))", &refs);
+    assert!(
+        wrapped.contains("(((deadbeef-0000-0000-0000-000000000000))</span>)"),
+        "{wrapped}"
+    );
     // A real URL with parentheses is captured whole (no truncation at first ')').
     let w = render_body(
         "[wiki](https://en.wikipedia.org/wiki/Foo_(bar))",
@@ -958,10 +971,10 @@ fn print_asset_inlining_enforces_per_file_and_shared_export_budgets() {
 
 fn print_test_graph(dir: &Path) -> Graph {
     let graph = Graph::open(dir);
-    graph.warm_cache();
     graph
         .attach_direct_projection(dir.join("print-test.sqlite"))
         .unwrap();
+    graph.warm_cache();
     let started = std::time::Instant::now();
     while !graph.direct_projection_ready_test() {
         assert!(started.elapsed() < std::time::Duration::from_secs(30));
@@ -1573,6 +1586,44 @@ fn publish_graph_with_main_reader(graph: &Graph) -> io::Result<(String, usize)> 
     publish_graph(graph)
 }
 
+/// GH #560's "0 pages exported" is the ordinary outcome for a graph whose
+/// pages are not marked `public:: true`, on every platform.
+///
+/// The report reached us as an Android defect, but `publishHtml` RESOLVED
+/// there — the UI renders `Exported ${n} pages` only on success and
+/// `Failed: …` on error. A successful zero cannot come from an unavailable or
+/// still-building projection (those are `ProjectionUnavailable` and
+/// `NotReady`, both errors); it means the capture honestly found nothing
+/// publishable. Publication is the public-page capability, so a graph with no
+/// public page exports zero pages and writes the bare index/pages templates
+/// the reporter saw.
+#[test]
+fn publish_exports_zero_pages_and_bare_templates_when_no_page_is_public() {
+    let dir = std::env::temp_dir().join(format!("tine-publish-nonpublic-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("journals")).unwrap();
+    fs::create_dir_all(dir.join("pages")).unwrap();
+    fs::create_dir_all(dir.join("logseq")).unwrap();
+    // Ordinary pages: real content, no `public::` property anywhere.
+    fs::write(dir.join("pages/Alpha.md"), "- alpha body\n").unwrap();
+    fs::write(dir.join("pages/Beta.md"), "- beta body\n").unwrap();
+
+    let graph = Graph::open(&dir);
+    let (outdir, count) = publish_graph_with_main_reader(&graph).unwrap();
+
+    assert_eq!(
+        count, 0,
+        "publication is the public-page capability: nothing is public here"
+    );
+    let index = fs::read_to_string(Path::new(&outdir).join("index.html")).unwrap();
+    assert!(
+        !index.contains("alpha body") && !index.contains("beta body"),
+        "a non-public page must not reach the export: {index}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The renderer routes TQL through its supplied reader and filters only
 /// after that reader has answered over the complete capture.
 ///
@@ -1710,9 +1761,8 @@ fn publish_tql_refuses_stale_main_until_normal_source_update() {
     .unwrap();
 
     let graph = Graph::open(&dir);
-    graph.warm_cache();
     let _projection = prepare_publication_graph(&graph);
-    // An external editor rewrites the source after the live cache was built.
+    // An external editor rewrites the source after the index was built.
     fs::write(
         dir.join("pages/Tasks.md"),
         "- TODO tql-current-token [[Alpha]]\n",
@@ -2122,7 +2172,7 @@ fn publish_runs_repeated_query_macros_once_per_authored_use() {
         .map(|(entry, document)| (entry.clone(), document.as_ref().clone()))
         .collect();
     let mut snapshot = PublicationGraphSnapshot::new(captured).unwrap();
-    snapshot.graph.config = graph.config.clone();
+    *snapshot.graph.config_mut() = (*graph.config()).clone();
     let reader = CapturedWalkReader {
         graph: &snapshot.graph,
         runs: std::cell::Cell::new(0),
@@ -3115,6 +3165,91 @@ fn fake_app_bundle() -> Arc<app_export::PublishedAppBundle> {
         })
 }
 
+#[test]
+fn graph_publication_ships_the_app_with_a_real_page_as_home() {
+    let dir = std::env::temp_dir().join(format!("tine-publish-graph-app-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("journals")).unwrap();
+    fs::create_dir_all(dir.join("pages")).unwrap();
+    fs::create_dir_all(dir.join("logseq")).unwrap();
+    fs::create_dir_all(dir.join("assets")).unwrap();
+    fs::write(dir.join("assets/pic.png"), b"picture").unwrap();
+    fs::write(
+        dir.join("pages/Welcome to Tine.md"),
+        "public:: true\n- Welcome\n- {{query (task TODO)}}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("pages/Other.md"),
+        "public:: true\n- TODO selected task ![pic](../assets/pic.png)\n",
+    )
+    .unwrap();
+    fs::write(dir.join("pages/Private.md"), "- private\n").unwrap();
+
+    let mut graph = Graph::open(&dir);
+    graph.config_mut().default_home = Some("Other".to_string());
+    let _projection = prepare_publication_graph(&graph);
+    let outcome =
+        publish_graph_app(&graph, fake_app_bundle(), "Tine Guide", "Welcome to Tine").unwrap();
+    assert_eq!(outcome.pages, 2);
+    assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+    let out = PathBuf::from(&outcome.path);
+    let app_index = fs::read_to_string(out.join("app/index.html")).unwrap();
+    assert!(app_index.contains("tine-published"), "{app_index}");
+    assert!(
+        app_index.contains("<title>Tine Guide</title>"),
+        "{app_index}"
+    );
+    let snapshot: serde_json::Value =
+        serde_json::from_slice(&fs::read(out.join("app/snapshot.json")).unwrap()).unwrap();
+    assert_eq!(snapshot["home"], "Welcome to Tine");
+    let names: Vec<&str> = snapshot["pages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|page| page["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["Other", "Welcome to Tine"]);
+    assert!(!names.contains(&"Tine Guide"), "no synthetic query home");
+    assert_eq!(snapshot["queries"].as_array().unwrap().len(), 1);
+    assert!(!snapshot.to_string().contains("Private"));
+    assert!(out.join("app-redirect.js").is_file());
+
+    let cli_output = PublicationOutput {
+        parent: PathBuf::from("exports"),
+        leaf: "live".to_string(),
+        replace: false,
+    };
+    let cli_outcome = publish_graph_app_to(
+        &graph,
+        fake_app_bundle(),
+        "CLI export",
+        app_export::AppHome::Auto,
+        cli_output.clone(),
+    )
+    .unwrap();
+    let cli_snapshot: serde_json::Value = serde_json::from_slice(
+        &fs::read(PathBuf::from(&cli_outcome.path).join("app/snapshot.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cli_snapshot["home"], "Other");
+    let cli_out = PathBuf::from(&cli_outcome.path);
+    assert_eq!(
+        fs::read(cli_out.join("assets/pic.png")).unwrap(),
+        b"picture"
+    );
+    assert!(cli_snapshot.to_string().contains("assets/pic.png"));
+    assert!(publish_graph_app_to(
+        &graph,
+        fake_app_bundle(),
+        "CLI export",
+        app_export::AppHome::Auto,
+        cli_output,
+    )
+    .is_err());
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// Stage 2: a query export with an embedded bundle ships the read-only
 /// app beside the static site, over a snapshot computed from the selected
 /// pages and nothing else, keyed exactly as the app will ask.
@@ -3334,4 +3469,35 @@ fn query_export_without_an_embedded_frontend_warns_and_ships_no_app() {
     assert!(error.to_string().contains("not exportable"), "{error}");
     assert!(!dir.join("published-queries/broken").exists());
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+/// A graph whose text cannot be admitted (here: opened through a symlinked
+/// root) lists no pages for display. An export or a print acts on that listing,
+/// so it must report the graph as unreadable rather than export an empty site
+/// or say the page does not exist (GH #543 round 2).
+#[cfg(unix)]
+#[test]
+fn an_unreadable_graph_is_an_error_to_publish_and_print_not_an_empty_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir_all(real.join("pages")).unwrap();
+    std::fs::write(real.join("pages/P.md"), "public:: true\n\n- hello\n").unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let mut graph = Graph::open(&link);
+    graph.config_mut().all_pages_public = true;
+
+    assert!(graph.list_pages().is_empty(), "display listing stays empty");
+    assert!(graph.try_list_pages().is_err());
+    let sources = capture_direct_publication_sources(&graph);
+    assert!(
+        sources.is_err(),
+        "publication must not capture an empty graph"
+    );
+    let printed = graph.page_print_html("P", PrintOpts::default());
+    assert!(
+        matches!(printed, Err(PrintPreparationError::Io(_))),
+        "print must report the unreadable graph, not a missing page: {printed:?}"
+    );
 }

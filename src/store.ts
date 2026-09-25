@@ -46,7 +46,7 @@ export { clearAllEditorActivations, clearEditorActivation, editorActivationFor, 
 export type { EditorInstallOptions, InstanceRefusal } from "./store/lifecycle";
 export { clearUndoHistory, historyPageOnlyMode, installHistoryRouteContextAdapter, invalidateUndoForPage, redo, toggleUndoRedoMode, undo, undoTopTag, withUndoUnit } from "./store/undo";
 export type { HistoryRouteContext } from "./store/undo";
-export { beginPageHeaderEdit, blockPageReadOnly, blockProperty, collapsibleDescendantIds, ensurePagePropertyOnKeyPage, expandAncestors, finishPageHeaderEdit, makeOwnNumberedList, orderedListMarker, promotePagePreamble, readPageProperty, readSchedule, removeOwnNumberedList, setBlockProperty, setCollapsed, setCollapsedDeep, setCollapsedDescendants, setHeading, setPageProperty, setSchedule, setSelectionHeading, stopOwnNumberedListOnEmptyEnter, toggleBlockProperty, toggleCollapse, toggleListItem, toggleListItemAtIndex, toggleOwnNumberedList } from "./store/properties";
+export { adoptFoldedPageHeader, beginPageHeaderEdit, blockPageReadOnly, blockProperty, collapsibleDescendantIds, ensurePagePropertyOnKeyPage, expandAncestors, finishPageHeaderEdit, makeOwnNumberedList, orderedListMarker, promotePagePreamble, readPageProperty, readSchedule, removeOwnNumberedList, reportInvalidPageHeaderOnExit, setBlockProperty, setCollapsed, setCollapsedDeep, setCollapsedDescendants, setHeading, setPageProperty, setSchedule, setSelectionHeading, stopOwnNumberedListOnEmptyEnter, toggleBlockProperty, toggleCollapse, toggleListItem, toggleListItemAtIndex, toggleOwnNumberedList } from "./store/properties";
 export type { HeadingState } from "./store/properties";
 export { __pageMutationPlanDeeplyFrozenForTest, __setPageMutationEffectFailureForTest, applyPageMutationPlan, createPageMutationPlan } from "./store/mutationPlans";
 export type { PageMutationAuthority, PageMutationDispatch, PageMutationDraft, PageMutationDraftNode, PageMutationDraftPage, PageMutationEffect, PageMutationPlan } from "./store/mutationPlans";
@@ -500,6 +500,7 @@ export async function loadFeed(
   // requested journal.
   const binding = opts.expectedGraphBinding ?? graphBinding();
   const installed: string[] = [];
+  let activationFailures = 0;
   for (const dto of dtos) {
     // Calendar rollover can add days without replacing or unmounting any live
     // feed page. In particular, even a clean active editor owns its exact nodes.
@@ -507,10 +508,19 @@ export async function loadFeed(
       installed.push(dto.name);
       continue;
     }
-    if (await ensurePageLoaded(dto, { expectedGraphBinding: binding, isRequestLive: opts.isRequestLive })) return false;
+    const refusal = await ensurePageLoaded(dto, { expectedGraphBinding: binding, isRequestLive: opts.isRequestLive });
+    // One day the backend cannot activate (today's placeholder on a graph whose
+    // walk refused, GH #385) is left out; it must not blank every other day.
+    // Unsaved work and stale requests still defer the whole feed atomically.
+    if (refusal?.reason === "activation-failed") {
+      activationFailures += 1;
+      continue;
+    }
+    if (refusal) return false;
     installed.push(dto.name);
   }
   if (binding !== graphBinding() || opts.isRequestLive?.() === false) return false;
+  if (installed.length === 0 && activationFailures > 0) return false;
   setDoc("feed", opts.preserveExisting
     ? [...installed, ...doc.feed.filter((name) => !installed.includes(name))]
     : installed);
@@ -568,7 +578,13 @@ export async function restoreTodayJournalInFeed(): Promise<boolean> {
 }
 
 export function pageToDto(pageName: string): PageDto | null {
-  return projectPageDto(doc.pages.find((x) => x.name === pageName), doc.byId, true);
+  // Autosave reports nothing: it fires ~400 ms after a pause, so a page header
+  // that is only half-typed is the NORMAL state of an unfinished edit, not a
+  // failure to tell the user about (GH #546). An invalid header still refuses
+  // to serialize — the page stays dirty and saves once it is valid again — and
+  // the user is told when the header editor closes, from
+  // `reportInvalidPageHeaderOnExit`. User-initiated callers still pass `true`.
+  return projectPageDto(doc.pages.find((x) => x.name === pageName), doc.byId, false);
 }
 
 // ---------------------------------------------------------------------------

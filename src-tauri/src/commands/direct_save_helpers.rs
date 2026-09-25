@@ -72,11 +72,18 @@ pub(crate) fn direct_save_error_message(error: std::io::Error) -> CommandError {
             })),
         );
     }
-    CommandError::tagged(
-        "direct-save-failure",
-        Some(code),
-        Some(serde_json::json!({ "io_error_kind": io_error_kind })),
-    )
+    // The failed call and its OS error number are closed vocabulary and a
+    // number: no page name or path, so they are safe in the toast and in a
+    // shared diagnostics report. Without them GH #538 read `unknown`. Each is
+    // sent only when known, so a failure without one keeps the legacy wire.
+    let mut detail = serde_json::json!({ "io_error_kind": io_error_kind });
+    if let Some(os_error) = tine_core::model::save_os_error(&error) {
+        detail["os_error"] = serde_json::json!(os_error);
+    }
+    if let Some(step) = tine_core::model::platform_step(&error) {
+        detail["operation"] = serde_json::json!(step.operation);
+    }
+    CommandError::tagged("direct-save-failure", Some(code), Some(detail))
 }
 
 /// Report what a slow or failed Direct-Markdown save actually did.
@@ -137,4 +144,65 @@ pub(super) fn report_direct_save_diagnostics(
         report.exact_updates,
         report.invalidated,
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use tine_core::model::BlockDto;
+    use tine_core::{ActivationIntent, Graph};
+
+    /// A real data-preservation refusal, through the real command boundary.
+    /// `ensure_io` used to wrap the refusal as `unknown` before it was
+    /// classified, so the app retried it three times and showed `unknown`
+    /// (the v0.6.985 GH #535/#546 fix never left tine-core).
+    #[test]
+    fn a_data_preservation_refusal_reaches_the_app_as_one() {
+        let root = std::env::temp_dir().join(format!(
+            "tine-wire-refusal-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(root.join("pages")).unwrap();
+        let conflicted = "- a\n<<<<<<< ours\n- b\n=======\n- c\n>>>>>>> theirs\n";
+        std::fs::write(root.join("pages/M.md"), conflicted).unwrap();
+        let graph = Graph::open(&root);
+        graph.warm_cache();
+        let mut page = graph.load_by_path("pages/M.md").unwrap().unwrap();
+        let base_rev = page.rev.clone();
+        page.blocks.push(BlockDto {
+            raw: "edited".into(),
+            ..Default::default()
+        });
+        let handle = graph
+            .activate_editor(&page.path, ActivationIntent::Replace, base_rev.as_deref())
+            .unwrap();
+        page.activation = Some(handle.activation.as_u64());
+        let error = graph.save_page(&page, base_rev.as_deref()).unwrap_err();
+        let crate::command_error::CommandError::Tagged {
+            kind, reason_code, ..
+        } = super::direct_save_error_message(error)
+        else {
+            panic!("a Direct save failure must reach the app tagged");
+        };
+        assert_eq!(kind, "direct-save-failure");
+        assert_eq!(reason_code.as_deref(), Some("refused.data_preservation"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("pages/M.md")).unwrap(),
+            conflicted
+        );
+        drop(graph);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The failed platform call and its OS error number reach the app (GH #538).
+    #[test]
+    fn a_platform_failure_carries_its_call_and_os_error() {
+        let error = std::io::Error::from_raw_os_error(22);
+        let crate::command_error::CommandError::Tagged { detail, .. } =
+            super::direct_save_error_message(error)
+        else {
+            panic!("a Direct save failure must reach the app tagged");
+        };
+        let detail = detail.unwrap();
+        assert_eq!(detail["os_error"], serde_json::json!(22));
+    }
 }

@@ -9,7 +9,7 @@
 // The feature: a rounded elbow thread traces the active path (the block being
 // edited plus each ancestor), curving into every bullet on the way, coloured
 // per depth. See src/bulletThreading.ts for the role computation and
-// src/styles/app/50-mine.css for the stroke itself.
+// src/styles/app/70-mine.css for the stroke itself.
 import { Show, type JSX } from "solid-js";
 import { threadingEnabled, threadColorMode, threadRoles, THREAD_PALETTE } from "../../bulletThreading";
 

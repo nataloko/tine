@@ -1,4 +1,33 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+const searchBridge = vi.hoisted(() => {
+  const foldText = (text: string) => text
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/\p{Mn}/gu, "")
+    .normalize("NFC");
+  const searchFold = vi.fn(foldText);
+  const searchFoldMap = vi.fn((text: string) => {
+    let offset = 0;
+    let folded = "";
+    const sources: { start: number; end: number }[] = [];
+    for (const scalar of text) {
+      const start = offset;
+      offset += scalar.length;
+      const part = foldText(scalar);
+      folded += part;
+      for (const _output of part) sources.push({ start, end: offset });
+    }
+    return { text: folded, sources };
+  });
+  const searchMatchBatch = vi.fn((_query: string, texts: string[]): { matches: boolean[]; search_error: string | null } => ({
+    matches: texts.map(() => true),
+    search_error: null,
+  }));
+  return { searchFold, searchFoldMap, searchMatchBatch };
+});
+
+vi.mock("./render/parse", () => searchBridge);
 import {
   PUBLISHED_QUERY_REASON,
   publishedBackend,
@@ -250,19 +279,19 @@ describe("published backend: the two query seams", () => {
     expect(second.groups).toHaveLength(1);
   });
 
-  it("answers the Quick Switcher's lanes by substring and refuses a query-language search", async () => {
+  it("answers the explicitly routed Ctrl-K consumer and refuses a query-language search", async () => {
     const backend = publishedBackend(load);
-    const answer = await backend.runGraphSearch("dash", 10, 10, "quick-switch");
+    const answer = await backend.runGraphSearch("dash", 10, 10, "quick-switch", false, undefined, undefined, "ctrl_k");
     expect(answer.hits.map((hit) => hit.entity)).toEqual(["page", "block"]);
     expect(answer.hits[0]).toMatchObject({ entity: "page", display_text: "Dashboard", match_class: "prefix" });
     expect(answer.hits[1]).toMatchObject({ entity: "block", page: "Sep 13th, 2026", display_text: "TODO call [[Dashboard]]" });
     expect(answer.has_more).toEqual({ pages: false, blocks: false });
     // Scoped to one page: only that page's blocks, no page rows.
-    const scoped = await backend.runGraphSearch("child", 10, 10, "quick-switch:current-page", false, { name: "Dashboard", pageKind: "page", path: "pages/Dashboard.md" });
+    const scoped = await backend.runGraphSearch("child", 10, 10, "quick-switch:current-page", false, { name: "Dashboard", pageKind: "page", path: "pages/Dashboard.md" }, undefined, "ctrl_k");
     expect(scoped.hits.map((hit) => (hit.entity === "block" ? hit.block.id : hit.entity))).toEqual(["d2"]);
     // An alias row names the page it stands for.
-    expect((await backend.runGraphSearch("dash", 10, 0, "quick-switch")).hits[0]).toMatchObject({ entity: "page", page: { name: "Dashboard" } });
-    expect((await backend.runGraphSearch("", 10, 10, "quick-switch")).hits).toEqual([]);
+    expect((await backend.runGraphSearch("dash", 10, 0, "quick-switch", false, undefined, undefined, "ctrl_k")).hits[0]).toMatchObject({ entity: "page", page: { name: "Dashboard" } });
+    expect((await backend.runGraphSearch("", 10, 10, "quick-switch", false, undefined, undefined, "ctrl_k")).hits).toEqual([]);
     // The query workspace and inline friendly search are query-language runs.
     await expect(backend.runGraphSearch("(task TODO)", 10, 10, "query-workspace:1:materialize")).rejects.toMatchObject({ reasonCode: PUBLISHED_QUERY_REASON });
     await expect(backend.runGraphSearch("dash", 10, 10)).rejects.toBeInstanceOf(QueryUnavailableError);
@@ -307,6 +336,68 @@ describe("published backend: pages and references", () => {
     expect(referrers[0].blocks[0].breadcrumb).toEqual(["{{query (and (task TODO) <% current page %>)}}"]);
   });
 
+  it("builds linked-filter entries only from requested snapshot roots and preserves stale roots", async () => {
+    const snapshot = fixture();
+    snapshot.backlinks.Dashboard = [{
+      page: "Journal",
+      kind: "journal",
+      blocks: [
+        {
+          id: "match",
+          raw: "Root café [[Dashboard]]",
+          collapsed: false,
+          tags: ["Work"],
+          children: [{ id: "match-child", raw: "TODO descendant 😀", collapsed: false, marker: "TODO", children: [] }],
+        },
+        { id: "miss", raw: "Draft note [[Dashboard]]", collapsed: false, children: [] },
+      ],
+    }];
+    const backend = publishedBackend(() => Promise.resolve(snapshot));
+    const targets = [
+      { page: "journal", kind: "journal" as const, block_id: "match" },
+      { page: "Journal", kind: "journal" as const, block_id: "miss" },
+      { page: "Journal", kind: "journal" as const, block_id: "stale" },
+    ];
+
+    searchBridge.searchMatchBatch.mockReturnValueOnce({ matches: [true, false], search_error: null });
+    const context = await backend.getBacklinkFilterContext("dashboard", targets, "café OR 😀 -draft");
+
+    expect(searchBridge.searchMatchBatch).toHaveBeenLastCalledWith(
+      "café OR 😀 -draft",
+      ["Root café [[Dashboard]]\nTODO descendant 😀", "Draft note [[Dashboard]]"],
+    );
+    expect(context).toEqual({
+      entries: [
+        { page: "Journal", kind: "journal", block_id: "match", facets: ["Work", "TODO"], text_matches: true },
+        { page: "Journal", kind: "journal", block_id: "miss", facets: [], text_matches: false },
+      ],
+      truncated: true,
+    });
+  });
+
+  it("passes regex through to the native batch matcher and keeps empty/invalid searches visible", async () => {
+    const snapshot = fixture();
+    const backend = publishedBackend(() => Promise.resolve(snapshot));
+    const targets = [{ page: "Sep 13th, 2026", kind: "journal" as const, block_id: "j1" }];
+
+    searchBridge.searchMatchBatch.mockReturnValueOnce({ matches: [true], search_error: null });
+    expect((await backend.getBacklinkFilterContext("Dashboard", targets, "/TODO.*Dashboard/")).entries[0].text_matches).toBe(true);
+    expect(searchBridge.searchMatchBatch).toHaveBeenLastCalledWith("/TODO.*Dashboard/", ["TODO call [[Dashboard]]"]);
+
+    searchBridge.searchMatchBatch.mockReturnValueOnce({ matches: [true], search_error: null });
+    expect(await backend.getBacklinkFilterContext("Dashboard", targets, "")).toMatchObject({
+      entries: [{ text_matches: true }],
+      truncated: false,
+    });
+
+    searchBridge.searchMatchBatch.mockReturnValueOnce({ matches: [true], search_error: "unclosed character class" });
+    expect(await backend.getBacklinkFilterContext("Dashboard", targets, "/[/")).toMatchObject({
+      entries: [{ text_matches: true }],
+      search_error: "unclosed character class",
+      truncated: false,
+    });
+  });
+
   it("searches raw text and switches pages by substring", async () => {
     const backend = publishedBackend(load);
     const hits = await backend.search("call", 10);
@@ -315,6 +406,46 @@ describe("published backend: pages and references", () => {
     expect((await backend.quickSwitch("dash", 10)).map((entry) => entry.name)).toEqual(["Dashboard"]);
     expect(await backend.pageIcons(["Dashboard", "Private"])).toEqual({ Dashboard: "📊" });
     expect(await backend.pageAliases()).toEqual([["dash", "Dashboard"]]);
+  });
+
+  it("uses the search fold for text but retains the separate page-identity fold", async () => {
+    const snapshot = fixture();
+    snapshot.pages.push({
+      name: "café",
+      kind: "page",
+      title: "café",
+      pre_block: null,
+      blocks: [{ id: "accent", raw: "Příliš café", collapsed: false, children: [] }],
+      path: "pages/café.md",
+    });
+    snapshot.entries.push({ name: "café", kind: "page", date_key: null, path: "pages/café.md" });
+    const backend = publishedBackend(() => Promise.resolve(snapshot));
+
+    expect((await backend.search("cafe", 10)).map((group) => group.page)).toContain("café");
+    expect((await backend.quickSwitch("cafe", 10)).map((entry) => entry.name)).toContain("café");
+    expect((await backend.getPage("cafe", "page"))?.path).toBe("");
+    expect((await backend.getPage("café", "page"))?.path).toBe("pages/café.md");
+  });
+
+  it("maps compatibility-folded evidence back to original emoji-aware UTF-16 offsets", async () => {
+    const snapshot = fixture();
+    snapshot.entries.push({ name: "😀 𝐀lpha", kind: "page", date_key: null, path: "pages/math.md" });
+    const backend = publishedBackend(() => Promise.resolve(snapshot));
+
+    const answer = await backend.runGraphSearch("𝐀", 20, 0, "quick-switch", false, undefined, undefined, "ctrl_k");
+    const hit = answer.hits.find((candidate) => candidate.entity === "page" && candidate.page.name === "😀 𝐀lpha");
+    expect(hit?.evidence).toEqual([
+      { clause_id: 0, field: "page_name", mode: "contains", spans: [{ start: 3, end: 5 }] },
+    ]);
+  });
+
+  it("does not turn a nonempty fold-erased literal into match-all", async () => {
+    const backend = publishedBackend(load);
+    const erased = "\u0301";
+    expect(await backend.search(erased, 10)).toEqual([]);
+    expect(await backend.quickSwitch(erased, 10)).toEqual([]);
+    expect((await backend.runGraphSearch(erased, 10, 10, "quick-switch", false, undefined, undefined, "ctrl_k")).hits).toEqual([]);
+    expect(await backend.quickSwitch("", 10)).toHaveLength(fixture().entries.length);
   });
 
   it("loads the export as a graph whose home is the baked home page", async () => {

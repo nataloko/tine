@@ -2,6 +2,11 @@
 //! Logseq-compatible outliner. Pure Rust, no GUI dependencies — fully unit
 //! testable without the Tauri shell.
 
+// A discarded `#[must_use]` result is an error, not a warning: a readiness
+// wait whose timeout a test ignored let a query run before the index was
+// ready and fail as a flake, not as a finding (GH #543, audit R9-15e).
+#![deny(unused_must_use)]
+
 pub mod backend_error;
 pub mod concord_ledger;
 pub mod concord_queue;
@@ -16,6 +21,7 @@ pub mod direct_move_recovery;
 #[path = "direct_move_recovery_corpus_tests.rs"]
 mod direct_move_recovery_corpus_tests;
 mod direct_projection;
+pub use direct_projection::{set_index_failure_observer, IndexFailureEvent};
 pub mod directory_identity;
 pub mod doc;
 pub mod edn;
@@ -25,6 +31,7 @@ pub mod durability_counters;
 pub mod graph_text_path;
 pub mod graph_text_scope;
 pub mod html_sanitize;
+pub mod indexing_progress;
 pub mod journal_feed;
 pub mod logbook;
 pub mod model;
@@ -32,6 +39,7 @@ pub mod onboarding;
 pub mod org;
 mod outline;
 pub mod pdf;
+pub(crate) mod projection_budget;
 #[cfg(test)]
 pub(crate) mod projection_producer_census;
 mod property_line;
@@ -63,6 +71,6 @@ pub use graph_text_scope::{
 };
 pub use model::{
     ActivationIntent, BlockDto, BlockPreview, ConflictOverride, ConflictPresentation,
-    EditorActivation, EditorActivationHandle, Graph, GraphMeta, LiveSaveConflictCapture, PageDto,
-    PageEntry, PageKind, RefGroup, ReferencedPageNames,
+    EditorActivation, EditorActivationHandle, Graph, GraphMeta, LiveSaveConflictCapture,
+    LiveSaveConflictReviewAuthority, PageDto, PageEntry, PageKind, RefGroup, ReferencedPageNames,
 };

@@ -155,6 +155,106 @@ pub struct LogbookSettings {
     pub enabled_in_all_blocks: bool,
 }
 
+/// How far a change to `config.edn` reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigReach {
+    Unchanged,
+    /// Only settings that are read when used: the graph takes the new
+    /// configuration in place and keeps its pages and its index.
+    Settings,
+    /// A setting the graph was opened, parsed or indexed with: only a new
+    /// `Graph` can take it in.
+    Graph,
+}
+
+/// The one classification of every `Config` field. The destructure in
+/// `reach` names every field, so a new field does not compile until it is
+/// listed here. A `settings` field must be one nothing copies at open or
+/// into the index (`config_reach_tests` checks the places that do).
+macro_rules! config_reach {
+    (
+        graph: [$($g:ident),* $(,)?],
+        answers: [$($a:ident),* $(,)?],
+        settings: [$($s:ident),* $(,)?] $(,)?
+    ) => {
+        impl Config {
+            /// The fields a [`ConfigReach::Settings`] change may move.
+            pub const SETTINGS_FIELDS: &'static [&'static str] =
+                &[$(stringify!($a),)* $(stringify!($s)),*];
+
+            /// The settings a derived answer (references, queries) reads when it
+            /// runs, so a memoized answer is keyed on them.
+            pub const ANSWER_FIELDS: &'static [&'static str] = &[$(stringify!($a)),*];
+
+            /// How far the change from `self` to `new` reaches.
+            pub fn reach(&self, new: &Config) -> ConfigReach {
+                let Config { $($g,)* $($a,)* $($s,)* } = self;
+                if false $(|| *$g != new.$g)* {
+                    return ConfigReach::Graph;
+                }
+                if false $(|| *$a != new.$a)* $(|| *$s != new.$s)* {
+                    return ConfigReach::Settings;
+                }
+                ConfigReach::Unchanged
+            }
+
+            /// A digest of the [`Config::ANSWER_FIELDS`], for keying memoized
+            /// answers (in-process only).
+            pub(crate) fn answer_settings_digest(&self) -> u64 {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                $(self.$a.hash(&mut hasher);)*
+                hasher.finish()
+            }
+        }
+    };
+}
+
+config_reach! {
+    graph: [
+        // Where graph text lives and which of it is admitted.
+        journals_dir,
+        pages_dir,
+        hidden,
+        hidden_parse_failed_closed,
+        file_name_format,
+        // Parser inputs (`ParseConfig`): every parsed page depends on them.
+        block_hidden_properties,
+        separated_by_commas,
+        ignored_page_references_keywords,
+        journal_file_name_format,
+        journal_page_title_format,
+        // Decide which pages exist.
+        property_pages_enabled,
+        property_pages_excludelist,
+    ],
+    // Read when a reference or query answer is computed, so a change must
+    // not be served an answer memoized under the old value (audit R3-06).
+    answers: [
+        favorites_page,
+    ],
+    // Read by the frontend, or by an action (export, file creation) when it
+    // runs; no memoized answer depends on them.
+    settings: [
+        preferred_workflow,
+        shortcuts,
+        all_pages_public,
+        start_of_week,
+        linked_references_collapsed_threshold,
+        default_journal_template,
+        default_home,
+        favorites,
+        preferred_format,
+        macros,
+        enable_timetracking,
+        show_brackets,
+        doc_mode_enter_for_new_block,
+        logical_outdenting,
+        logbook,
+        guide_announced,
+    ],
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -1307,6 +1407,155 @@ impl Config {
 }
 
 #[cfg(test)]
+mod config_reach_tests {
+    use super::*;
+
+    #[test]
+    fn a_change_reaches_the_graph_only_through_a_graph_field() {
+        let base = Config::parse("{}");
+        assert_eq!(base.reach(&base.clone()), ConfigReach::Unchanged);
+        let home = Config::parse(r#"{:default-home {:page "Start"}}"#);
+        assert_eq!(base.reach(&home), ConfigReach::Settings);
+        let favorites = Config::parse(r#"{:favorites ["A"] :tine/favorites-page "F"}"#);
+        assert_eq!(base.reach(&favorites), ConfigReach::Settings);
+        let hidden = Config::parse(r#"{:hidden ["drafts"] :default-home {:page "Start"}}"#);
+        assert_eq!(base.reach(&hidden), ConfigReach::Graph);
+        let title = Config::parse(r#"{:journal/page-title-format "yyyy-MM-dd"}"#);
+        assert_eq!(base.reach(&title), ConfigReach::Graph);
+    }
+
+    /// Exports and the CLI read settings from the graph: one written through
+    /// the graph is the one they read, without reopening it. Favorites and the
+    /// workflow were read as the graph opened until the next launch.
+    #[test]
+    fn a_setting_written_through_the_graph_is_the_one_it_reads() {
+        let dir = std::env::temp_dir().join(format!("tine-config-reach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("logseq")).unwrap();
+        std::fs::write(dir.join("logseq/config.edn"), "{}\n").unwrap();
+        let graph = crate::model::Graph::open(&dir);
+        graph.set_favorites(&["A".to_owned()]).unwrap();
+        graph.set_default_home_page(Some("Home")).unwrap();
+        graph.set_journal_page_title_format("yyyy-MM-dd").unwrap();
+        let config = graph.config();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(config.favorites, vec!["A".to_owned()]);
+        assert_eq!(config.default_home.as_deref(), Some("Home"));
+        // Reaches the graph: this instance keeps the format it parsed with.
+        assert_eq!(config.journal_page_title_format, None);
+    }
+
+    /// A `settings` field is taken in place, so nothing may copy it where a
+    /// swap cannot reach: into what the graph derives when it opens, or into
+    /// the parser input every indexed page is stored under. If this fails,
+    /// the field belongs in `graph:` in `config_reach!` (GH #543, R2-P1).
+    #[test]
+    fn a_settings_field_is_not_copied_at_open_or_into_the_index() {
+        let sources = [
+            ("model/open_graph.rs", include_str!("model/open_graph.rs")),
+            (
+                "model/projection_lifetime.rs",
+                include_str!("model/projection_lifetime.rs"),
+            ),
+            ("config.rs parse_config", {
+                let source = include_str!("config.rs");
+                let start = source.find("pub fn parse_config(&self)").unwrap();
+                &source[start..start + source[start..].find("\n    }\n").unwrap()]
+            }),
+        ];
+        let mut copied = Vec::new();
+        for field in Config::SETTINGS_FIELDS {
+            for (name, source) in sources {
+                if [
+                    format!("config.{field}"),
+                    format!("config().{field}"),
+                    format!("self.{field}"),
+                ]
+                .iter()
+                .any(|read| source.contains(read.as_str()))
+                {
+                    copied.push(format!("{name}: {field}"));
+                }
+            }
+        }
+        assert!(
+            copied.is_empty(),
+            "settings fields copied where a swap cannot reach: {copied:?}"
+        );
+    }
+
+    /// A memoized reference or query answer is keyed on the answer settings
+    /// only (`Config::answer_settings_digest`). A setting outside that list
+    /// read anywhere an answer is computed would be served stale after a
+    /// change (audit R3-06). The readers allowed here act when they run
+    /// (export, file creation) or describe the config to the frontend; to
+    /// read another setting while computing an answer, list it under
+    /// `answers:` in `config_reach!`.
+    #[test]
+    fn only_an_answer_setting_is_read_where_answers_are_computed() {
+        const ALLOWED: &[(&str, &[&str])] = &[
+            ("config.rs", &["*"]),
+            ("model/paths.rs", &["*"]),
+            ("publish.rs", &["*"]),
+            ("publish/", &["*"]),
+            ("model/pdf.rs", &["preferred_format"]),
+            ("model/pages_merge.rs", &["preferred_format"]),
+            ("model/graph_text_inventory.rs", &["preferred_format"]),
+        ];
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        let mut readers = Vec::new();
+        for file in files {
+            let rel = file
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel.contains("tests") || rel.ends_with("_test.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&file).unwrap();
+            for field in Config::SETTINGS_FIELDS {
+                if Config::ANSWER_FIELDS.contains(field) {
+                    continue;
+                }
+                let allowed = ALLOWED.iter().any(|(prefix, fields)| {
+                    rel.starts_with(prefix) && (fields.contains(&"*") || fields.contains(field))
+                });
+                if allowed {
+                    continue;
+                }
+                for read in [format!("config.{field}"), format!("config().{field}")] {
+                    let hit = source.match_indices(read.as_str()).any(|(at, _)| {
+                        !source[at + read.len()..]
+                            .starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                    });
+                    if hit {
+                        readers.push(format!("{rel}: {field}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            readers.is_empty(),
+            "settings read outside the answer list where answers may be computed; \
+             list them under `answers:` in `config_reach!` (GH #543, audit R3-06): {readers:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod parse_config_tests {
     use super::*;
 
@@ -1541,12 +1790,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bare);
     }
 
-    /// The other half of the watcher's economy. A settings write leaves the
-    /// running graph's parsed view stale (it always has), so the byte gate
-    /// alone would read every star toggled in the sidebar as an outside change
-    /// and reopen the whole graph — discarding every cache it has built.
+    /// The watcher does nothing exactly when disk holds the bytes the served
+    /// configuration was taken from. Tine's own settings write is taken in, so
+    /// a star toggled in the sidebar costs no reopen; anything not taken in
+    /// must differ, or the running graph serves stale configuration.
     #[test]
-    fn a_settings_write_tine_performed_itself_does_not_read_as_an_outside_change() {
+    fn the_watcher_gate_matches_disk_only_when_disk_was_taken_in() {
         let dir = std::env::temp_dir().join(format!(
             "tine-config-selfwrite-{}-{:?}",
             std::process::id(),
@@ -1554,34 +1803,55 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("logseq")).unwrap();
-        std::fs::write(dir.join("logseq").join("config.edn"), "{}\n").unwrap();
+        let config = dir.join("logseq").join("config.edn");
+        std::fs::write(&config, "{}\n").unwrap();
+        let disk = || crate::model::config_file_description(&dir);
 
         let g = crate::model::Graph::open(&dir);
-        assert_eq!(g.recent_config_write(), None, "nothing published yet");
+        assert_eq!(
+            g.served_config_description(),
+            disk(),
+            "opened with these bytes"
+        );
 
         g.set_favorites(&["Alpha".to_owned()]).unwrap();
-        let disk = crate::model::config_file_description(&dir);
-
-        assert_ne!(
-            g.open_config_description(),
-            disk,
-            "the parsed view is stale after a write, as it has always been"
-        );
         assert_eq!(
-            g.recent_config_write(),
-            disk,
-            "but the bytes on disk are the ones this instance published"
+            g.served_config_description(),
+            disk(),
+            "Tine's own settings write is taken in"
         );
 
         // An outside edit after our own write is still an outside edit.
-        std::fs::write(
-            dir.join("logseq").join("config.edn"),
-            "{:favorites [\"Alpha\" \"AddedInLogseq\"]}\n",
-        )
-        .unwrap();
-        let disk = crate::model::config_file_description(&dir);
-        assert_ne!(g.open_config_description(), disk);
-        assert_ne!(g.recent_config_write(), disk);
+        std::fs::write(&config, "{:favorites [\"Alpha\" \"AddedInLogseq\"]}\n").unwrap();
+        assert_ne!(g.served_config_description(), disk());
+
+        // An outside revert to the bytes the graph was opened with: the served
+        // configuration still has Alpha, so this is a change.
+        std::fs::write(&config, "{}\n").unwrap();
+        assert_ne!(
+            g.served_config_description(),
+            disk(),
+            "a revert to the opening bytes is a change to what is served"
+        );
+        g.take_in_config();
+        assert!(g.config().favorites.is_empty());
+        assert_eq!(g.served_config_description(), disk());
+
+        // An outside change that reaches the graph, folded into Tine's own
+        // settings write: the write cannot take it in, so disk must still
+        // differ and the watcher must reopen.
+        std::fs::write(&config, "{:pages-directory \"notes\"}\n").unwrap();
+        g.set_favorites(&["Beta".to_owned()]).unwrap();
+        assert_ne!(
+            g.served_config_description(),
+            disk(),
+            "a folded change that reaches the graph is not taken in"
+        );
+        assert_eq!(
+            g.take_in_config(),
+            crate::config::ConfigReach::Graph,
+            "and the watcher's own take-in says it needs a new graph"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1625,7 +1895,7 @@ mod tests {
         std::fs::write(dir.join("logseq").join("config.edn"), original).unwrap();
 
         let g = crate::model::Graph::open(&dir);
-        assert_eq!(g.config.favorites_page, None);
+        assert_eq!(g.config().favorites_page, None);
         g.set_favorites_page("Favorites").unwrap();
 
         let written = std::fs::read_to_string(dir.join("logseq").join("config.edn")).unwrap();
@@ -1716,7 +1986,7 @@ mod tests {
         assert!(written.contains(";; keep me"), "{written}");
         assert!(written.contains(":start-of-week 2"), "{written}");
         assert_eq!(
-            Graph::open(&dir).config.default_home.as_deref(),
+            Graph::open(&dir).config().default_home.as_deref(),
             Some("New \"Home\"")
         );
 
@@ -1724,7 +1994,7 @@ mod tests {
         let cleared = fs::read_to_string(&path).unwrap();
         assert!(!cleared.contains(":page \"New"), "{cleared}");
         assert!(cleared.contains(":sidebar [\"Contents\"]"), "{cleared}");
-        assert_eq!(Graph::open(&dir).config.default_home, None);
+        assert_eq!(Graph::open(&dir).config().default_home, None);
 
         fs::write(&path, "{:start-of-week 2}\n").unwrap();
         Graph::open(&dir)
@@ -1866,9 +2136,9 @@ mod tests {
             "not written: {after}"
         );
         assert!(after.contains(":start-of-week 0"), "other keys preserved");
-        assert!(!Graph::open(&dir).config.enable_timetracking);
+        assert!(!Graph::open(&dir).config().enable_timetracking);
         Graph::open(&dir).set_timetracking_enabled(true).unwrap();
-        assert!(Graph::open(&dir).config.enable_timetracking);
+        assert!(Graph::open(&dir).config().enable_timetracking);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1899,7 +2169,7 @@ mod tests {
             after.contains(";; preserve this comment"),
             "comments preserved"
         );
-        assert!(!Graph::open(&dir).config.show_brackets);
+        assert!(!Graph::open(&dir).config().show_brackets);
         let _ = fs::remove_dir_all(&dir);
     }
 

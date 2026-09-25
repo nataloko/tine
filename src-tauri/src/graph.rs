@@ -17,11 +17,25 @@ use std::time::Instant;
 use tauri::{Emitter, Manager, State};
 use tine_core::model::{Graph, GraphMeta};
 
-/// Reset the warm flag for a new graph load and return the new warm generation
-/// (passed to `warm_cache_async`, which only reports done if still current).
-pub(crate) fn begin_warm_cache(slot: &GraphSlot) -> u64 {
+/// A launch warm reserved for a graph that is about to be published: the warm
+/// generation `warm_cache_async` reports done against, and the graph's
+/// registered index owner, which tells readers index work is coming.
+pub(crate) struct WarmTicket {
+    pub(crate) generation: u64,
+    owner: tine_core::model::IndexOwner,
+}
+
+/// Reset the warm flag for a new graph load and register its index owner.
+/// Both callers take the ticket before the slot is published, so a command
+/// reaching the new graph sees index work coming and waits for it instead of
+/// parsing the whole graph itself (GH #543); `warm_cache_async` accepts only a
+/// ticket.
+pub(crate) fn begin_warm_cache(slot: &GraphSlot) -> WarmTicket {
     slot.warm_done.store(false, Ordering::Release);
-    slot.warm_generation.fetch_add(1, Ordering::AcqRel) + 1
+    WarmTicket {
+        generation: slot.warm_generation.fetch_add(1, Ordering::AcqRel) + 1,
+        owner: slot.graph().register_index_owner(),
+    }
 }
 
 /// Resolve the graph root: explicit path, else env var, else first CLI arg.
@@ -36,7 +50,11 @@ pub(crate) fn resolve_root(path: &str) -> Option<String> {
             }
         }
     }
-    std::env::args().skip(1).find(|arg| !arg.starts_with('-'))
+    #[cfg(desktop)]
+    if let crate::cli::LaunchRequest::Open(path) = crate::cli::launch_request_env() {
+        return Some(path.display().to_string());
+    }
+    None
 }
 
 /// The remembered-graph lookup retains its historical best-effort semantics:
@@ -232,7 +250,6 @@ pub(crate) fn capture_graph_binding(
 
 struct LoadedGraph {
     graph: Graph,
-    meta: GraphMeta,
 }
 
 fn open_graph_for_load(
@@ -242,7 +259,6 @@ fn open_graph_for_load(
     let graph = Graph::open_checked_with_assets(root, approved_assets).map_err(|e| {
         crate::command_error::CommandError::graph(format!("unsafe graph layout: {e}"))
     })?;
-    let meta = graph.meta();
     // Concord invariant 4 (write-shyness). Opening a graph used to RENAME every
     // title-named journal file to its date stem, behind a synchronous launch
     // backup. It is a genuine repair — such a file cannot be parsed back to a
@@ -252,7 +268,7 @@ fn open_graph_for_load(
     // (`journal_filename_migrations`) and applied only by the explicit
     // `apply_journal_filename_migrations` command, which takes the same
     // pre-migration snapshot first. Opening touches nothing.
-    Ok(LoadedGraph { graph, meta })
+    Ok(LoadedGraph { graph })
 }
 
 #[derive(serde::Serialize)]
@@ -460,9 +476,9 @@ fn publish_direct_files_slot(
     window_label: &str,
     graph: Graph,
     root_key: PathBuf,
-) -> Result<(Arc<GraphSlot>, u64), crate::command_error::CommandError> {
+) -> Result<(Arc<GraphSlot>, WarmTicket), crate::command_error::CommandError> {
     let slot = Arc::new(GraphSlot::new(graph, root_key));
-    let warm_generation = begin_warm_cache(&slot);
+    let warm = begin_warm_cache(&slot);
     state
         .graphs
         .write()
@@ -471,7 +487,7 @@ fn publish_direct_files_slot(
         .map_err(crate::command_error::CommandError::from)?;
     state.note_focused(window_label);
     poke_watcher(state);
-    Ok((slot, warm_generation))
+    Ok((slot, warm))
 }
 
 fn direct_files_projection_path(
@@ -498,7 +514,6 @@ fn direct_files_projection_path(
 
 pub(crate) struct PreparedDirectFilesOpen {
     graph: Graph,
-    meta: GraphMeta,
     root_key: PathBuf,
 }
 
@@ -530,13 +545,9 @@ pub(crate) fn prepare_direct_files_open(
                 .to_string(),
         ),
     }
-    let LoadedGraph { graph, meta } = open_graph_for_load(&root, approved_assets.as_deref())?;
+    let LoadedGraph { graph } = open_graph_for_load(&root, approved_assets.as_deref())?;
     attach_direct_files_services(&graph, direct_files_service_paths(app, &root_key));
-    Ok(PreparedDirectFilesOpen {
-        graph,
-        meta,
-        root_key,
-    })
+    Ok(PreparedDirectFilesOpen { graph, root_key })
 }
 
 /// The app-private locations of the services a Direct Files `Graph` carries:
@@ -560,7 +571,7 @@ pub(crate) fn direct_files_service_paths(
 
 /// Attach the Direct Files services to a freshly opened `Graph`. This is the
 /// ONE place that does so: the ordinary open and the configuration refresh
-/// (`state::reopen_legacy_for_refresh`) both go through it, so a `Graph` that
+/// (`state::PreparedRefresh::commit`) both go through it, so a `Graph` that
 /// reaches the window registry always carries its projection. A refresh that
 /// reopened without attaching left every query `ProjectionUnavailable` until
 /// the next graph open (GH draft "Query Engine", 2026-09-11: dismissing the
@@ -598,16 +609,26 @@ pub(crate) fn publish_prepared_direct_files(
     state: &AppState,
     prepared: PreparedDirectFilesOpen,
 ) -> Result<DirectFilesOpen, crate::command_error::CommandError> {
-    let PreparedDirectFilesOpen {
-        graph,
-        meta,
-        root_key,
-    } = prepared;
-    let (slot, warm_generation) = publish_direct_files_slot(state, window_label, graph, root_key)?;
+    let PreparedDirectFilesOpen { graph, root_key } = prepared;
+    let (slot, warm) = publish_direct_files_slot(state, window_label, graph, root_key)?;
+    crate::state::serve_disk_config(app, window_label, &slot);
+    let meta = slot.graph_meta();
+    let binding_generation = slot.binding_generation;
+    let application_page_admission = slot.application_page_admission();
+    // The graph is published: its index owner starts now, before anything
+    // that can fail. An error returned after publication dropped the warm
+    // ticket, leaving an open graph whose index nobody owned and whose
+    // whole-graph views waited for a completion that never came (GH #543,
+    // audit R7-03).
+    warm_cache_async(app.clone(), window_label.to_string(), slot.clone(), warm)?;
     // Opening no longer mutates the tree, so the launch snapshot is never on a
     // rename's critical path: it stays the ordinary background backup.
-    backup_async(app.clone(), slot.clone())?;
-    remember_graph(app, &meta.root)?;
+    backup_async(app.clone(), window_label.to_string(), slot)?;
+    // The recent-graphs list is bookkeeping; a settings write that fails
+    // (a full disk) does not un-open the graph.
+    if remember_graph(app, &meta.root).is_err() {
+        crate::debug::diag("remembering the opened graph in settings failed".to_string());
+    }
     if let Some(window) = app.get_webview_window(window_label) {
         let name = Path::new(&meta.root)
             .file_name()
@@ -615,9 +636,6 @@ pub(crate) fn publish_prepared_direct_files(
             .unwrap_or("Graph");
         let _ = window.set_title(&format!("Tine — {name}"));
     }
-    let binding_generation = slot.binding_generation;
-    let application_page_admission = slot.application_page_admission();
-    warm_cache_async(app.clone(), window_label.to_string(), slot, warm_generation)?;
     Ok(DirectFilesOpen {
         meta,
         binding_generation,
@@ -654,10 +672,12 @@ pub(crate) fn load_graph_for_label(
         lookup_id,
         StorageTransitionPhase::LookingUpSelection,
     )?;
-    if let Some(owner) = state.graphs.read().unwrap().owner(&root_key) {
+    let owner = state.graphs.read().unwrap().owner(&root_key);
+    if let Some(owner) = owner {
         if owner == window_label {
             let slot = slot_for_window(&state, &owner)
                 .map_err(crate::command_error::CommandError::from)?;
+            crate::state::serve_disk_config(app, window_label, &slot);
             state.storage_supervisor.finish_transition(
                 app,
                 lookup_id,
@@ -768,7 +788,15 @@ pub(crate) async fn open_graph_window(
     {
         let id = state.next_window.fetch_add(1, Ordering::Relaxed);
         let label = format!("graph-{id}");
-        let result = load_graph_for_label(path, &app, &label, &state)?;
+        // Off the async runtime, like `load_graph`: opening a graph walks it.
+        let worker_app = app.clone();
+        let worker_label = label.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            let state = worker_app.state::<AppState>();
+            load_graph_for_label(path, &worker_app, &worker_label, &state)
+        })
+        .await
+        .map_err(crate::command_error::CommandError::worker)??;
         if let LoadGraphResult::Loaded { ref meta, .. } = result {
             let name = Path::new(&meta.root)
                 .file_name()
@@ -1018,63 +1046,131 @@ pub(crate) fn default_graph_parent(
     Ok(dir.display().to_string())
 }
 
-/// Build the search/backlinks cache off the hot path. We let the frontend's
-/// first journal load grab the graph lock first, then warm in the background so
-/// the first search is instant instead of re-parsing the whole tree. When the
-/// warm completes (and this graph is still the current one — generation check),
-/// flip `warm_done` and tell the frontend, which has been HOLDING its
-/// whole-graph fetches (aliases, ref-count badges) so graph open never does
-/// graph-sized work in the foreground.
+/// Run the graph's index owner off the hot path. We let the frontend's first
+/// journal load get ahead of it, then the owner validates or builds
+/// the index in the background, and keeps answering what the index needs for
+/// as long as this graph is bound to the window. When nothing is coming any
+/// more (and this graph is still the current one — generation check), flip
+/// `warm_done` and tell the frontend, which has been HOLDING its whole-graph
+/// fetches (aliases, ref-count badges) so graph open never does graph-sized
+/// work in the foreground.
 pub(crate) fn warm_cache_async(
     app: tauri::AppHandle,
     window_label: String,
     slot: Arc<GraphSlot>,
-    warm_generation: u64,
+    warm: WarmTicket,
 ) -> Result<(), crate::command_error::CommandError> {
     let graph = slot.graph();
+    // The ticket's owner was registered before the graph was published, not
+    // after the delay below; it is dropped when this thread ends, however it
+    // ends.
+    let WarmTicket {
+        generation: warm_generation,
+        owner,
+    } = warm;
     std::thread::spawn(move || {
         // Brief delay so the first journal paint (which only needs a few pages)
-        // grabs the lock first; then build the whole-graph cache in the
-        // background so the first search / query / `g j` agenda doesn't pay for
-        // parsing every file synchronously under the lock.
+        // is not competing with a whole-graph pass for cores and storage; then
+        // index in the background so the first search / query / `g j` agenda
+        // doesn't pay for parsing every file in the foreground.
         std::thread::sleep(std::time::Duration::from_millis(250));
-        if slot.background_cancelled.load(Ordering::Acquire)
-            || slot.warm_generation.load(Ordering::Acquire) != warm_generation
-        {
+        if warm_revoked(&slot, warm_generation) {
             return; // the graph was switched while we slept — a newer warm owns it
         }
-        // At most one process-wide graph warm parses files at a time. Rapid
-        // switches may leave short-lived sleepers, but cannot amplify disk/CPU
-        // work; revoked slots stop between page parses.
+        // At most one process-wide whole-graph index pass reads files at a
+        // time: every graph's owner takes this permit for its passes only.
+        // Rapid switches cannot amplify disk/CPU work; revoked slots stop
+        // between page parses.
         static WARM_WORK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        let _worker = WARM_WORK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
-        if slot.background_cancelled.load(Ordering::Acquire)
-            || slot.warm_generation.load(Ordering::Acquire) != warm_generation
-        {
-            return;
-        }
-        let completed = graph.warm_cache_cancellable(|| {
-            slot.background_cancelled.load(Ordering::Acquire)
-                || slot.warm_generation.load(Ordering::Acquire) != warm_generation
-        });
-        if !completed {
-            return;
-        }
-        let state: State<'_, AppState> = app.state();
-        let current = state.graphs.read().unwrap().slot(&window_label);
-        let still_current = current.as_ref().is_some_and(|current| {
-            current.binding_generation == slot.binding_generation
-                && current.root_key == slot.root_key
-        });
-        if still_current && slot.warm_generation.load(Ordering::Acquire) == warm_generation {
-            current.unwrap().warm_done.store(true, Ordering::Release);
-            let _ = app.emit_to(&window_label, "warm-cache-done", ());
-        }
+        let permit = WARM_WORK.get_or_init(|| std::sync::Mutex::new(()));
+        let cancelled = || warm_revoked(&slot, warm_generation);
+        settle_launch_warm(
+            |settle| graph.run_index_owner(owner, permit, cancelled, settle),
+            cancelled,
+            || {
+                let state: State<'_, AppState> = app.state();
+                let current = state.graphs.read().unwrap().slot(&window_label);
+                if finish_warm(current, &slot, warm_generation) {
+                    let _ = app.emit_to(&window_label, "warm-cache-done", ());
+                    crate::watcher::announce_unreadable_pages(&app, &window_label, &graph);
+                }
+            },
+        );
     });
     Ok(())
+}
+
+/// Whether the launch warm `warm_generation` of `slot` no longer owns the
+/// window: the slot's background work was cancelled (switch, close), a newer
+/// warm replaced it, or its graph was retired. A refresh retires the old
+/// graph before it swaps the slot -- it cannot cancel the background work the
+/// two slots share -- and a check without retirement let the old owner's
+/// launch completion announce `warm-cache-done` for a pass that never
+/// finished (GH #543, audit R8-05).
+fn warm_revoked(slot: &GraphSlot, warm_generation: u64) -> bool {
+    slot.background_cancelled.load(Ordering::Acquire)
+        || slot.warm_generation.load(Ordering::Acquire) != warm_generation
+        || slot.graph().is_retired()
+}
+
+/// Mark indexing finished for the window, if this warm still owns it. Only
+/// the warm of the slot currently installed for the window may: a
+/// same-root refresh keeps the binding generation and copies the warm
+/// generation, so comparing those let a retired slot's warm settle the
+/// replacement's pending requests before the replacement's own pass had
+/// begun (GH #543, audit R3-05).
+fn finish_warm(
+    current: Option<Arc<GraphSlot>>,
+    slot: &Arc<GraphSlot>,
+    warm_generation: u64,
+) -> bool {
+    let Some(current) = current.filter(|current| Arc::ptr_eq(current, slot)) else {
+        return false;
+    };
+    if current.warm_generation.load(Ordering::Acquire) != warm_generation {
+        return false;
+    }
+    current.warm_done.store(true, Ordering::Release);
+    true
+}
+
+/// Run the index owner and settle its launch completion signal, at most
+/// once. The signal is `warm-cache-done`: the frontend's alias, page-identity
+/// and block-ref-count fetches and the indexing progress bar wait for it, and
+/// nothing else ends that wait. The owner sends it through the callback it is
+/// given, the first time nothing is coming; an owner that ended before that
+/// for any reason other than cancellation -- the worker gone, a failed build,
+/// a panic -- still sends it, and the waiting reads then take their ordinary
+/// route. Only a cancelled owner (graph switched or closed) stays silent,
+/// because a newer owner has the window (GH #543, IT-04).
+fn settle_launch_warm(
+    owner: impl FnOnce(&mut dyn FnMut()),
+    cancelled: impl Fn() -> bool,
+    finish: impl FnOnce(),
+) {
+    struct Settle<C: Fn() -> bool, F: FnOnce()> {
+        cancelled: C,
+        finish: Option<F>,
+    }
+    impl<C: Fn() -> bool, F: FnOnce()> Settle<C, F> {
+        fn fire(&mut self) {
+            if let Some(finish) = self.finish.take() {
+                finish();
+            }
+        }
+    }
+    impl<C: Fn() -> bool, F: FnOnce()> Drop for Settle<C, F> {
+        fn drop(&mut self) {
+            if !(self.cancelled)() {
+                self.fire();
+            }
+        }
+    }
+    let mut settle = Settle {
+        cancelled,
+        finish: Some(finish),
+    };
+    owner(&mut || settle.fire());
 }
 
 /// "Have the whole-graph derived caches finished warming for the current graph?"
@@ -1091,10 +1187,85 @@ pub(crate) fn warm_done(
         .load(Ordering::Acquire))
 }
 
+/// How far the graph-sized index work has got, for the indexing progress bar
+/// (GH #543). `None` once search is answered by a current index. Polled by
+/// the frontend while it shows the bar; cheap (atomics and one short lock).
+#[tauri::command]
+pub(crate) fn indexing_progress(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<
+    Option<tine_core::indexing_progress::IndexingProgress>,
+    crate::command_error::CommandError,
+> {
+    Ok(slot_for_window(&state, window.label())
+        .map_err(crate::command_error::CommandError::from)?
+        .graph()
+        .indexing_progress())
+}
+
+/// The user's Retry after the index failed (GH #594, index liveness L4):
+/// reopen the graph, which starts a new index worker with a fresh budget of
+/// attempts, exactly as the next launch would.
+#[tauri::command]
+pub(crate) async fn retry_index(
+    state: crate::state::GraphContext<'_>,
+) -> Result<(), crate::command_error::CommandError> {
+    let (app, label, _) = crate::state::owned_graph_context(state)?;
+    crate::state::refresh_graph(app, label, || Ok(())).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    /// GH #543 (IT-04): a launch warm that ended without being cancelled always
+    /// sends its completion signal. A failed warm used to return silently, and
+    /// the alias, page-identity and ref-count fetches and the indexing
+    /// progress poll waited for a signal that never came.
+    #[test]
+    fn a_launch_warm_that_ends_uncancelled_always_signals_completion() {
+        for (case, settles) in [("settled", true), ("ended unsettled", false)] {
+            let signalled = std::cell::Cell::new(0);
+            settle_launch_warm(
+                |settle| {
+                    if settles {
+                        settle();
+                        settle();
+                    }
+                },
+                || false,
+                || signalled.set(signalled.get() + 1),
+            );
+            assert_eq!(
+                signalled.get(),
+                1,
+                "{case}: not exactly one completion signal"
+            );
+        }
+
+        let signalled = std::sync::atomic::AtomicBool::new(false);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            settle_launch_warm(
+                |_| panic!("owner panicked"),
+                || false,
+                || signalled.store(true, Ordering::Release),
+            )
+        }));
+        assert!(panicked.is_err());
+        assert!(
+            signalled.load(Ordering::Acquire),
+            "panicked: no completion signal"
+        );
+
+        let signalled = std::cell::Cell::new(false);
+        settle_launch_warm(|_| {}, || true, || signalled.set(true));
+        assert!(
+            !signalled.get(),
+            "cancelled: a newer warm owns the window's signal"
+        );
+    }
 
     use crate::test_support::rust_module_source;
 
@@ -1126,6 +1297,121 @@ mod tests {
         collect(root, Path::new(""), &mut files);
         files.sort_by(|left, right| left.0.cmp(&right.0));
         files
+    }
+
+    /// GH #543 (audit R3-05): a same-root refresh installs a replacement
+    /// slot and starts its own warm. The retired slot's warm must neither
+    /// mark the replacement finished (its pending alias and ref-count
+    /// requests would be answered from a graph that has not indexed yet) nor
+    /// keep parsing the graph nothing reads any more.
+    #[test]
+    fn a_retired_warm_cannot_finish_indexing_for_its_replacement() {
+        let root =
+            std::env::temp_dir().join(format!("tine-r3-retired-warm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["pages", "journals", "logseq"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("logseq/config.edn"), "{}\n").unwrap();
+        std::fs::write(root.join("pages/Source.md"), "- [[OnlyReferenced]]\n").unwrap();
+        let root_key = std::fs::canonicalize(&root).unwrap();
+        let state = direct_test_state();
+        let (old, old_warm) =
+            publish_direct_files_slot(&state, "main", Graph::open(&root), root_key.clone())
+                .unwrap();
+        let old_generation = old_warm.generation;
+        let services = DirectFilesServicePaths {
+            projection: Ok(root.join("private/projection.sqlite")),
+            concord_ledger: None,
+        };
+        let replacement = Arc::new(
+            crate::state::prepare_legacy_refresh(&old, None, services)
+                .unwrap()
+                .commit(&old),
+        );
+        let replacement_generation = begin_warm_cache(&replacement).generation;
+        assert!(state.graphs.write().unwrap().swap_refreshed(
+            "main",
+            &old,
+            Arc::clone(&replacement)
+        ));
+
+        assert_ne!(
+            old.warm_generation.load(Ordering::Acquire),
+            old_generation,
+            "the retired warm keeps parsing a graph nothing reads"
+        );
+        let current = state.graphs.read().unwrap().slot("main");
+        assert!(!finish_warm(current, &old, old_generation));
+        assert!(
+            !replacement.warm_done.load(Ordering::Acquire),
+            "a retired warm settled the replacement's pending requests before its pass began"
+        );
+
+        let current = state.graphs.read().unwrap().slot("main");
+        assert!(finish_warm(current, &replacement, replacement_generation));
+        assert!(replacement.warm_done.load(Ordering::Acquire));
+        replacement
+            .graph()
+            .detach_direct_projection(std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// GH #543: a refresh retires the old graph in `commit` but moves the old
+    /// slot's warm generation only in `swap_refreshed`. In between, the old
+    /// owner is cancelled by retirement; the launch-settle guard and
+    /// `finish_warm` must treat that as revoked (`warm_revoked`) rather than
+    /// consult only the slot, or the retired warm announces `warm-cache-done`
+    /// before the replacement's pass has begun.
+    #[test]
+    fn a_refresh_does_not_announce_the_retired_warm() {
+        let root =
+            std::env::temp_dir().join(format!("tine-refresh-retired-warm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in ["pages", "journals", "logseq"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("logseq/config.edn"), "{}\n").unwrap();
+        std::fs::write(root.join("pages/Source.md"), "- [[OnlyReferenced]]\n").unwrap();
+        let root_key = std::fs::canonicalize(&root).unwrap();
+        let state = direct_test_state();
+        let (old, old_warm) =
+            publish_direct_files_slot(&state, "main", Graph::open(&root), root_key.clone())
+                .unwrap();
+        let old_generation = old_warm.generation;
+        let services = DirectFilesServicePaths {
+            projection: Ok(root.join("private/projection.sqlite")),
+            concord_ledger: None,
+        };
+        let prepared = crate::state::prepare_legacy_refresh(&old, None, services).unwrap();
+        let replacement = Arc::new(prepared.commit(&old));
+        // Between commit and swap: the old graph is retired, so its owner's
+        // own `cancelled` is true and it returns without settling.
+        let slot_cancelled = || warm_revoked(&old, old_generation);
+        let mut announced = false;
+        settle_launch_warm(
+            |_settle| { /* owner returned: cancelled by retirement, never settled */ },
+            slot_cancelled,
+            || {
+                let current = state.graphs.read().unwrap().slot("main");
+                announced = finish_warm(current, &old, old_generation);
+            },
+        );
+        let _ = begin_warm_cache(&replacement);
+        let _ =
+            state
+                .graphs
+                .write()
+                .unwrap()
+                .swap_refreshed("main", &old, Arc::clone(&replacement));
+        replacement
+            .graph()
+            .detach_direct_projection(std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            !announced,
+            "a retired owner's launch settle emitted warm-cache-done for the window before the replacement's pass began"
+        );
     }
 
     fn direct_test_state() -> AppState {
@@ -1247,15 +1533,23 @@ mod tests {
             "the open path attaches before it publishes"
         );
         let state = production(include_str!("state.rs"));
+        let prepare = &state[state
+            .find("pub(crate) fn prepare_legacy_refresh")
+            .expect("refresh preparation")..];
+        let prepare = &prepare[..prepare.find("\n}\n").expect("end of preparation")];
+        assert!(
+            prepare.contains("Graph::open_checked_with_assets(")
+                && !prepare.contains("retire(")
+                && !prepare.contains("detach_direct_projection("),
+            "refresh preparation reopens the root and leaves the bound graph serving"
+        );
         let refresh = &state[state
-            .find("pub(crate) fn reopen_legacy_for_refresh")
-            .expect("refresh core")..];
+            .find("pub(crate) fn commit(self, old: &GraphSlot) -> GraphSlot")
+            .expect("refresh commit")..];
+        let retire = refresh.find(".retire()").expect("old graph retired");
         let detach = refresh
             .find("detach_direct_projection(")
             .expect("old worker retired");
-        let reopen = refresh
-            .find("Graph::open_checked_with_assets(")
-            .expect("refresh reopens");
         let attach = refresh
             .find("attach_direct_files_services(")
             .expect("refresh attaches");
@@ -1263,16 +1557,56 @@ mod tests {
             .find("GraphSlot::refreshed(")
             .expect("refresh publishes");
         assert!(
-            detach < reopen && reopen < attach && attach < slot,
-            "refresh retires the old projection worker, reopens, attaches, then builds the slot"
+            retire < detach && detach < attach && attach < slot,
+            "refresh commit retires the old graph, stops its projection worker, \
+             attaches, then builds the slot"
+        );
+        // The open path starts the owner of a published graph before
+        // anything that can fail: an error in between dropped the warm ticket
+        // and left the graph's index unowned (GH #543, audit R7-03).
+        let open = &graph[graph
+            .find("pub(crate) fn publish_prepared_direct_files(")
+            .expect("open publication")..];
+        let open = &open[..open.find("\n}\n").expect("open publication ends")];
+        let published = open
+            .find("publish_direct_files_slot(")
+            .expect("open publishes");
+        let warmed = open.find("warm_cache_async(").expect("open warms");
+        let between = &open[published..warmed];
+        assert!(
+            published < warmed && between.matches('?').count() == 1,
+            "nothing fallible sits between publishing the graph and starting its \
+             index owner: {between}"
         );
         let refresh_entry = &state[state
-            .find("pub(crate) fn refresh_graph_for_label")
+            .find("\nfn refresh_graph_for_label")
             .expect("refresh entry")..];
         assert!(
-            refresh_entry.find("reopen_legacy_for_refresh(")
-                < refresh_entry.find("warm_cache_async("),
+            refresh_entry.find(".commit(&old)") < refresh_entry.find("warm_cache_async("),
             "the refreshed slot is warmed, or the projection never receives its payload"
+        );
+        // The warm ticket announces the warm, so it is taken before the graph
+        // is published; otherwise the first command on the new graph finds no
+        // warm coming and parses the whole graph (GH #543).
+        assert!(
+            refresh_entry
+                .find("begin_warm_cache(")
+                .expect("refresh reserves its warm")
+                < refresh_entry
+                    .find("swap_refreshed(")
+                    .expect("refresh publishes"),
+            "a refreshed graph's warm is announced before the swap publishes it"
+        );
+        let source = include_str!("graph.rs");
+        let publish = &source[source
+            .find("fn publish_direct_files_slot(")
+            .expect("open publication")..];
+        assert!(
+            publish
+                .find("begin_warm_cache(")
+                .expect("open reserves its warm")
+                < publish.find(".bind(").expect("open binds the slot"),
+            "an opened graph's warm is announced before the slot is bound"
         );
     }
 
@@ -1365,9 +1699,9 @@ mod tests {
             .expect("inert legacy-v1 bytes must not reject a checked Direct Files open");
         let root_key = std::fs::canonicalize(&dir).unwrap();
         let loaded = open_graph_for_load(dir.to_str().unwrap(), None).unwrap();
-        assert_eq!(loaded.meta.root, dir.display().to_string());
+        assert_eq!(loaded.graph.meta().root, dir.display().to_string());
         let state = direct_test_state();
-        let (slot, warm_generation) =
+        let (slot, warm) =
             publish_direct_files_slot(&state, "ordinary", loaded.graph, root_key.clone()).unwrap();
         let installed = state
             .graphs
@@ -1380,7 +1714,7 @@ mod tests {
         assert_eq!(installed.binding_generation, slot.binding_generation);
         assert_eq!(
             installed.warm_generation.load(Ordering::Acquire),
-            warm_generation,
+            warm.generation,
             "the installed Direct slot owns the scheduled warm generation"
         );
         assert_eq!(std::fs::read(&page).unwrap(), page_before);
@@ -1461,7 +1795,7 @@ mod tests {
         let started = std::time::Instant::now();
         let loaded = open_graph_for_load(dir.to_str().unwrap(), None).unwrap();
         let elapsed = started.elapsed();
-        assert_eq!(loaded.meta.root, dir.display().to_string());
+        assert_eq!(loaded.graph.meta().root, dir.display().to_string());
         eprintln!(
             "direct open: pages={page_count}, assets={asset_count}, apparent_asset_gib={:.1}, elapsed={elapsed:?}",
             asset_count as f64 * 2.0 / 1024.0

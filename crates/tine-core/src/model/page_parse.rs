@@ -11,9 +11,32 @@ pub(super) struct SessionPageIds {
     pub(super) revision: String,
     pub(super) config: ContentDigest,
     preorder: Vec<(String, usize)>,
+    /// Event sequence of this publication (see `StructuralGeneration`); 0 for
+    /// ids restored from the stored index, which record no new read.
+    pub(super) published: u64,
 }
 
 impl SessionPageIds {
+    pub(super) fn from_projection(
+        revision: &str,
+        config: ContentDigest,
+        preorder: Vec<(String, usize)>,
+    ) -> Option<Self> {
+        let source = revision.rsplit(':').next()?;
+        (crate::direct_projection::projection_source_revision(source, config) == revision).then(
+            || Self {
+                revision: source.to_owned(),
+                config,
+                preorder,
+                published: 0,
+            },
+        )
+    }
+
+    pub(super) fn contains(&self, ids: &HashSet<String>) -> bool {
+        self.preorder.iter().any(|(id, _)| ids.contains(id))
+    }
+
     pub(super) fn capture(revision: &str, config: ContentDigest, doc: &Document) -> Self {
         let mut pending: Vec<_> = doc.roots.iter().rev().collect();
         let mut preorder = Vec::new();
@@ -25,6 +48,7 @@ impl SessionPageIds {
             revision: revision.to_owned(),
             config,
             preorder,
+            published: 0,
         }
     }
 
@@ -67,7 +91,7 @@ impl Graph {
         revision: &str,
         doc: &mut Document,
     ) -> bool {
-        let config = self.config.parse_config().digest();
+        let config = self.config().parse_config().digest();
         self.session_page_ids
             .read()
             .unwrap()
@@ -251,11 +275,36 @@ pub(super) fn parse_external_document(
         }
     })) {
         Ok(parsed) => Ok(parsed),
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+        Err(_) => Err(page_content_rejected(
             "external document parser rejected present graph text",
         )),
     }
+}
+
+/// A page file Tine read but cannot accept as a page: the parser rejected
+/// it, or it is not UTF-8. Reading the same bytes again fails the same way,
+/// so the failure is a state of the file, not an interruption: it lasts
+/// until the file changes.
+#[derive(Debug)]
+struct PageContentRejected(&'static str);
+
+impl std::fmt::Display for PageContentRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for PageContentRejected {}
+
+pub(super) fn page_content_rejected(reason: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, PageContentRejected(reason))
+}
+
+/// Whether `error` is a [`page_content_rejected`] failure.
+pub(super) fn is_page_content_rejection(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<PageContentRejected>())
 }
 
 pub(crate) fn parse_exact_page(

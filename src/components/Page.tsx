@@ -1,6 +1,6 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, untrack, useContext, type JSX } from "solid-js";
 import { createReadyQueryResource } from "../createReadyQueryResource";
-import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, loadRoutedPage, setFeedExtender, flushAll, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, isBlockMoving, isDirty, isSaving, resolveBlockRef, blockRef, takeEditorLease, pageMutationBusy, pageMutationVisiblyBusy, type FeedPage } from "../store";
+import { doc, mainPages, pageByName, loadFeed, appendFeed, emptyPage, loadRoutedPage, setFeedExtender, formatForBlock, readPageProperty, setPageProperty, appendToTodayJournal, ensureEmptyBlock, insertEmptyChildBlock, insertOutlineAfter, promotePagePreamble, beginPageHeaderEdit, isBlockMoving, isDirty, isSaving, resolveBlockRef, blockRef, takeEditorLease, pageMutationBusy, pageMutationVisiblyBusy, type FeedPage } from "../store";
 import { sameRoute, pageTargetFromFeedPage, pageTargetFromRoute, pageTargetMatchesLoaded, openPageTargetInNewTab, openInNewTab, type PaneRouter } from "../router";
 import { PaneContext, focusedRouter, openRouteInOtherPane } from "../panes";
 import {
@@ -13,7 +13,7 @@ import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from ".
 import { carryDay, carryPrevDay, carryDaysBack } from "../carry";
 import { backend } from "../backend";
 import { isPublishedExport } from "../publishedBackend";
-import { ensureJournalTemplateForDay, switchGraph, refreshAfterRename, renameOrMergePage } from "../graph";
+import { ensureJournalTemplateForDay, switchGraph, prepareRename, refreshAfterRename, renameOrMergePage } from "../graph";
 import { Block, OutlineScopeContext } from "./Block";
 import { LinkedReferences } from "./LinkedReferences";
 import { UnlinkedReferences } from "./UnlinkedReferences";
@@ -34,7 +34,7 @@ import { copyGuideIntoGraph, ensureGuidePagesLoaded, isGuidePageName } from "../
 import { isPropertiesOnly, splitPagePreamble } from "../editor/properties";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { PagePropertyValue } from "./PagePropertyValue";
-import { graphBinding, renameFlushFailureMessage } from "../persistence";
+import { graphBinding } from "../persistence";
 import { markPageDeleteFallbackFetch, markPageDeleteFallbackFirstPaint } from "../pageDeleteTrace";
 import { selectedThemePresentation } from "../themeGallery";
 import { TodayTaskSummary } from "./TodayTaskSummary";
@@ -314,7 +314,7 @@ export function PageView(): JSX.Element {
     );
     void (async () => {
       try {
-        if (r.kind === "query" || r.kind === "pdf" || r.kind === "invalid") {
+        if (r.kind === "query" || r.kind === "pdf" || r.kind === "invalid" || r.kind === "conflicts") {
           // Non-page workspaces are rendered by PaneLeaf, not PageView. Keep
           // this guard so the page loader never interprets a virtual route or
           // PDF asset as a graph page file.
@@ -356,6 +356,18 @@ export function PageView(): JSX.Element {
               ? await backend().getPageByPath(r.path)
               : await backend().getPage(r.name, r.pageKind);
             if (epoch !== graphEpoch() || !sameRoute(currentRoute(), r)) return;
+            // A route pinned to another case spelling of the file (saved while
+            // Tine handed out `pages/Contents.md` for `contents.md`, GH #597)
+            // loads the file under its disk spelling. Re-key every tab, Recent
+            // and sidebar entry to that spelling once, then route there.
+            if (r.path && dto?.path && dto.path !== r.path && dto.kind === r.pageKind
+              && dto.path.toLowerCase() === r.path.toLowerCase()) {
+              const from = { name: r.name, pageKind: r.pageKind, path: r.path };
+              const to = { name: dto.name, pageKind: dto.kind, path: dto.path };
+              renamePageInNavigation(from, to);
+              router.rewritePageTarget(from, to);
+              return;
+            }
             if (r.path && (!dto || dto.path !== r.path || dto.name !== r.name || dto.kind !== r.pageKind)) {
               throw new Error("The selected physical page is no longer available at that path.");
             }
@@ -807,20 +819,20 @@ function PageSection(props: { page: FeedPage; children?: JSX.Element }): JSX.Ele
     if (!next || next === props.page.name) return;
     renameInFlight = true;
     try {
-      // Flush ALL unsaved edits before the file is moved on disk — the rename
-      // transaction reads every referencing page from disk to rewrite its
-      // `[[refs]]`, so a dirty edit on ANY page (not just the renamed one) would
-      // be read stale and its link left dangling. Abort if anything can't save.
-      if (!(await flushAll())) {
-        alert(renameFlushFailureMessage());
+      // Save every pending edit first: the rename reads referring pages from
+      // disk to rewrite their `[[refs]]`. An edit that cannot be saved blocks
+      // the rename only if the rename would touch it (GH #535).
+      const prepared = await prepareRename(props.page.name);
+      if (!prepared.ok) {
+        alert(prepared.message);
         return;
       }
-      const outcome = await renameOrMergePage(props.page.name, next, props.page.path);
-      if (outcome === "cancelled") return;
-      // The backend rewrote refs across many pages via the self-write guard (no
-      // watcher reload), so every in-memory page is now potentially stale; reset
-      // + reload so a stale copy can't be saved back and revert the rename.
-      refreshAfterRename(props.page.name, next, pageTarget());
+      const result = await renameOrMergePage(props.page.name, next, props.page.path, prepared.unsavedPaths);
+      if (result.status === "cancelled") return;
+      // The backend rewrote refs through the self-write guard (no watcher
+      // reload): refresh the pages it touched so a stale copy can't be saved
+      // back and revert the rename.
+      void refreshAfterRename(props.page.name, next, pageTarget(), result.status === "renamed" ? result.touched : null);
       router.openPage(next, "page");
     } catch (e) {
       alert(`Rename failed: ${String(e)}`);

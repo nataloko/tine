@@ -3,19 +3,21 @@
 
 import { backend } from "./backend";
 import { graphBindingRuntime } from "./graphBindingRuntime";
-import { favorites, setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, bumpAliasRev, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, restoreLiveSaveConflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey } from "./ui";
+import { favorites, setGraphMeta, setWorkflow, bumpGraphEpoch, setRightSidebar, graphMeta, graphEpoch, setAliasMap, bumpAliasRev, seedFavorites, pruneSidebarBlocks, pushToast, refreshJournalConflicts, refreshSyncConflicts, resetGraphConflicts, restoreLiveSaveConflicts, conflicts, clearRecent, graphTransitioning, setGraphTransitioning, renamePageInNavigation, resetLeftSidebarSections, pageIdentityKey } from "./ui";
 import { loadFavoritesLayout } from "./favoritesStore";
-import { resetStore, flushAll } from "./store";
+import { notifyGraphRebound, onGraphRebound } from "./modeHooks";
+import { resetStore, flushAll, doc, pageByName, forgetPage, invalidateUndoForPage, reloadPageIfStillSafe } from "./store";
+import { dirtyPages, graphBinding, renameFlushFailureMessage, savingPages } from "./persistence";
 import { clearAssetBlobCache } from "./assetCache";
 import { resetTabsToJournals, openPage, restoreSession, flushSession, route, sameRoute, type PageTarget } from "./router";
 import { resetPaneLayoutToSingle, removePageTargetAcrossPanes } from "./panes";
 import { journalTitle, localDayKey, setJournalTitleFormat } from "./journal";
 import { applyTemplateVars, prepareTemplateVars } from "./editor/templateVars";
-import { waitForWarmCache } from "./warmCache";
+import { listGraphPages } from "./pageList";
 import { CUSTOM_CSS_STYLE_ID, ensureLsShimStyle } from "./lsShim";
 import { ensureThemeStyle } from "./themeGallery";
 import { isMobile, platformKind } from "./platform";
-import type { BlockDto, GraphMeta } from "./types";
+import type { BlockDto, GraphMeta, RenameTouchedPage } from "./types";
 import { maybeShowGuideAnnouncement } from "./guide";
 import { endEdit } from "./editorController";
 import { activatePdfOwnership, drainPdfWork, retirePdfOwnership } from "./pdfOwnership";
@@ -190,6 +192,7 @@ export async function loadGraphPath(
   }
   resetStore();
   resetNavigationIndex();
+  resetGraphConflicts();
   clearAssetBlobCache(); // old graph's image blob URLs must not leak into the new one
   if (switching) {
     // A graph switch is a full workspace reset (OG opens one graph at a time):
@@ -199,6 +202,12 @@ export async function loadGraphPath(
     clearRecent();
   }
   if (switching || !hadGraph) resetLeftSidebarSections();
+  // Title format BEFORE the meta/epoch change that wakes the Journals surface:
+  // otherwise today's template lookup runs under the default "MMM do, yyyy"
+  // title, misses a custom-format journal Syncthing already delivered, and
+  // saves the template over it with no baseline (a spurious save conflict on
+  // every launch, GH #550). applyConfigDerivedState below re-applies it.
+  setJournalTitleFormat(meta.journal_page_title_format);
   setGraphMeta(meta ?? null);
   // Recovery is part of graph activation: no page becomes interactive before
   // its app-private retained drafts have been restored into the conflict queue.
@@ -274,6 +283,14 @@ let aliasEntries: Record<string, string> = {};
  *  `aliasRev` (GH #484). Cleared with the rest of the index. */
 let committedAliasMap: Record<string, string> = {};
 let pageIdentities: Record<string, string> = {};
+/** Whether `pageIdentities` holds this epoch's answer. Until it does, no alias
+ *  is published: an alias published beside an empty identity set beats the
+ *  real page it collides with (audit R8-08). */
+let pageIdentitiesLoaded = false;
+let aliasesLoaded = false;
+/** The epoch each half was last requested for; see `bindNavigationIndex`. */
+let aliasesRequestedAt = -1;
+let pageIdentitiesRequestedAt = -1;
 let aliasRequest = 0;
 let pageIdentityRequest = 0;
 
@@ -281,24 +298,63 @@ function resetNavigationIndex(): void {
   navigationEpoch = -1;
   aliasEntries = {};
   pageIdentities = {};
+  pageIdentitiesLoaded = false;
+  aliasesLoaded = false;
+  aliasesRequestedAt = -1;
+  pageIdentitiesRequestedAt = -1;
   aliasRequest++;
   pageIdentityRequest++;
   committedAliasMap = {};
   setAliasMap({});
 }
 
+/** Bind the index to `epoch`. The index is keyed by the render epoch because
+ *  a journal-title format change renames pages; a repaint-only bump
+ *  (typography) clears it too. So a refresh that finds the other half of this
+ *  epoch neither loaded nor requested fetches it too (`completeNavigationIndex`):
+ *  an epoch bump followed by a save used to refresh the aliases alone, and
+ *  every alias then beat the real page of the same name until the next
+ *  create, delete or rename (audit R8-08). Graph open requests both halves
+ *  itself, so it still lists the pages once. */
 function bindNavigationIndex(epoch: number): void {
   if (navigationEpoch === epoch) return;
+  resetNavigationIndex();
   navigationEpoch = epoch;
-  aliasEntries = {};
-  pageIdentities = {};
-  aliasRequest++;
-  pageIdentityRequest++;
-  committedAliasMap = {};
-  setAliasMap({});
+}
+
+async function completeNavigationIndex(epoch: number): Promise<void> {
+  if (!aliasesLoaded && aliasesRequestedAt !== epoch) await refreshAliases();
+  await ensurePageIdentities(epoch);
+}
+
+/** Fetch the page identities unless this epoch already has them or is already
+ *  fetching them. Graph open used to list the pages twice when a save's alias
+ *  refresh landed before warm-cache-done and completed the index first
+ *  (audit R9-08). */
+async function ensurePageIdentities(epoch: number): Promise<void> {
+  if (
+    navigationEpoch === epoch
+    && (pageIdentitiesLoaded || pageIdentitiesRequestedAt === epoch)
+  ) return;
+  await refreshPageIdentities();
+}
+
+/** A request answered after the render epoch moved finds the index cleared and
+ *  drops its answer. A repaint-only bump keeps the graph, so unless the new
+ *  epoch has already asked, ask again: nothing else re-requests the index
+ *  loaded at graph open (audit R9-10). A different binding asks for itself. */
+function reaskAfterRepaint(
+  binding: number,
+  requestedAt: () => number,
+  loaded: () => boolean,
+): boolean {
+  if (binding !== graphBinding()) return false;
+  const current = graphEpoch();
+  return navigationEpoch !== current || !(loaded() || requestedAt() === current);
 }
 
 function commitNavigationIndex(): void {
+  if (!pageIdentitiesLoaded) return;
   // Existing files win a colliding alias, matching core `load_named`.
   const next = { ...aliasEntries, ...pageIdentities };
   // An alias edit changes which NAMES resolve to a page without creating or
@@ -321,26 +377,70 @@ function aliasMapChanged(
   return previousKeys.some((key) => previous[key] !== next[key]);
 }
 
-/** Refresh semantic aliases after content saves. Request sequencing prevents an
- *  older same-epoch response from overwriting a newer alias edit. */
-export async function refreshAliases(): Promise<void> {
+let aliasesInFlight: { key: string; done: Promise<void> } | null = null;
+let aliasesAskedAgain = false;
+
+/** Refresh semantic aliases after content saves. One read per graph binding
+ *  and render epoch is in flight at a time: saves during it ask for one more
+ *  read when it lands, not one each. Every save during an indexing pass used
+ *  to park its own `page_aliases` on a native thread until the pass ended
+ *  (GH #543, audit R10-09). A read for another binding or epoch is never
+ *  joined, so a read parked on the old graph cannot hold up the new one. */
+export function refreshAliases(): Promise<void> {
+  const key = `${graphBinding()}\0${graphEpoch()}`;
+  if (aliasesInFlight?.key === key) {
+    aliasesAskedAgain = true;
+    return aliasesInFlight.done;
+  }
+  const flight: { key: string; done: Promise<void> } = { key, done: Promise.resolve() };
+  aliasesInFlight = flight;
+  flight.done = (async () => {
+    try {
+      do {
+        aliasesAskedAgain = false;
+        await refreshAliasesOnce();
+      } while (aliasesAskedAgain && aliasesInFlight === flight);
+    } finally {
+      if (aliasesInFlight === flight) aliasesInFlight = null;
+    }
+  })();
+  return flight.done;
+}
+
+/** One alias read. Request sequencing prevents an older same-epoch response
+ *  from overwriting a newer alias edit. */
+async function refreshAliasesOnce(): Promise<void> {
   const epoch = graphEpoch();
+  const binding = graphBinding();
   bindNavigationIndex(epoch);
+  aliasesRequestedAt = epoch;
   const request = ++aliasRequest;
   const result = await Promise.allSettled([backend().pageAliases()]);
-  if (epoch !== graphEpoch() || navigationEpoch !== epoch || request !== aliasRequest) return;
+  if (epoch !== graphEpoch() || navigationEpoch !== epoch) {
+    if (reaskAfterRepaint(binding, () => aliasesRequestedAt, () => aliasesLoaded)) {
+      aliasesAskedAgain = true;
+    }
+    return;
+  }
+  if (request !== aliasRequest) return;
+  if (result[0].status !== "fulfilled") {
+    // A failed half stays unloaded, so the next refresh asks again instead of
+    // publishing an empty answer as if it were the graph's (audit R9-09).
+    aliasesRequestedAt = -1;
+    return;
+  }
   aliasEntries = {};
-  if (result[0].status === "fulfilled") {
-    for (const [alias, owner] of result[0].value) {
-      const key = pageIdentityKey(alias);
-      // Core returns owners in deterministic path order; preserve its first-wins
-      // fallback when duplicate owners contribute the same folded alias.
-      if (!Object.prototype.hasOwnProperty.call(aliasEntries, key)) {
-        aliasEntries[key] = owner;
-      }
+  for (const [alias, owner] of result[0].value) {
+    const key = pageIdentityKey(alias);
+    // Core returns owners in deterministic path order; preserve its first-wins
+    // fallback when duplicate owners contribute the same folded alias.
+    if (!Object.prototype.hasOwnProperty.call(aliasEntries, key)) {
+      aliasEntries[key] = owner;
     }
   }
+  aliasesLoaded = true;
   commitNavigationIndex();
+  await completeNavigationIndex(epoch);
 }
 
 /** Refresh the real-page identity inventory only after graph bind, create,
@@ -348,69 +448,194 @@ export async function refreshAliases(): Promise<void> {
  *  this whole-page-list IPC. Real pages override colliding semantic aliases. */
 export async function refreshPageIdentities(): Promise<void> {
   const epoch = graphEpoch();
+  const binding = graphBinding();
   bindNavigationIndex(epoch);
+  pageIdentitiesRequestedAt = epoch;
   const request = ++pageIdentityRequest;
-  const result = await Promise.allSettled([backend().listPages()]);
-  if (epoch !== graphEpoch() || navigationEpoch !== epoch || request !== pageIdentityRequest) return;
-  pageIdentities = result[0].status === "fulfilled"
-    ? Object.fromEntries(
-        result[0].value
-          .filter((entry) => entry.kind === "page")
-          .map((entry) => [pageIdentityKey(entry.name), entry.name])
-      )
-    : {};
+  const result = await Promise.allSettled([listGraphPages()]);
+  if (epoch !== graphEpoch() || navigationEpoch !== epoch) {
+    if (reaskAfterRepaint(binding, () => pageIdentitiesRequestedAt, () => pageIdentitiesLoaded)) {
+      await refreshPageIdentities();
+    }
+    return;
+  }
+  if (request !== pageIdentityRequest) return;
+  if (result[0].status !== "fulfilled") {
+    // Publishing aliases beside an empty identity set is the state R8-08
+    // forbids: every alias would beat the real page of its name (audit R9-09).
+    pageIdentitiesRequestedAt = -1;
+    return;
+  }
+  pageIdentities = Object.fromEntries(
+    result[0].value
+      .filter((entry) => entry.kind === "page")
+      .map((entry) => [pageIdentityKey(entry.name), entry.name])
+  );
+  pageIdentitiesLoaded = true;
   commitNavigationIndex();
+  await completeNavigationIndex(epoch);
 }
 
+/** Graph open's navigation index, asked at once: during the launch index
+ *  check the backend answers from the index as the last session left it, or
+ *  waits while the index is being built, and the check's completion re-asks
+ *  both halves through `dataRev` and `pageInventoryRev` (GH #550, launch design
+ *  D4). It used to wait for `warm-cache-done` first, which kept every alias
+ *  link unresolved for the whole launch check. Aliases are always re-read
+ *  here; the page identities only if this epoch has not already fetched them
+ *  (audit R9-08). */
 async function loadAliases(): Promise<void> {
-  const epoch = graphEpoch();
-  if (!(await waitForWarmCache(epoch))) return;
-  if (epoch !== graphEpoch()) return;
-  await Promise.all([refreshAliases(), refreshPageIdentities()]);
+  await loadNavigationIndex();
 }
 
-/** Refresh frontend state after a successful page rename. The backend rename
- *  rewrites `[[refs]]` across many files through the self-write guard, which
- *  SUPPRESSES the watcher reload — so every in-memory page (the renamed page, the
- *  journals feed, satellite/sidebar pages) is potentially stale, and a stale save
- *  of one would silently revert the rename's rewrite on disk. Reset the store
- *  (cancels pending/in-flight saves + clears the shared `byId`) and bump the graph
- *  epoch (drops the block-resolve cache and forces the open view + Linked
- *  References to refetch from the now-correct backend). Aliases may have moved with
- *  the renamed file, so refresh those too. Caller must have run flushAll() first
- *  (so resetStore discards nothing unsaved) and then navigate to the new name. */
-export function refreshAfterRename(from: string, to: string, exactTarget?: PageTarget): void {
+// Every rebind (a backend reopen, a restored backup) re-asks the navigation
+// index, the one binding-scoped store no resource re-reads: a reopen used to
+// keep the old graph's aliases, and one during the launch warm left the
+// index unloaded until the next save (GH #543, audit R10-06). A microtask,
+// so the binding and the render epoch have both moved when it asks.
+onGraphRebound(() => queueMicrotask(() => void loadAliases()));
+
+export async function loadNavigationIndex(): Promise<void> {
+  await Promise.all([refreshAliases(), ensurePageIdentities(graphEpoch())]);
+}
+
+/** What a rename may proceed with after trying to save every pending edit. */
+export type RenamePreparation =
+  | { ok: true; unsavedPaths: string[] }
+  | { ok: false; message: string };
+
+/** Save every pending edit before a rename, and decide what a failure means.
+ *
+ *  The rename reads referring pages from disk to rewrite their `[[refs]]`, so
+ *  every edit that CAN be saved is saved first. A page that cannot be saved
+ *  used to block every rename in the graph, because the old refresh reset the
+ *  whole working set; it now blocks only when it matters (GH #535):
+ *  - it is the page being renamed, or one of its namespace children; or
+ *  - its unsaved text mentions the old name, so the rename would miss a
+ *    reference that exists only in memory.
+ *  Anything else is handed to the backend as `unsavedPaths`, which refuses to
+ *  rewrite those files, and keeps its unsaved edits through the rename. */
+export async function prepareRename(from: string): Promise<RenamePreparation> {
+  if (await flushAll()) return { ok: true, unsavedPaths: [] };
+  const renamed = pageIdentityKey(from);
+  const mention = from.trim().toLowerCase().normalize("NFC");
+  const stuck = [...new Set([...dirtyPages(), ...savingPages(), ...conflicts()])];
+  const unsavedPaths: string[] = [];
+  for (const name of stuck) {
+    const key = pageIdentityKey(name);
+    if (key === renamed || key.startsWith(`${renamed}/`)) {
+      return {
+        ok: false,
+        message: `Couldn't rename: “${name}” has changes Tine could not save. Save or discard them, then rename again. Your pending edits are still here.`,
+      };
+    }
+    if (mention && unsavedPageText(name).toLowerCase().normalize("NFC").includes(mention)) {
+      return {
+        ok: false,
+        message: `Couldn't rename: “${name}” has changes Tine could not save, and they mention “${from}”, so the rename could not update them. Save or discard those changes, then rename again. Your pending edits are still here.`,
+      };
+    }
+    const path = pageByName(name)?.path;
+    if (path) unsavedPaths.push(path);
+  }
+  return { ok: true, unsavedPaths };
+}
+
+/** Everything a page holds in memory: its header and every block. */
+function unsavedPageText(name: string): string {
+  const page = pageByName(name);
+  if (!page) return "";
+  const parts = [page.preBlock ?? ""];
+  const visit = (id: string) => {
+    const node = doc.byId[id];
+    if (!node) return;
+    parts.push(node.raw);
+    node.children.forEach(visit);
+  };
+  page.roots.forEach(visit);
+  return parts.join("\n");
+}
+
+/** Refresh frontend state after a successful page rename.
+ *
+ *  The backend rewrites `[[refs]]` through the self-write guard, which
+ *  SUPPRESSES the watcher reload, so each page it touched is stale in memory
+ *  and a stale save could revert the rewrite. Only those pages are refreshed
+ *  (GH #535); every other open page, unsaved edits included, is kept:
+ *  - a moved page is dropped under its old name (the caller opens the new one);
+ *  - a rewritten page is reloaded from disk when it is still clean. One edited
+ *    while the rename ran keeps its edit, and its save meets the rewrite as an
+ *    ordinary reviewable conflict.
+ *  Undo history for touched pages is dropped: replaying it would restore the
+ *  pre-rename text. The graph epoch is bumped so views, Linked References and
+ *  the block-resolve cache refetch; aliases may have moved with the file.
+ *
+ *  `touched === null` (a merge, which does not report what it touched) keeps
+ *  the old full reset; its caller must have saved every page first.
+ *  Returns once the rewritten pages have been reloaded. */
+export async function refreshAfterRename(
+  from: string,
+  to: string,
+  exactTarget: PageTarget | undefined,
+  touched: readonly RenameTouchedPage[] | null,
+): Promise<void> {
   if (exactTarget) {
     removePageTargetAcrossPanes(exactTarget);
     renamePageInNavigation(exactTarget, { name: to, pageKind: exactTarget.pageKind });
   } else {
     renamePageInNavigation(from, to);
   }
-  resetStore();
+  const reloads: RenameTouchedPage[] = [];
+  if (touched === null) {
+    resetStore();
+  } else {
+    for (const page of touched) {
+      const loaded = pageByName(page.name);
+      if (!loaded || loaded.kind !== page.kind || (loaded.path ?? "") !== page.path) continue;
+      if (page.renamedTo !== null) {
+        forgetPage(page.name);
+      } else {
+        invalidateUndoForPage(page.name);
+        reloads.push(page);
+      }
+    }
+  }
   resetNavigationIndex();
   bumpGraphEpoch();
   void Promise.all([refreshAliases(), refreshPageIdentities()]);
+  const binding = graphBinding();
+  await Promise.all(reloads.map(async (page) => {
+    const dto = await backend().getPageByPath(page.path);
+    if (dto && binding === graphBinding()) await reloadPageIfStillSafe(page.name, dto, binding);
+  }));
 }
+
+export type RenameResult =
+  | { status: "renamed"; touched: RenameTouchedPage[] }
+  | { status: "merged" | "cancelled" };
 
 export async function renameOrMergePage(
   from: string,
   to: string,
-  sourcePath?: string,
-): Promise<"renamed" | "merged" | "cancelled"> {
+  sourcePath: string | undefined,
+  unsavedPaths: readonly string[],
+): Promise<RenameResult> {
   const destination = await backend().getPage(to, "page");
   let exactSourcePath = sourcePath;
   if (!exactSourcePath) exactSourcePath = (await backend().getPage(from, "page"))?.path;
   if (destination?.path && destination.path !== exactSourcePath) {
+    // A merge still resets the whole working set, so it needs every page saved.
+    if (unsavedPaths.length) throw new Error(renameFlushFailureMessage());
     if (!globalThis.confirm(`Page “${to}” already exists. Merge “${from}” into it?`)) {
-      return "cancelled";
+      return { status: "cancelled" };
     }
     if (!exactSourcePath) {
       throw new Error(`Couldn't identify the source file for “${from}”.`);
     }
     await backend().mergePages(exactSourcePath, destination.path, { from, to });
-    return "merged";
+    return { status: "merged" };
   }
-  const outcome = await backend().renamePage(from, to, exactSourcePath);
+  const outcome = await backend().renamePage(from, to, exactSourcePath, [...unsavedPaths]);
   const skipped = outcome?.skippedConflictedReferrers ?? [];
   if (skipped.length) {
     // These files are mid-merge, so the rename deliberately left their refs
@@ -424,7 +649,7 @@ export async function renameOrMergePage(
       { sticky: true },
     );
   }
-  return "renamed";
+  return { status: "renamed", touched: outcome?.touched ?? [] };
 }
 
 export type JournalTemplateEnsureResult = "ready" | "deferred" | "stale";
@@ -455,6 +680,10 @@ function journalTemplateOwnerIsCurrent(owner: JournalTemplateOwner): boolean {
     && localDayKey() === owner.day;
 }
 
+function blockTreeHasText(block: BlockDto): boolean {
+  return block.raw.trim() !== "" || block.children.some(blockTreeHasText);
+}
+
 async function materializeJournalTemplate(
   owner: JournalTemplateOwner,
   canWrite: () => boolean,
@@ -462,7 +691,10 @@ async function materializeJournalTemplate(
   try {
     const existing = await backend().getPage(owner.title, "journal");
     if (!journalTemplateOwnerIsCurrent(owner)) return "stale";
-    if (existing && existing.blocks.some((b) => b.raw.trim() !== "")) return "ready";
+    // Any text anywhere in the tree is the user's: the usual template shape
+    // leaves an empty parent, and checking only top-level blocks re-applied the
+    // template over text typed into its children (GH #550).
+    if (existing && existing.blocks.some(blockTreeHasText)) return "ready";
     const tmpl = (await backend().listTemplates()).find((t) => t.name === owner.template);
     if (!journalTemplateOwnerIsCurrent(owner)) return "stale";
     if (!tmpl) return "ready";
@@ -733,9 +965,22 @@ export function applyConfigDerivedState(meta: GraphMeta, previous: GraphMeta | n
  *  Before this existed, Tine read the file once per graph open, so an edit made
  *  in Logseq — or delivered by Syncthing — was invisible for the rest of the
  *  session, and the next settings write in Tine was based on the stale copy. */
+/** The backend reopened this graph after a `config.edn` change that reaches
+ *  the graph (for example `:hidden`). Everything read from the old `Graph` is
+ *  stale: in-flight results are dropped, and the page set and what is on
+ *  screen are read again (GH #543, audit R9-13). The navigation index is
+ *  re-read by its own rebind listener (above `loadNavigationIndex`). */
+export function applyGraphReopened(): void {
+  notifyGraphRebound();
+  bumpGraphEpoch();
+}
+
 export function applyGraphConfigChange(meta: GraphMeta): void {
   const previous = graphMeta();
   if (previous && previous.root !== meta.root) return; // a different graph's window
+  // Same ordering rule as graph bind (GH #550): the format lands before
+  // anything observing the meta or epoch change computes a journal title.
+  setJournalTitleFormat(meta.journal_page_title_format);
   setGraphMeta(meta);
   // A journal-title or format change re-dates and re-routes what is already on
   // screen, so in-flight results from before it must not land afterwards.

@@ -3,9 +3,12 @@
 // seeded from a fixture graph, so the whole UI is exercisable without the shell.
 
 import { createSignal } from "solid-js";
+import type { DiscardReason } from "./safeClose";
 import { notifyGraphRebound } from "./modeHooks";
+import { listenHere } from "./windowEvents";
+import { describeSavePlatformStep, readSavePlatformStep, type SavePlatformStep } from "./savePlatformStep";
 import { DIAGNOSTIC_KINDS } from "./editor/queryIr";
-import type { GraphSearchDisplayOptions } from "./editor/queryIr";
+import type { GraphSearchConsumer, GraphSearchDisplayOptions } from "./editor/queryIr";
 import type {
   Diagnostic,
   DiagnosticKind,
@@ -44,10 +47,9 @@ import type {
   TrashStats,
   JournalConflict,
   JournalFilenameMigration,
-  SyncConflict,
   SyncConflictDiff,
-  VcsMarkerConflict,
   ConflictObject,
+  ConflictInventory,
   LiveSaveConflictCapture,
   MarkerConflictDiff,
   MergeDecision,
@@ -129,6 +131,14 @@ export async function clipboardImageToPng(img: ClipboardImage): Promise<Uint8Arr
 
 /** One raw graph file, as returned by `graphSourceFiles` — the input to the
  *  in-app lsdoc↔mldoc diff panel. `text` is the file's bytes exactly as on disk. */
+/** Mirrors `tine_core::indexing_progress::IndexingProgress`. `total === 0`
+ *  means the pass is running but has not counted its pages yet. */
+export interface IndexingProgress {
+  phase: "checking" | "reading" | "indexing";
+  done: number;
+  total: number;
+}
+
 export interface GraphSourceFile {
   rel: string;
   text: string;
@@ -283,8 +293,28 @@ export class QueryNotReadyError extends BackendError {
   }
 }
 
+/** The short, fixed classification of a failed call for the diagnostic record.
+ *
+ * Only codes this frontend itself assigned, never a message from the backend or
+ * a thrown value's own text: an arbitrary error string could carry a path or
+ * graph content into a report the user is invited to publish. Anything
+ * unrecognised is reported as `"other"`, which is still the useful fact — it
+ * says the failure was not a readiness wait. */
+export function diagnosticFailureReason(error: unknown): string {
+  if (error instanceof QueryNotReadyError) return `not-ready:${error.reasonCode}`;
+  if (error instanceof QueryUnavailableError) return `unavailable:${error.reasonCode}`;
+  if (error instanceof OperationCancelledError) return "cancelled";
+  return "other";
+}
+
 export class QueryUnavailableError extends BackendError {
-  constructor(readonly reasonCode: string, message: string) {
+  constructor(
+    readonly reasonCode: string,
+    message: string,
+    /** Why the index failed, when `reasonCode` is `index_failed`: a fixed
+     *  code (`IndexFailureClass::as_str`), never backend prose (GH #594). */
+    readonly indexFailure: string | null = null,
+  ) {
     super("query-unavailable", message);
     this.name = "QueryUnavailableError";
   }
@@ -303,11 +333,21 @@ export class PublishedExportReadOnlyError extends BackendError {
 }
 
 export class DirectSaveFailureError extends BackendError {
-  constructor(readonly reasonCode: string, readonly ioErrorKind: string) {
-    super("direct-save-failure", `Direct Files could not save (reason code: ${reasonCode}).`);
+  constructor(
+    readonly reasonCode: string,
+    readonly ioErrorKind: string,
+    /** The failed platform call and its OS error number, when the backend
+     *  knows them (GH #538: `unknown` alone could not be acted on). */
+    readonly platformStep: SavePlatformStep | null = null,
+  ) {
+    super(
+      "direct-save-failure",
+      `Direct Files could not save (reason code: ${reasonCode}${describeSavePlatformStep(platformStep)}).`,
+    );
     this.name = "DirectSaveFailureError";
   }
 }
+
 
 /** A Direct Files revision conflict, classified once at the Tauri wire boundary.
  * Callers branch on this tag and never inspect arbitrary backend prose. */
@@ -393,7 +433,11 @@ function classifyTaggedBackendError(error: unknown): BackendError | null {
       const ioErrorKind = readIoErrorKind(payload.detail);
       return typeof payload.reason_code === "string" && REASON_CODE.test(payload.reason_code)
         && ioErrorKind !== null
-        ? new DirectSaveFailureError(payload.reason_code, ioErrorKind)
+        ? new DirectSaveFailureError(
+          payload.reason_code,
+          ioErrorKind,
+          readSavePlatformStep(payload.detail),
+        )
         : null;
     }
     case "save-conflict": {
@@ -418,11 +462,14 @@ function classifyTaggedBackendError(error: unknown): BackendError | null {
         ? new QueryNotReadyError(payload.reason_code)
         : null;
     case "query-unavailable": {
-      const detail = payload.detail && typeof payload.detail === "object"
-        ? (payload.detail as Record<string, unknown>).message : undefined;
+      const fields = payload.detail && typeof payload.detail === "object"
+        ? payload.detail as Record<string, unknown> : undefined;
+      const detail = fields?.message;
+      const indexFailure = typeof fields?.indexFailure === "string" && REASON_CODE.test(fields.indexFailure)
+        ? fields.indexFailure : null;
       return typeof payload.reason_code === "string" && REASON_CODE.test(payload.reason_code)
         && typeof detail === "string" && detail.trim().length > 0
-        ? new QueryUnavailableError(payload.reason_code, detail)
+        ? new QueryUnavailableError(payload.reason_code, detail, indexFailure)
         : null;
     }
     case "query-print-refused":
@@ -547,19 +594,24 @@ export interface Backend {
   /** Persist the graph-local one-time Guide announcement flag. */
   setGuideAnnounced(announced: boolean): Promise<void>;
   getBacklinks(name: string): Promise<RefGroup[]>;
-  /** Parser-owned visible-subtree/facet index for only the roots in an open
-   *  Linked References filter. Ordinary backlink DTOs stay shallow. */
-  getBacklinkFilterContext(name: string, targets: BacklinkFilterTarget[]): Promise<BacklinkFilterContext>;
+  /** Parser-owned visible-subtree facets and native text-match decisions for
+   *  only the roots in an open Linked References filter. */
+  getBacklinkFilterContext(name: string, targets: BacklinkFilterTarget[], search: string): Promise<BacklinkFilterContext>;
   getUnlinkedRefs(name: string): Promise<RefGroup[]>;
   /** True once the background whole-graph warm has built derived graph-open caches. */
   warmDone(): Promise<boolean>;
+  /** How far the graph-sized index work has got; null once search is answered
+   *  by a current index (GH #543). */
+  indexingProgress(): Promise<IndexingProgress | null>;
   /** Map of block uuid → number of blocks that reference it (the count badge). */
   getBlockRefCounts(): Promise<Record<string, number>>;
   /** Blocks that reference block `uuid`, grouped by page (the referrers panel). */
   getBlockReferrers(uuid: string): Promise<RefGroup[]>;
   deletePage(name: string, kind: "journal" | "page", expectedPath?: string): Promise<void>;
   /** Rename a page and update all [[refs]]/#tags across the graph. */
-  renamePage(old: string, next: string, expectedPath?: string): Promise<RenameOutcome>;
+  /** `unsavedPaths`: pages whose edits could not be saved. The rename refuses
+   *  to move or rewrite any of them (GH #535). */
+  renamePage(old: string, next: string, expectedPath?: string, unsavedPaths?: string[]): Promise<RenameOutcome>;
   publishHtml(): Promise<[string, number]>;
   /** Plan a query export: the pages that own the query's results, plus the
    *  fingerprint the confirm step echoes back. Writes nothing. */
@@ -757,12 +809,14 @@ export interface Backend {
   /** Move a stray file (graph-root-relative path) to a uniquely-named page so it
    *  stops colliding and becomes normally navigable (#21). */
   renameFileToPage(path: string, newName: string): Promise<void>;
-  /** Sync-tool conflict copies (Syncthing/Dropbox) sitting in the graph — for the
-   *  user to review + merge instead of them showing as garbage pages. */
-  listSyncConflicts(): Promise<SyncConflict[]>;
-  /** Pages whose on-disk bytes carry unresolved VCS merge-conflict markers
-   *  (git/Fossil): readable, but quarantined from saves. */
-  listVcsMarkerConflicts(): Promise<VcsMarkerConflict[]>;
+  /** Everything the conflicts UI shows, from one pass over the graph: sync-tool
+   *  conflict copies (Syncthing/Dropbox) to review + merge instead of them
+   *  showing as garbage pages; pages whose on-disk bytes carry unresolved VCS
+   *  merge-conflict markers (git/Fossil: readable, but quarantined from
+   *  saves); and the Concord conflict queue (L3) derived from both, from disk
+   *  on every call — nothing is stored, so it survives a restart by being
+   *  recomputed. One call, so a refresh reads every page once (GH #543). */
+  conflictInventory(): Promise<ConflictInventory>;
   /** Block-level diff of a conflict copy against its winner (graph-root-relative
    *  paths). Read-only; null if a path is invalid or the file is gone. */
   syncConflictDiff(winner: string, conflict: string): Promise<SyncConflictDiff | null>;
@@ -812,11 +866,6 @@ export interface Backend {
     decisions: Record<string, MergeDecision>,
     preChoice?: "mine" | "theirs" | "union",
   ): Promise<PageDto>;
-  /** The Concord conflict queue (L3): one derived inventory of every page that
-   *  needs the user's judgement, from BOTH artifact sources (conflict copies and
-   *  VCS-marker pages). Derived from disk on every call — nothing is stored, so
-   *  it survives a restart by being recomputed. */
-  conflictQueue(): Promise<ConflictObject[]>;
   /** A marker-bearing page's own conflict: its `<<<<<<<` sections parsed into
    *  complete page texts and run through the same block diff (Concord L5).
    *  Read-only; null when the page has no (parseable) markers. */
@@ -868,7 +917,8 @@ export interface Backend {
     lane?: string,
     explain?: boolean,
     scope?: QueryPageScope,
-    options?: GraphSearchDisplayOptions
+    options?: GraphSearchDisplayOptions,
+    consumer?: GraphSearchConsumer,
   ): Promise<QueryExecution>;
   quickSwitch(query: string, limit: number): Promise<PageEntry[]>;
   /** Capture-only page/tag completion capability. It is intentionally not the
@@ -964,10 +1014,16 @@ export interface Backend {
    *  Carries the fresh GraphMeta; a graph whose settings did not move emits
    *  nothing. */
   onGraphConfigChanged(cb: (meta: GraphMeta) => void): Promise<() => void>;
+  /** The backend reopened this window's graph on its own (a `config.edn`
+   *  change that reaches the graph). A command that reopens it is announced by
+   *  its return instead (`REBINDING_COMMANDS`). */
+  onGraphReopened(cb: () => void): Promise<() => void>;
   /** A committed query image changed; does not reload or replace live editors. */
   onQueryProjectionChanged(cb: () => void): Promise<() => void>;
   /** Direct Markdown folder-watch reconcile failure. */
   onGraphWatchError(cb: (message: string) => void): Promise<() => void>;
+  /** Graph-relative paths of pages Tine newly could not read or parse. */
+  onGraphUnreadablePages(cb: (paths: string[]) => void): Promise<() => void>;
   /** How many launch snapshots to keep. */
   getBackupKeep(): Promise<number>;
   setBackupKeep(keep: number): Promise<void>;
@@ -987,6 +1043,9 @@ export interface Backend {
   /** Restore a snapshot (graph text at original paths, config, and sidecars;
    *  snapshots current state first). Destructive — confirm before calling. */
   restoreBackup(stamp: string): Promise<void>;
+  /** Reopen the graph after its index failed, which builds the index again as
+   *  the next launch would (GH #594). */
+  retryIndex(): Promise<void>;
   /** Load the persisted UI session JSON (open tabs / active tab / zoom), or null.
    *  Stored atomically in a backend file so structured session state is independent
    *  of a particular WebView/origin and can be shared across windows. */
@@ -1073,12 +1132,14 @@ export interface Backend {
   saveGraphVerificationReport(text: string): Promise<boolean>;
   onGraphVerificationProgress(cb: (progress: GraphVerificationProgress) => void): Promise<() => void>;
   diagnosticFrontendEvent(
-    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure",
+    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure" | "close_discarded_unsaved",
     line?: number,
     column?: number,
     delayMs?: number,
     updaterStage?: string,
     updaterCause?: string,
+    closeReason?: DiscardReason,
+    pages?: number,
   ): Promise<void>;
   /** Whether the recorded session counts as live from now on. Mobile only: the
    *  OS reaps a backgrounded app without notice, and that is not a crash
@@ -1193,15 +1254,8 @@ export function isTauri(): boolean {
  * `refresh_graph(` call and fails on any difference in either direction.
  */
 const REBINDING_COMMANDS = new Set([
-  "set_default_home",
-  "set_journal_title_format",
-  "set_preferred_format",
-  "set_timetracking_enabled",
-  "set_show_brackets",
-  "set_doc_mode_enter_for_new_block",
-  "set_logical_outdenting",
-  "set_guide_announced",
   "restore_backup",
+  "retry_index",
 ]);
 
 const DIAGNOSTIC_COMMANDS = new Set([
@@ -1279,12 +1333,24 @@ class TauriBackend implements Backend {
     const started = performance.now();
     let slow = false;
     let slowTimer: ReturnType<typeof setTimeout> | undefined;
-    const reportPhase = (phase: "slow" | "completed" | "failed", elapsedMs: number) => {
+    // GH #543: a reporter's diagnostic showed 7,520 failed `run_query` calls
+    // and not one word about WHY. "failed" covers a retryable wait for the
+    // index, a terminal unavailable projection, and a cancelled job, and those
+    // three want three different answers from us — so the report that was
+    // supposed to end the guessing could not distinguish them. The reason is a
+    // short fixed code the backend already produced; it carries no query text,
+    // no page name and no path.
+    const reportPhase = (
+      phase: "slow" | "completed" | "failed",
+      elapsedMs: number,
+      reason?: string,
+    ) => {
       if (DIAGNOSTIC_COMMANDS.has(cmd)) return;
       void this.invoke<void>("diagnostic_ipc_event", {
         command: cmd,
         phase,
         elapsedMs: Math.max(0, Math.round(elapsedMs)),
+        reason,
       }).catch(() => {});
     };
     let slowTicket: number | undefined;
@@ -1310,10 +1376,18 @@ class TauriBackend implements Backend {
       if (slowTimer !== undefined) clearTimeout(slowTimer);
       releaseSlowTicket();
       recordGraphOpenCommand(cmd, started, "failed");
-      reportPhase("failed", performance.now() - started);
       // Classify once, at the only frontend funnel (Harvest H2 E-1 wired only
-      // save_page and left the resolver recovery branch dead).
-      throw classifyNativeCallError(error);
+      // save_page and left the resolver recovery branch dead) — and BEFORE
+      // reporting. `invoke` rejects with the wire payload, an object or a JSON
+      // string, never a frontend error instance, while
+      // `diagnosticFailureReason` recognises only instances. Reporting first
+      // recorded every native failure as `other`, erasing precisely the
+      // distinction the diagnostic exists to draw: a retryable wait for the
+      // index, a terminal unavailable projection, and a cancelled job
+      // (GH #543, re-audit A2-N3).
+      const classified = classifyNativeCallError(error);
+      reportPhase("failed", performance.now() - started, diagnosticFailureReason(classified));
+      throw classified;
     }
     if (slowTimer !== undefined) clearTimeout(slowTimer);
     releaseSlowTicket();
@@ -1351,8 +1425,7 @@ class TauriBackend implements Backend {
     return this.call<string | null>("startup_graph_path");
   }
   async onStorageTransition(cb: (progress: StorageTransitionEvent) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<StorageTransitionEvent>("storage-transition", (event) => cb(event.payload));
+    return listenHere<StorageTransitionEvent>("storage-transition", (event) => cb(event.payload));
   }
   captureTarget() {
     return this.call<string>("capture_target");
@@ -1481,14 +1554,17 @@ class TauriBackend implements Backend {
   getBacklinks(name: string) {
     return this.call<RefGroup[]>("get_backlinks", { name });
   }
-  getBacklinkFilterContext(name: string, targets: BacklinkFilterTarget[]) {
-    return this.call<BacklinkFilterContext>("get_backlink_filter_context", { name, targets });
+  getBacklinkFilterContext(name: string, targets: BacklinkFilterTarget[], search: string) {
+    return this.call<BacklinkFilterContext>("get_backlink_filter_context", { name, targets, search });
   }
   getUnlinkedRefs(name: string) {
     return this.call<RefGroup[]>("get_unlinked_refs", { name });
   }
   warmDone() {
     return this.call<boolean>("warm_done");
+  }
+  indexingProgress() {
+    return this.call<IndexingProgress | null>("indexing_progress");
   }
   getBlockRefCounts() {
     return this.call<Record<string, number>>("block_ref_counts", {});
@@ -1499,8 +1575,8 @@ class TauriBackend implements Backend {
   deletePage(name: string, kind: "journal" | "page", expectedPath?: string) {
     return this.call<void>("delete_page", { name, kind, expectedPath });
   }
-  renamePage(old: string, next: string, expectedPath?: string) {
-    return this.call<RenameOutcome>("rename_page", { old, new: next, expectedPath });
+  renamePage(old: string, next: string, expectedPath?: string, unsavedPaths?: string[]) {
+    return this.call<RenameOutcome>("rename_page", { old, new: next, expectedPath, unsavedPaths });
   }
   publishHtml() {
     return this.call<[string, number]>("publish_html");
@@ -1627,7 +1703,7 @@ class TauriBackend implements Backend {
   search(query: string, limit: number, lane?: string) {
     return this.call<RefGroup[]>("search", { query, limit, lane });
   }
-  async runGraphSearch(source: string, pageLimit: number, blockLimit: number, lane = "graph-search", explain = false, scope?: QueryPageScope, options?: GraphSearchDisplayOptions) {
+  async runGraphSearch(source: string, pageLimit: number, blockLimit: number, lane = "graph-search", explain = false, scope?: QueryPageScope, options?: GraphSearchDisplayOptions, consumer: GraphSearchConsumer = "non_interactive") {
     const execution = await this.call<QueryExecution>("run_graph_search", {
       source, pageLimit, blockLimit, lane, explain,
       scope: scope ?? null,
@@ -1641,6 +1717,7 @@ class TauriBackend implements Backend {
           blockView: options.blockView ?? null,
         }
         : null,
+      consumer,
     });
     return {
       ...execution,
@@ -1784,17 +1861,11 @@ class TauriBackend implements Backend {
   renameFileToPage(path: string, newName: string) {
     return this.call<void>("rename_file_to_page", { path, newName });
   }
-  listSyncConflicts() {
-    return this.call<SyncConflict[]>("list_sync_conflicts");
-  }
-  listVcsMarkerConflicts() {
-    return this.call<VcsMarkerConflict[]>("list_vcs_marker_conflicts");
+  conflictInventory() {
+    return this.call<ConflictInventory>("conflict_inventory");
   }
   syncConflictDiff(winner: string, conflict: string) {
     return this.call<SyncConflictDiff | null>("sync_conflict_diff", { winner, conflict });
-  }
-  conflictQueue() {
-    return this.call<ConflictObject[]>("conflict_queue");
   }
   vcsMarkerConflictDiff(path: string) {
     return this.call<MarkerConflictDiff | null>("vcs_marker_conflict_diff", { path });
@@ -1922,8 +1993,7 @@ class TauriBackend implements Backend {
     return this.call<void>("trash_sync_conflict", { conflict });
   }
   async onConflictsChanged(cb: () => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen("conflicts-changed", () => cb());
+    return listenHere("conflicts-changed", () => cb());
   }
   importAsset(path: string, name?: string) {
     return this.call<string>("import_asset", { path, name });
@@ -2036,30 +2106,30 @@ class TauriBackend implements Backend {
     return this.call<void>("rollback_pdf_area_image", { pdf, page, id, stamp });
   }
   async onGraphChanged(cb: (c: GraphChange) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<GraphChange>("graph-changed", (e) => cb(e.payload));
+    return listenHere<GraphChange>("graph-changed", (e) => cb(e.payload));
   }
   async onGraphChangedBulk(cb: (bulk: GraphChangedBulk) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<GraphChangedBulk>("graph-changed-bulk", (e) => cb(e.payload));
+    return listenHere<GraphChangedBulk>("graph-changed-bulk", (e) => cb(e.payload));
   }
   async onAssetChanged(cb: (batch: AssetChangedBatch) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<AssetChangedBatch>("asset-changed", (e) => cb(e.payload));
+    return listenHere<AssetChangedBatch>("asset-changed", (e) => cb(e.payload));
   }
   async onGraphConfigChanged(cb: (meta: GraphMeta) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<GraphMeta>("graph-config-changed", (e) => cb(e.payload));
+    return listenHere<GraphMeta>("graph-config-changed", (e) => cb(e.payload));
+  }
+  async onGraphReopened(cb: () => void): Promise<() => void> {
+    return listenHere("graph-rebound", () => cb());
   }
   async onQueryProjectionChanged(cb: () => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<number>("query-projection-changed", (event) => {
+    return listenHere<number>("query-projection-changed", (event) => {
       if (event.payload === this.bindingGeneration) cb();
     });
   }
   async onGraphWatchError(cb: (message: string) => void): Promise<() => void> {
-    const { listen } = await import("@tauri-apps/api/event");
-    return listen<string>("graph-watch-error", (e) => cb(e.payload));
+    return listenHere<string>("graph-watch-error", (e) => cb(e.payload));
+  }
+  async onGraphUnreadablePages(cb: (paths: string[]) => void): Promise<() => void> {
+    return listenHere<string[]>("graph-unreadable-pages", (e) => cb(e.payload));
   }
   getBackupKeep() {
     return this.call<number>("get_backup_keep");
@@ -2090,6 +2160,9 @@ class TauriBackend implements Backend {
   }
   restoreBackup(stamp: string) {
     return this.call<void>("restore_backup", { stamp });
+  }
+  retryIndex() {
+    return this.call<void>("retry_index");
   }
   loadSession() {
     return this.call<string | null>("load_session");
@@ -2168,12 +2241,14 @@ class TauriBackend implements Backend {
     return listen<GraphVerificationProgress>("graph-verification-progress", (event) => cb(event.payload));
   }
   diagnosticFrontendEvent(
-    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure",
+    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure" | "close_discarded_unsaved",
     line?: number,
     column?: number,
     delayMs?: number,
     updaterStage?: string,
     updaterCause?: string,
+    closeReason?: DiscardReason,
+    pages?: number,
   ) {
     return this.call<void>("diagnostic_frontend_event", {
       kind,
@@ -2182,6 +2257,8 @@ class TauriBackend implements Backend {
       delayMs,
       updaterStage,
       updaterCause,
+      closeReason,
+      pages,
     });
   }
   diagnosticSessionActive(active: boolean) {

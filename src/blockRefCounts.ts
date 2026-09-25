@@ -1,9 +1,9 @@
 import { createResource, createRoot } from "solid-js";
 import { backend } from "./backend";
 import { dataRev, graphEpoch } from "./ui";
-import { waitForWarmCache } from "./warmCache";
 import { blockExternalId } from "./store";
 import { readOr } from "./resourceRead";
+import { readLane } from "./readLane";
 
 // One graph-wide `block uuid → referrer count` map, fetched once per graph and
 // after each landed save, and shared by every block's count badge (Block.tsx). Reading
@@ -11,12 +11,22 @@ import { readOr } from "./resourceRead";
 // update together when the graph changes (a new ref is saved → graphEpoch bumps →
 // refetch). Created in its own root: it lives for the app's lifetime by design.
 const countsMap = createRoot(() => {
+  // Asked at open: the backend answers from the stored index during the launch
+  // check, or waits for the index being built, and the check's completion bumps
+  // `dataRev`, which asks again (GH #550). The lane keeps one read in flight, so
+  // a save no longer leaves one more read waiting (R11-09).
+  const lane = readLane();
   const [countsResource] = createResource(
     () => ({ epoch: graphEpoch(), revision: dataRev() }),
-    async ({ epoch }) => {
-      if (!(await waitForWarmCache(epoch))) return {};
-      if (epoch !== graphEpoch()) return {};
-      return backend().getBlockRefCounts().catch(() => ({}) as Record<string, number>);
+    async ({ epoch, revision }) => {
+      // A save during the pass has already asked again: each stale waiter
+      // issuing its own whole-graph read at hand-over cost N+1 of them
+      // (GH #543, audit R10-09). Solid drops a superseded fetch's value.
+      if (epoch !== graphEpoch() || revision !== dataRev()) return {};
+      return lane(
+        () => epoch === graphEpoch() && revision === dataRev(),
+        () => backend().getBlockRefCounts().catch(() => ({}) as Record<string, number>),
+      );
     }
   );
   // Read by `blockRefCount` from inside Block.tsx's render; a throw here would

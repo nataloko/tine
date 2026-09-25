@@ -43,11 +43,13 @@ mod budgets;
 mod config_writes;
 mod conflicts;
 mod derived_cache;
+mod derived_reads;
 mod direct_query;
 mod dto;
 mod editor_activation;
 mod editor_types;
 mod graph_dir;
+mod graph_drift;
 mod graph_text_admission;
 mod graph_text_capture;
 mod graph_text_errors;
@@ -73,6 +75,7 @@ mod pdf;
 mod persistent_map;
 pub use atomic_copy::*;
 mod projection_rename;
+mod projection_slot;
 use bounded_walks::*;
 use budgets::*;
 use graph_text_capture::*;
@@ -85,6 +88,8 @@ pub use crate::filesystem_durability::{
 };
 use projection_fs::*;
 mod trash;
+mod unreadable_pages;
+pub(crate) use crate::query::graph::PageFallback;
 use asset_files::*;
 use asset_refs::*;
 use asset_reserve::*;
@@ -100,6 +105,7 @@ mod write_gate;
 pub use dto::*;
 use write_gate::*;
 mod projection_lifetime;
+pub use projection_lifetime::IndexOwner;
 mod retired_files;
 use retired_files::*;
 mod queries;
@@ -226,14 +232,65 @@ pub(crate) fn is_projection_semantic_refusal(error: &io::Error) -> bool {
 /// preserved, because callers above classify on it (`NotFound`/`AlreadyExists`
 /// are guarded-conflict signals) and the platform durability policy matches on
 /// it too. A semantic refusal is returned untouched so its marker type survives.
-fn projection_platform_error(operation: &str, location: &str, error: io::Error) -> io::Error {
+fn projection_platform_error(
+    operation: &'static str,
+    location: &str,
+    error: io::Error,
+) -> io::Error {
     if is_projection_semantic_refusal(&error) {
         return error;
     }
+    let os_error = error.raw_os_error();
     io::Error::new(
         error.kind(),
-        format!("{operation} failed at {location}: {error}"),
+        PlatformStepError {
+            operation,
+            os_error,
+            message: format!("{operation} failed at {location}: {error}"),
+        },
     )
+}
+
+/// A platform call on the save path that failed: which call, and the OS
+/// error number. The app shows both with a save failure (GH #538: a device
+/// whose storage refused `RENAME_NOREPLACE` reported only `unknown`). The
+/// location is kept out of them because it names a page.
+#[derive(Debug)]
+pub struct PlatformStepError {
+    pub operation: &'static str,
+    pub os_error: Option<i32>,
+    message: String,
+}
+
+impl std::fmt::Display for PlatformStepError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PlatformStepError {}
+
+/// The OS error number behind a save error, looking through the
+/// [`DirectSaveError`] tag and a [`PlatformStepError`].
+pub fn save_os_error(error: &io::Error) -> Option<i32> {
+    if let Some(code) = error.raw_os_error() {
+        return Some(code);
+    }
+    let inner = error.get_ref()?;
+    if let Some(step) = inner.downcast_ref::<PlatformStepError>() {
+        return step.os_error;
+    }
+    save_os_error(&inner.downcast_ref::<DirectSaveError>()?.source)
+}
+
+/// The failed platform call behind a save error, looking through the
+/// [`DirectSaveError`] tag.
+pub fn platform_step(error: &io::Error) -> Option<&PlatformStepError> {
+    let inner = error.get_ref()?;
+    if let Some(step) = inner.downcast_ref::<PlatformStepError>() {
+        return Some(step);
+    }
+    platform_step(&inner.downcast_ref::<DirectSaveError>()?.source)
 }
 
 /// One lexical/scope validation result shared by exact points and feed events.
@@ -301,7 +358,11 @@ pub struct Graph {
     /// approved an external assets symlink/junction it is that exact resolved
     /// directory. No other graph path may use this capability.
     assets_root: PathBuf,
-    pub config: Config,
+    /// The graph's `config.edn` as last taken in. A change whose
+    /// [`Config::reach`] is `Settings` replaces it in place; a change that
+    /// reaches the graph replaces the whole `Graph`. Read it with
+    /// [`Graph::config`].
+    config: RwLock<Arc<Config>>,
     /// Sole versioned eligibility policy for normal graph text discovery and
     /// exact existing-file access. It grants no creation/projection authority.
     graph_text_scope: GraphTextScope,
@@ -309,12 +370,12 @@ pub struct Graph {
     /// configured text roots. A scan must require a fresh Graph when the case-insensitive
     /// on-disk config path no longer has this description.
     reconciliation_scan_open_config_description: Option<BlobDescription>,
-    /// Digest of the configuration bytes THIS instance last published.
-    ///
-    /// The watcher cannot otherwise tell Tine's own settings write from an
-    /// outside one, and would reopen the whole graph — discarding every cache
-    /// it has built — every time the user toggles a star.
-    recent_config_write: RwLock<Option<BlobDescription>>,
+    /// Digest of the `config.edn` bytes the served configuration was taken
+    /// from: the bytes opened with, then whatever `take_in_config` last took
+    /// in. A change that reaches the graph is not taken in, so it leaves this
+    /// as it was, and the watcher keeps seeing disk differ until a new graph
+    /// takes it in.
+    served_config_description: RwLock<Option<BlobDescription>>,
     /// Unforgeable identity of this exact Graph instance. Reopening the same
     /// resource intentionally produces a different token.
     graph_text_admission_instance: Arc<GraphTextAdmissionInstance>,
@@ -340,10 +401,14 @@ pub struct Graph {
     /// One source-inventory repair at a time. Joiners return to readiness
     /// admission without retaining a snapshot or waiting under a graph lock.
     projection_recovery: std::sync::Mutex<()>,
-    /// Graph-relative paths of pages skipped by the latest whole-graph cache
-    /// build because their parse/projection panicked. Kept retrievable so an
-    /// lsdoc ownership gap can never degrade search completeness invisibly.
-    page_index_failures: RwLock<Vec<String>>,
+    /// Graph text Tine could not read or parse, as the disk holds it now:
+    /// it outlives the parsed cache, and changes only by path
+    /// (`model/unreadable_pages.rs`). Kept retrievable so an lsdoc ownership
+    /// gap can never degrade search completeness invisibly.
+    page_index_failures: RwLock<unreadable_pages::UnreadablePages>,
+    /// The `page_index_failures` already announced to the user, so each
+    /// unreadable page is announced once per breakage.
+    announced_page_failures: std::sync::Mutex<Vec<String>>,
     /// Companion indexes for `cache`: the logical `(kind, page_key(name)) -> Vec
     /// slot` index preserves deterministic first-wins lookup, while the exact-path
     /// index keeps cache ownership physical. The Vec stays the source of truth for
@@ -359,6 +424,17 @@ pub struct Graph {
     /// captures this before reading disk and rebuilds if a mutation raced it
     /// (which would otherwise install stale content over a concurrent save).
     cache_gen: std::sync::atomic::AtomicU64,
+    /// Moved, under the cache write lock and before `cache_gen`, by every
+    /// generation move that is not a one-page upsert: a removal or a whole
+    /// cache invalidation. A whole-graph pass that sees `cache_gen` move
+    /// while this stays put knows each move published one page and its
+    /// session revision, so it can check those pages against what it read
+    /// instead of rereading the whole graph (GH #543). Each move names what
+    /// it removed; see `graph_drift`.
+    cache_structural_gen: graph_drift::StructuralGeneration,
+    /// Pages counted by the running whole-graph check or read, for the
+    /// indexing progress bar only (GH #543).
+    indexing_progress: crate::indexing_progress::ProgressCounter,
     /// Raw watcher callbacks publish an O(1) admission barrier before their
     /// debounced reconciliation. The app registry admits only one Graph slot per
     /// canonical root, so this frontier is instance-local and cannot be cleared
@@ -371,6 +447,9 @@ pub struct Graph {
     /// this mutex; joiners wait on the flight's own notification and therefore
     /// never wait while holding cache or index locks.
     page_build_flight: std::sync::Mutex<Option<Arc<PageBuildFlight>>>,
+    /// The app has replaced this graph (a switch or a refresh): a display read
+    /// still running on it must not start graph-sized work (GH #543).
+    retired: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     page_build_test: PageBuildTestState,
     /// Memoized reference results (backlinks and unlinked references), keyed by `(cache_gen, today)` so it self-invalidates on ANY
@@ -381,13 +460,37 @@ pub struct Graph {
     /// Disposable SQLite facts for Direct Files. Markdown/Org and the parsed
     /// page cache remain authoritative; indexed reads are admitted only when
     /// this worker has published the exact current `cache_gen`.
-    direct_projection: std::sync::Mutex<Option<Arc<crate::direct_projection::DirectProjection>>>,
+    direct_projection: projection_slot::ProjectionSlot,
     /// Memoized `list_pages()` (the journals//pages/ directory scan), keyed by
     /// cache_gen — which bumps on every page create/delete/rename (Tine or watcher)
     /// — so quick-switch / [[ ]] autocomplete don't re-read both dirs on every
     /// keystroke. An externally-created page not yet seen by the watcher is at most
     /// one watcher tick (≤3s) stale here.
     page_list_cache: RwLock<Option<(u64, Vec<PageEntry>)>>,
+    /// Memoized `referenced_page_names()`, keyed by `cache_gen`, with the set's
+    /// digest stored beside it so a hit does not re-hash every name.
+    ///
+    /// The projection answers this question by draining one row per (source
+    /// page, referenced name) pair and folding it down to distinct names: on a
+    /// 10,000-page graph that is 110,000 rows for 10,010 names, measured at
+    /// 1.29 s — essentially the whole 1.41 s a `[[ ]]` autocomplete keystroke
+    /// used to cost before page-name autocomplete moved to the dictionary-backed
+    /// executor. Within one generation every later
+    /// keystroke, and every other caller of this set, then answers from here.
+    /// The first lookup after a save still pays the drain, because a save bumps
+    /// `cache_gen`; priming the memo at generation publish would only move that
+    /// 1.4 s behind every save instead.
+    ///
+    /// Batching does not help (512 → 16384 rows per statement leaves the cost
+    /// unchanged; the work is the scan, not the round trips) and neither does a
+    /// distinct-names query (`raw_name` is not indexed, so it is 2–13× SLOWER).
+    /// Keyed on `cache_gen`, this is exactly as fresh as the projection read it
+    /// replaces, which already refuses to answer at any other generation.
+    referenced_names_cache: RwLock<Option<(u64, u64, Vec<String>)>>,
+    /// The page side of a pre-ready Ctrl-K search, for the cache generation
+    /// it was built from ([`crate::query_plan::PreReadyPageInventory`]).
+    pre_ready_inventory:
+        std::sync::Mutex<Option<(u64, Arc<crate::query_plan::PreReadyPageInventory>)>>,
     /// Memoized exact `find_entry(name, kind)` resolution, keyed by `cache_gen`.
     /// Unlike `list_pages()`, this index is built from raw `list_md` output so it
     /// preserves `find_entry`'s duplicate selection: date-stem file first, else
@@ -530,6 +633,7 @@ thread_local! {
     static GRAPH_TEXT_PARSE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static GRAPH_TEXT_FIRST_CAPTURE_CHARGE_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static GRAPH_TEXT_PORTABLE_TRAVERSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GRAPH_TEXT_PORTABLE_DIRECTORY_LISTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GRAPH_TEXT_EVENT_REVALIDATION_RACE: std::cell::RefCell<Option<Box<dyn FnOnce() -> io::Result<()>>>> = std::cell::RefCell::new(None);
     static FAIL_NEXT_GUARDED_GRAPH_TEXT_IDENTITY_UPDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DIRECT_CREATION_CENSUS_BUMP_CACHE_GEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -712,6 +816,25 @@ fn guide_twin_race_hook(_path: &Path) -> io::Result<()> {
 // test-only control surface to tine-storage.  Keying it by the deterministic
 // ambient return path keeps parallel runtime fixtures independent.
 
+/// Arm the one-shot directory-sync fault from a test outside this module.
+/// The fault itself stays at the narrow core `Result` boundary above; this only
+/// makes it reachable from the projection tests, which need a move that RENAMED
+/// and then failed (GH #543, seventh audit A7-N3).
+#[cfg(test)]
+pub(crate) fn fail_next_projection_directory_sync() {
+    FAIL_NEXT_PROJECTION_DIRECTORY_SYNC.with(|fail| fail.set(true));
+}
+
+#[cfg(test)]
+pub(crate) fn fail_graph_text_directory_sync_after_mutation() {
+    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(|| {
+            fail_next_projection_directory_sync();
+            Ok(())
+        }));
+    });
+}
+
 #[cfg(test)]
 fn projection_directory_sync_hook(_dir: &Path) -> io::Result<()> {
     FAIL_NEXT_PROJECTION_DIRECTORY_SYNC.with(|fail| {
@@ -813,10 +936,10 @@ fn graph_text_write_after_identity_check_hook() {}
 
 #[cfg(test)]
 fn graph_text_write_before_mutation_hook() -> io::Result<()> {
-    GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| match hook.borrow_mut().take() {
-        Some(hook) => hook(),
-        None => Ok(()),
-    })
+    // Take the hook and release the borrow before running it, so a hook can
+    // re-arm itself to fire on a later mutation.
+    let hook = GRAPH_TEXT_WRITE_BEFORE_MUTATION.with(|hook| hook.borrow_mut().take());
+    hook.map_or(Ok(()), |hook| hook())
 }
 
 #[cfg(not(test))]

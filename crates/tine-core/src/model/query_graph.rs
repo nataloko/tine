@@ -4,8 +4,20 @@ use super::*;
 use crate::query::graph::QueryGraph;
 
 impl QueryGraph for Graph {
+    fn indexed_derived_pages(
+        &self,
+        selection: crate::direct_projection::derived_reads::DerivedSelection<'_>,
+    ) -> Option<Vec<(PageEntry, Arc<Document>)>> {
+        Graph::indexed_derived_pages(self, selection)
+    }
     fn with_pages<T>(&self, f: impl FnOnce(&[(PageEntry, Arc<Document>)]) -> T) -> T {
         Graph::with_pages(self, f)
+    }
+    fn indexed_or_fallback<T>(
+        &self,
+        indexed: impl FnMut() -> Option<T>,
+    ) -> Result<T, PageFallback> {
+        Graph::indexed_or_fallback(self, indexed)
     }
 
     fn page_aliases(&self) -> Vec<(String, String)> {
@@ -19,17 +31,35 @@ impl QueryGraph for Graph {
     fn reference_candidate_pages(
         &self,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
     ) -> ReferenceCandidatePages {
-        Graph::reference_candidate_pages(self, names_norm, kind)
+        Graph::reference_candidate_pages(self, names_norm, self_page, kind)
     }
 
     fn reference_candidate_pages_indexed(
         &self,
         names_norm: &[String],
+        self_page: &str,
         kind: ReferenceKind,
     ) -> Result<ReferenceCandidatePages, crate::query::QueryExecutionError> {
-        Graph::reference_candidate_pages_indexed(self, names_norm, kind)
+        Graph::reference_candidate_pages_indexed(self, names_norm, self_page, kind)
+    }
+
+    fn reference_readiness(
+        &self,
+        target: &str,
+        kind: ReferenceKind,
+    ) -> Result<(), crate::query::QueryExecutionError> {
+        Graph::reference_readiness(self, target, kind)
+    }
+
+    fn backlink_filter_scope(
+        &self,
+        target: &str,
+        requested_pages: &[(PageKind, String)],
+    ) -> Result<crate::query::BacklinkFilterScope, crate::query::QueryExecutionError> {
+        Graph::backlink_filter_scope(self, target, requested_pages)
     }
 
     fn direct_projection_block_referrer_candidate_pages(
@@ -81,6 +111,7 @@ impl QueryGraph for Graph {
         Graph::search(self, query, limit)
     }
 
+    #[cfg(test)]
     fn direct_projection_recover_after_failed_read(&self) {
         Graph::direct_projection_recover_after_failed_read(self)
     }
@@ -89,8 +120,8 @@ impl QueryGraph for Graph {
         Graph::cache_generation(self)
     }
 
-    fn config(&self) -> &Config {
-        &self.config
+    fn config(&self) -> Arc<Config> {
+        Graph::config(self)
     }
 
     #[cfg(test)]

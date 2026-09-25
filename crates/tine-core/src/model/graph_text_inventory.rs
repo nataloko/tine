@@ -4,6 +4,10 @@
 
 use super::*;
 
+/// The listing skip for a FIFO, socket or device named like a page: never
+/// graph text, so it owns no page name (`failures_that_could_own`).
+pub(super) const NOT_A_REGULAR_FILE_SKIP: &str = ": graph text entry is not a regular file";
+
 impl Graph {
     pub(super) fn text_entries_with_limits_and_budget<'a>(
         &self,
@@ -17,6 +21,7 @@ impl Graph {
         Vec<PageEntry>,
         Option<RetainedContentReservation>,
         std::collections::HashMap<PathBuf, ContentDigest>,
+        Vec<String>,
     )> {
         struct PendingDirectory {
             directory: Dir,
@@ -47,6 +52,36 @@ impl Graph {
         let mut portable_paths = std::collections::BTreeMap::new();
         let mut portable_paths_charge =
             RetainedHeapCharge::new(budget, "graph text portable path identity map")?;
+        // GH #332: the graph-wide READ inventory skips an entry it cannot admit
+        // instead of failing the whole walk. One FIFO, unreadable folder or
+        // oddly named image anywhere under the root used to leave the page
+        // cache with zero pages, so every page opened blank. A page file that
+        // cannot be admitted is reported here (the caller records it as a page
+        // index failure, so the source is not treated as complete). An
+        // unreadable folder or a non-page entry is simply not graph text Tine
+        // can see; reporting it would keep a graph whose root holds, say,
+        // `System Volume Information` on the uncached listing path forever.
+        // The configured walk (writes) and the limits stay fail-closed.
+        let mut skipped = Vec::new();
+        macro_rules! admit_or_skip {
+            ($result:expr, $relative:expr, $may_hold_page:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    // Gone since the directory read named it: a deleted
+                    // page, not one Tine failed to read (GH #543).
+                    Err(error) if graph_wide && error.kind() == io::ErrorKind::NotFound => {
+                        continue;
+                    }
+                    Err(error) if graph_wide => {
+                        if $may_hold_page {
+                            skipped.push(format!("{}: {error}", $relative));
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+        }
         for (relative, depth) in roots {
             if depth > limits.directory_depth {
                 return Err(graph_text_inventory_limit_error("graph directory depth"));
@@ -116,7 +151,16 @@ impl Graph {
         }) = pending.pop()
         {
             let pending_path_charge = owned_path_upper_bound(&path)?;
-            for entry in directory.entries()? {
+            let entries = match directory.entries() {
+                Ok(entries) => entries,
+                Err(_) if graph_wide && depth > 0 => {
+                    pending_paths
+                        .shrink(pending_path_charge, "graph inventory pending owned paths")?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for entry in entries {
                 #[cfg(test)]
                 if graph_wide {
                     GRAPH_TEXT_INVENTORY_ENTRY_VISITS
@@ -128,9 +172,21 @@ impl Graph {
                 if all_entries > limits.all_entries {
                     return Err(graph_text_inventory_limit_error("all directory entries"));
                 }
-                let entry = entry?;
+                let entry = admit_or_skip!(entry, self.rel_path(&path), false);
                 let name = entry.file_name();
                 let Some(name_text) = name.to_str() else {
+                    if graph_wide {
+                        // Not nameable as graph text. Report it only when it
+                        // looks like a page file.
+                        let lossy = name.to_string_lossy();
+                        if is_page_file(&path.join(&name)) {
+                            skipped.push(format!(
+                                "{}/{lossy}: graph text entry name is not UTF-8",
+                                self.rel_path(&path)
+                            ));
+                        }
+                        continue;
+                    }
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "graph text entry name is not UTF-8",
@@ -156,7 +212,27 @@ impl Graph {
                 if path_bytes > limits.path_bytes {
                     return Err(graph_text_inventory_limit_error("aggregate path bytes"));
                 }
-                let file_type = entry.file_type()?;
+                let file_type =
+                    admit_or_skip!(entry.file_type(), child_relative, is_page_file(&child_path));
+                // The configured walk resolves page identities and rewrites
+                // page text; entries that can never be a page are not its
+                // business. Hidden entries (an Emacs `.#name.org` lock
+                // symlink, `.DS_Store`) and non-page files (images, PDFs, an
+                // iCloud file whose download is refused) used to be opened or
+                // refused here, which blanked the Journals view and failed
+                // today's journal on such graphs (GH #385). A symlink is not a
+                // graph-text document on any other path either (the save
+                // capture skips it since GH #267, `graph_inventory_entry` never
+                // admits one, and every write target is opened no-follow), so
+                // no in-scope scenario is defended by refusing it here. Two
+                // page files on one inode are still refused below.
+                if !graph_wide
+                    && (file_type.is_symlink()
+                        || (!file_type.is_dir()
+                            && (name_text.starts_with('.') || !is_page_file(&child_path))))
+                {
+                    continue;
+                }
                 if file_type.is_symlink() {
                     if graph_wide {
                         continue;
@@ -175,8 +251,23 @@ impl Graph {
                     if graph_wide && !self.graph_text_scope.is_eligible(&child_relative) {
                         continue;
                     }
-                    let file = open_projection_file_nofollow(&directory, name_text)?;
-                    let resource = canonical_projection_file_resource_id(&file)?;
+                    #[cfg(test)]
+                    {
+                        let mut vanish = self.page_build_test.vanish_inside_listing.lock().unwrap();
+                        if vanish.as_ref() == Some(&child_path) {
+                            std::fs::remove_file(vanish.take().unwrap()).unwrap();
+                        }
+                    }
+                    let file = admit_or_skip!(
+                        open_projection_file_nofollow(&directory, name_text),
+                        child_relative,
+                        true
+                    );
+                    let resource = admit_or_skip!(
+                        canonical_projection_file_resource_id(&file),
+                        child_relative,
+                        true
+                    );
                     if graph_wide {
                         graph_file_identities.insert(child_path.clone(), resource);
                     }
@@ -242,7 +333,11 @@ impl Graph {
                             .or_insert(child_relative.clone());
                     }
                     let page = if graph_wide {
-                        self.graph_inventory_entry(&child_path)?
+                        admit_or_skip!(
+                            self.graph_inventory_entry(&child_path),
+                            child_relative,
+                            true
+                        )
                     } else {
                         self.graph_text_inventory_entry(&child_path)?
                     };
@@ -260,6 +355,13 @@ impl Graph {
                     continue;
                 }
                 if !file_type.is_dir() {
+                    if graph_wide {
+                        // A FIFO, socket or device is never graph text.
+                        if is_page_file(&child_path) {
+                            skipped.push(format!("{child_relative}{NOT_A_REGULAR_FILE_SKIP}"));
+                        }
+                        continue;
+                    }
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!("graph text entry is not a regular file: {child_relative}"),
@@ -283,9 +385,21 @@ impl Graph {
                 if directory_count > limits.directories {
                     return Err(graph_text_inventory_limit_error("directory count"));
                 }
-                projection_real_directory(&directory, name_text)?;
-                let child = open_projection_dir_nofollow(&directory, name_text)?;
-                let resource = canonical_projection_directory_resource_id(&child)?;
+                admit_or_skip!(
+                    projection_real_directory(&directory, name_text),
+                    child_relative,
+                    false
+                );
+                let child = admit_or_skip!(
+                    open_projection_dir_nofollow(&directory, name_text),
+                    child_relative,
+                    false
+                );
+                let resource = admit_or_skip!(
+                    canonical_projection_directory_resource_id(&child),
+                    child_relative,
+                    false
+                );
                 directory_resources_charge.grow(
                     checked_add_bytes(
                         conservative_btree_entry_bytes::<ContentDigest, String>()?,
@@ -294,11 +408,15 @@ impl Graph {
                     "graph inventory directory identity map",
                 )?;
                 if let Some(first) = directory_resources.insert(resource, child_relative.clone()) {
-                    return Err(graph_text_inventory_alias_error(
-                        "directories",
-                        &first,
-                        &child_relative,
-                    ));
+                    admit_or_skip!(
+                        Err::<(), _>(graph_text_inventory_alias_error(
+                            "directories",
+                            &first,
+                            &child_relative,
+                        )),
+                        child_relative,
+                        false
+                    );
                 }
                 if pending.len() == limits.pending_directories {
                     return Err(graph_text_inventory_limit_error("pending directories"));
@@ -325,20 +443,20 @@ impl Graph {
             pending_paths.shrink(pending_path_charge, "graph inventory pending owned paths")?;
         }
         out.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-        Ok((out, out_charge.reservation, graph_file_identities))
+        Ok((out, out_charge.reservation, graph_file_identities, skipped))
     }
 
     /// Return the non-overlapping roots that must be walked for a configured-root
     /// inventory.  Nested roots are discovered through their outer root, then
     /// classified by their exact graph-relative path below; equal roots have no
     /// unambiguous owner and fail before any file is parsed or mutated.
-    pub(super) fn configured_text_inventory_roots(
+    pub(super) fn configured_text_inventory_roots<'c>(
         &self,
+        config: &'c Config,
         permit: &GraphTextWritePermit,
-    ) -> io::Result<Vec<(&str, usize)>> {
-        let page_root = configured_root_components(&self.config.pages_dir).ok_or_else(bad_path)?;
-        let journal_root =
-            configured_root_components(&self.config.journals_dir).ok_or_else(bad_path)?;
+    ) -> io::Result<Vec<(&'c str, usize)>> {
+        let page_root = configured_root_components(&config.pages_dir).ok_or_else(bad_path)?;
+        let journal_root = configured_root_components(&config.journals_dir).ok_or_else(bad_path)?;
         if page_root == journal_root {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -347,8 +465,8 @@ impl Graph {
         }
 
         let configured = [
-            (&self.config.pages_dir, page_root),
-            (&self.config.journals_dir, journal_root),
+            (&config.pages_dir, page_root),
+            (&config.journals_dir, journal_root),
         ];
         let mut resources = std::collections::BTreeMap::new();
         for (root, _) in configured.iter() {
@@ -377,7 +495,7 @@ impl Graph {
     /// Construct a list entry only after assigning the exact path's canonical
     /// longest-root owner. This is also the only ownership rule used by cache
     /// paths through `entry_for_path`.
-    fn graph_text_inventory_entry(&self, path: &Path) -> io::Result<Option<PageEntry>> {
+    pub(super) fn graph_text_inventory_entry(&self, path: &Path) -> io::Result<Option<PageEntry>> {
         if !is_page_file(path) {
             return Ok(None);
         }
@@ -419,7 +537,7 @@ impl Graph {
         {
             return Err(bad_path());
         }
-        let decoded = decode_page_name(stem, self.config.file_name_format);
+        let decoded = decode_page_name(stem, self.config().file_name_format);
         let (name, kind, date_key) = match self.journal_format.parse(&decoded) {
             Some(date) => (
                 self.journal_format.title(date),
@@ -602,7 +720,7 @@ impl Graph {
         let (dir, stem) = match kind {
             PageKind::Page => (
                 self.pages_path(),
-                Some(encode_page_name(name, self.config.file_name_format)),
+                Some(encode_page_name(name, self.config().file_name_format)),
             ),
             PageKind::Journal => (
                 self.journals_path(),
@@ -621,6 +739,32 @@ impl Graph {
             }
         }
         Ok(variants > 1)
+    }
+
+    /// GH #597: a path built from a page name names the page's file only in
+    /// the file's own spelling. On a case- (or normalization-) insensitive
+    /// filesystem `pages/Contents.md` also finds `contents.md`; handing that
+    /// spelling out gives the editor a path `resolve_rel` refuses. Such a hit
+    /// is answered from the inventory, which matches names case-insensitively
+    /// and carries each file's spelling on disk.
+    fn graph_text_as_spelled(
+        &self,
+        permit: &GraphTextWritePermit,
+        found: PathBuf,
+        name: &str,
+        kind: PageKind,
+    ) -> io::Result<PathBuf> {
+        if !path_uses_graph_text_alias(&self.root, &found) {
+            return Ok(found);
+        }
+        self.graph_text_find_entry(permit, name, kind)?
+            .map(|entry| entry.path)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the page's file is not spelled as its name on disk",
+                )
+            })
     }
 
     pub(super) fn graph_text_path_for(
@@ -644,19 +788,19 @@ impl Graph {
                         .join(format!("{stem}.{}", preferred.ext()))
                 })),
             PageKind::Page => {
-                let encoded = encode_page_name(name, self.config.file_name_format);
+                let encoded = encode_page_name(name, self.config().file_name_format);
                 let primary = self
                     .pages_path()
                     .join(format!("{encoded}.{}", preferred.ext()));
                 if self.graph_text_exists(permit, &primary)? {
-                    return Ok(primary);
+                    return self.graph_text_as_spelled(permit, primary, name, kind);
                 }
                 for alternate in configured_text_variant_paths(&self.pages_path(), &encoded) {
                     if alternate == primary {
                         continue;
                     }
                     if self.graph_text_exists(permit, &alternate)? {
-                        return Ok(alternate);
+                        return self.graph_text_as_spelled(permit, alternate, name, kind);
                     }
                 }
                 Ok(primary)

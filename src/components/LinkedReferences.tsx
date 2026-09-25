@@ -4,15 +4,16 @@ import { openPage, openPageInNewTab } from "../router";
 import { openRouteInOtherPane } from "../panes";
 import { graphMeta, openPageInSidebar, openPageContextMenu } from "../ui";
 import { LiveRefGroup } from "./LiveRefGroup";
-import type { BacklinkFilterEntry, BacklinkFilterTarget, BlockDto, RefGroup } from "../types";
+import type { BacklinkFilterContext, BacklinkFilterEntry, BacklinkFilterTarget, BlockDto, RefGroup } from "../types";
 import { shouldOpenTextContextMenu } from "../contextMenuPolicy";
 import { internalLinkAuxClick, internalLinkDest, internalLinkMouseDown } from "../linkGesture";
-import { canonicalFold, matcherMatches, parseSearchQuery } from "../editor/searchQuery";
 import {
   referenceLoadErrorMessage,
   type ReferenceLoadError,
 } from "../lib/referenceLoadError";
-import { createReferenceFetcher } from "../lib/referenceFetch";
+import { createReferenceFetcher, referenceRead, referenceIndexPendingMessage } from "../lib/referenceFetch";
+import { IndexFailedNotice } from "./IndexFailedNotice";
+import type { QueryNotReadyError } from "../backend";
 import {
   collapsedGroupsFor,
   sectionOverride,
@@ -24,6 +25,8 @@ import { mergeReferenceGroups } from "../lib/referenceGroups";
 import { ReferenceExportChooser } from "./ReferenceExportChooser";
 import { createLongPress } from "../render/longPress";
 import { readOr } from "../resourceRead";
+import { componentLifetime, runQueryWhenCurrent } from "../queryReadiness";
+import { backlinkFilterFacets } from "../lib/backlinkFilterFacets";
 
 // One identity fold for chips, filters, and group merging (DUP-2/DUP-8): the
 // old private `norm` (trim+toLowerCase) split NFC/NFD and boundary-slash
@@ -58,37 +61,29 @@ function saveFilters(page: string, f: FilterMap) {
 }
 const filterKey = (page: string, kind: string, blockId: string) => `${kind}\0${norm(page)}\0${blockId}`;
 
-type SearchableFilterEntry = Pick<BacklinkFilterEntry, "text" | "facets"> & {
-  normalizedText: string;
-};
-
-function searchableFilterEntry(
-  entry: Pick<BacklinkFilterEntry, "text" | "facets">
-): SearchableFilterEntry {
-  return {
-    text: entry.text,
-    facets: entry.facets,
-    normalizedText: canonicalFold(entry.text),
-  };
-}
+type FilterEntry = Pick<BacklinkFilterEntry, "facets" | "text_matches">;
 
 /** A bounded fallback while native context is loading or stale. It intentionally
  *  uses only DTO-owned semantic facets (never a raw reference regex); the native
  *  context replaces it with parser-owned descendant refs as soon as it arrives. */
-function fallbackFilterEntry(block: BlockDto): SearchableFilterEntry {
-  const text: string[] = [];
-  const facets = new Map<string, string>();
-  const visit = (current: BlockDto) => {
-    text.push(current.raw);
-    for (const tag of current.tags ?? []) if (!facets.has(norm(tag))) facets.set(norm(tag), tag);
-    if (current.marker) {
-      const key = norm(current.marker);
-      if (!facets.has(key)) facets.set(key, current.marker);
-    }
-    for (const child of current.children) visit(child);
-  };
-  visit(block);
-  return searchableFilterEntry({ text: text.join("\n"), facets: [...facets.values()] });
+function fallbackFilterEntry(block: BlockDto): FilterEntry {
+  return { facets: backlinkFilterFacets(block), text_matches: true };
+}
+
+interface BacklinkRootInventory {
+  groups: RefGroup[];
+  targets: BacklinkFilterTarget[];
+}
+
+interface BacklinkFilterRequest {
+  name: string;
+  search: string;
+  inventory: BacklinkRootInventory;
+}
+
+interface BacklinkFilterResponse {
+  request: BacklinkFilterRequest;
+  context: BacklinkFilterContext;
 }
 
 /** How many backlinks a page needs before its Linked References open collapsed.
@@ -109,16 +104,18 @@ const referenceCollapseThreshold = () =>
 
 export function LinkedReferences(props: { name: string }): JSX.Element {
   const [loadError, setLoadError] = createSignal<ReferenceLoadError | null>(null);
-  // The section renders nothing until it has groups, so waiting for the index
-  // looks exactly like the first load already does. No extra affordance here.
+  // The section renders nothing until it has groups. While the index is still
+  // building it says so instead: hidden, it read as "no linked references"
+  // for as long as the index took, or for ever (GH #594, index liveness L4).
+  const [indexPending, setIndexPending] = createSignal<QueryNotReadyError | null>(null);
   const fetchReferences = createReferenceFetcher({
-    currentName: () => props.name,
+    currentRead: () => referenceRead(props.name),
     setLoadError,
-    setIndexPending: () => {},
+    setIndexPending,
   });
   const [groupsResource] = createResource(
-    () => props.name,
-    (n) => fetchReferences(n, () => backend().getBacklinks(n))
+    () => referenceRead(props.name),
+    (read) => fetchReferences(read, () => backend().getBacklinks(read.name))
   );
   // `createReferenceFetcher` already routes a failure to `loadError` (rendered
   // below), so this covers the read itself rather than replacing that channel.
@@ -167,22 +164,87 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
     setSearchQuery("");
   });
 
-  const targets = createMemo<BacklinkFilterTarget[]>(() =>
-    mergedGroups().flatMap((group) =>
-      group.blocks.map((block) => ({ page: group.page, kind: group.kind, block_id: block.id }))
+  // One immutable identity binds the exact page/root inventory to every native
+  // reply. Search changes reuse this inventory; page or backlink refreshes make
+  // a new one even when the same block ids survive with different content.
+  const rootInventory = createMemo<BacklinkRootInventory>(() => {
+    const snapshot = mergedGroups();
+    return {
+      groups: snapshot,
+      targets: snapshot.flatMap((group) =>
+        group.blocks.map((block) => ({ page: group.page, kind: group.kind, block_id: block.id }))
+      ),
+    };
+  });
+  const nativeContextRequest = createMemo<BacklinkFilterRequest | null>((previous) => {
+    const activeFilter = searchDraft().trim() !== "" || searchQuery().trim() !== ""
+      || Object.keys(filters()).length > 0;
+    if ((!filterOpen() && !activeFilter) || !groups() || groupsResource.loading) return null;
+    const name = props.name;
+    const search = searchQuery();
+    const inventory = rootInventory();
+    if (previous?.name === name && previous.search === search && previous.inventory === inventory) {
+      return previous;
+    }
+    return { name, search, inventory };
+  });
+  const [nativeResponse, setNativeResponse] = createSignal<BacklinkFilterResponse>();
+  const [nativeContextLoading, setNativeContextLoading] = createSignal(false);
+  const [nativeContextError, setNativeContextError] = createSignal<unknown>();
+  let nativeRequestVersion = 0;
+  const lifetime = componentLifetime();
+  createEffect(() => {
+    const request = nativeContextRequest();
+    const version = ++nativeRequestVersion;
+    setNativeContextError(undefined);
+    if (!request) {
+      setNativeContextLoading(false);
+      return;
+    }
+    setNativeContextLoading(true);
+    void runQueryWhenCurrent(
+      lifetime,
+      () => backend().getBacklinkFilterContext(
+        request.name,
+        request.inventory.targets,
+        request.search,
+      ),
+      () => version === nativeRequestVersion,
     )
-  );
-  const needsNativeContext = () => filterOpen() || Object.keys(filters()).length > 0;
-  const [nativeContextResource] = createResource(
-    () => {
-      if (!needsNativeContext() || !groups()) return null;
-      return { name: props.name, targets: targets() };
-    },
-    ({ name, targets }) => backend().getBacklinkFilterContext(name, targets)
-  );
-  // The "Couldn't index descendant text" row below was unreachable: reading a
-  // rejected `nativeContext` threw before any Show could render it.
-  const nativeContext = () => readOr(nativeContextResource, undefined, "reference filter index");
+      .then(
+        (context) => {
+          if (version !== nativeRequestVersion) return;
+          setNativeResponse({ request, context });
+          setNativeContextLoading(false);
+        },
+        (error) => {
+          if (version !== nativeRequestVersion) return;
+          setNativeResponse(undefined);
+          setNativeContextError(() => error);
+          setNativeContextLoading(false);
+        }
+      );
+  });
+  onCleanup(() => {
+    nativeRequestVersion += 1;
+  });
+  const currentNativeResponse = () => {
+    const request = nativeContextRequest();
+    const response = nativeResponse();
+    return request && response?.request === request ? response : undefined;
+  };
+  // While a new search is pending, keep the last settled rendering only when
+  // it belongs to this exact page/root snapshot. It is never re-applied to a
+  // replacement inventory, and late promises are rejected by request version.
+  const displayedNativeResponse = () => {
+    const request = nativeContextRequest();
+    const response = nativeResponse();
+    return request
+      && response?.request.name === request.name
+      && response.request.inventory === request.inventory
+      ? response
+      : undefined;
+  };
   const fallbackByRoot = createMemo(() =>
     new Map(
       mergedGroups().flatMap((group) =>
@@ -195,9 +257,9 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
   );
   const nativeByRoot = createMemo(() =>
     new Map(
-      (nativeContext()?.entries ?? []).map((entry) => [
+      (displayedNativeResponse()?.context.entries ?? []).map((entry) => [
         filterKey(entry.page, entry.kind, entry.block_id),
-        searchableFilterEntry(entry),
+        entry,
       ] as const)
     )
   );
@@ -205,11 +267,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
     nativeByRoot().get(filterKey(group.page, group.kind, block.id))
       ?? fallbackByRoot().get(filterKey(group.page, group.kind, block.id))!;
 
-  const parsedSearch = createMemo(() => parseSearchQuery(searchQuery()));
-  const searchError = createMemo(() => {
-    const parsed = parsedSearch();
-    return parsed.kind === "invalid" ? parsed.error : null;
-  });
+  const searchError = () => currentNativeResponse()?.context.search_error ?? null;
 
   /** Filter backlink roots, trim each group's evidence to the survivors, and
    *  drop groups that lose every root. Shared so the text pass runs ONCE and
@@ -232,13 +290,11 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
   // NOT follow the chip selections, or selecting a chip would remove the
   // controls needed to undo it.
   const textMatchedGroups = createMemo<RefGroup[]>(() => {
-    const parsed = parsedSearch();
-    const searching = parsed.kind !== "empty" && parsed.kind !== "invalid";
-    if (!searching || nativeContextResource.loading) return mergedGroups();
-    return filterGroups(mergedGroups(), (group, block) => {
-      const entry = rootEntry(group, block);
-      return matcherMatches(parsed, entry.normalizedText, entry.text);
-    });
+    const response = displayedNativeResponse();
+    if (!response) return mergedGroups();
+    return filterGroups(response.request.inventory.groups, (group, block) =>
+      rootEntry(group, block).text_matches
+    );
   });
 
   // Co-referenced pages/tags and task states in each backlink tree, with counts.
@@ -278,14 +334,11 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
     const f = filters();
     const ins = Object.keys(f).filter((k) => f[k] === "in").map(norm);
     const outs = Object.keys(f).filter((k) => f[k] === "out").map(norm);
-    const parsed = parsedSearch();
-    const searching = parsed.kind !== "empty" && parsed.kind !== "invalid";
     // Do not flash descendant-only matches away while their on-demand native
-    // index is still in flight: the fallback corpus is a SUBSET of the native
-    // one, so a fallback miss cannot prove a real miss and dropping the root
-    // would hide a genuine match. Once the index arrives filtering is
-    // synchronous. The summary says so rather than reporting a filtered count.
-    if ((searching || ins.length || outs.length) && nativeContextResource.loading) return mergedGroups();
+    // answer is still in flight. A settled answer for the same immutable root
+    // inventory stays displayed; a replacement inventory remains unfiltered.
+    if ((searchQuery().trim() !== "" || ins.length || outs.length)
+        && nativeContextLoading() && !displayedNativeResponse()) return mergedGroups();
     if (!ins.length && !outs.length) return textMatchedGroups();
     // GH #273: positive include chips OR — a backlink stays when ANY included
     // page/tag is present, and zero positive chips leaves the facet side
@@ -343,10 +396,8 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
    *  so the list below is deliberately UNFILTERED. Say that instead of
    *  reporting "N of N references", which asserts a finished filter. */
   const filterPending = () => {
-    if (!nativeContextResource.loading) return false;
-    const parsed = parsedSearch();
-    const searching = parsed.kind !== "empty" && parsed.kind !== "invalid";
-    return searching || Object.keys(filters()).length > 0;
+    if (!nativeContextLoading()) return false;
+    return searchQuery().trim() !== "" || Object.keys(filters()).length > 0;
   };
   const updateSearch = (value: string) => {
     setSearchDraft(value);
@@ -367,13 +418,32 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
       fallback={
         <div class="linked-references reference-error" role="alert">
           <div class="references-header">Linked References</div>
-          <div class="reference-filter-error">
-            {referenceLoadErrorMessage(loadError()!)}
-          </div>
+          <Show
+            when={loadError()!.kind === "index_failed"}
+            fallback={
+              <div class="reference-filter-error">
+                {referenceLoadErrorMessage(loadError()!)}
+              </div>
+            }
+          >
+            <IndexFailedNotice subject="Linked References" failure={loadError()!.indexFailure ?? "other"} />
+          </Show>
         </div>
       }
     >
-    <Show when={groups() && mergedGroups().length > 0}>
+    <Show
+      when={groups() && mergedGroups().length > 0}
+      fallback={
+        <Show when={groupsResource.loading && indexPending()}>
+          <div class="linked-references">
+            <div class="references-header">
+              Linked References
+              <span class="references-loading"> {referenceIndexPendingMessage(indexPending())}</span>
+            </div>
+          </div>
+        </Show>
+      }
+    >
       <Show when={exportChooserOpen()}>
         {/* GH #348: batch export honors the visible (filtered) set, matching
             what the section actually shows the user right now. */}
@@ -451,7 +521,7 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
                   fallback={
                     <>
                       {count()} of {totalCount()} references
-                      <Show when={nativeContextResource.loading}> · indexing…</Show>
+                      <Show when={nativeContextLoading()}> · indexing…</Show>
                     </>
                   }
                 >
@@ -461,10 +531,11 @@ export function LinkedReferences(props: { name: string }): JSX.Element {
               <Show when={searchError()}>
                 {(error) => <div class="reference-filter-error">Invalid search: {error()}</div>}
               </Show>
-              <Show when={nativeContextResource.error}>
-                <div class="reference-filter-error">Couldn’t index descendant text; searching visible root text only.</div>
+              <Show when={nativeContextError()}>
+                <div class="reference-filter-error">Couldn’t search descendant text; showing all references.</div>
               </Show>
-              <Show when={nativeContext()?.truncated || nativeContext()?.entries.some((entry) => entry.truncated)}>
+              <Show when={displayedNativeResponse()?.context.truncated
+                  || displayedNativeResponse()?.context.entries.some((entry) => entry.truncated)}>
                 <div class="reference-filter-warning">Some very large reference trees are searched partially.</div>
               </Show>
               <Show when={coRefs().length > 0 || orphanFilters().length > 0}>

@@ -65,6 +65,12 @@ impl ReferencedPageNames {
 /// set is identical — which is exactly the case this exists to make cheap. The
 /// length is mixed in separately so a name swapped for one whose hash collides
 /// with it does not slip through unless the count matches too.
+///
+/// It crosses to JavaScript as a JSON number, which is exact only up to 2^53
+/// - 1, and comes back as the `known` digest; so it is kept within that
+/// range. A full-width digest came back rounded, never matched, and every
+/// save shipped the whole set (307 KB on 10,000 pages) instead of "unchanged"
+/// (GH #543).
 pub(super) fn referenced_names_digest(names: &[String]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut sum: u64 = 0;
@@ -76,8 +82,13 @@ pub(super) fn referenced_names_digest(names: &[String]) -> u64 {
         sum = sum.wrapping_add(hash);
         xor ^= hash;
     }
-    sum.rotate_left(17) ^ xor.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (names.len() as u64)
+    (sum.rotate_left(17) ^ xor.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (names.len() as u64))
+        & JS_SAFE_INTEGER_MAX
 }
+
+/// `Number.MAX_SAFE_INTEGER`: the largest integer a JavaScript number holds
+/// exactly.
+pub(crate) const JS_SAFE_INTEGER_MAX: u64 = (1 << 53) - 1;
 
 /// An orphaned asset file (no block references it) — surfaced so the user can
 /// review + trash unused media. `size` in bytes; `modified` is the file's
@@ -186,6 +197,23 @@ pub struct SyncConflict {
 pub struct RenameOutcome {
     /// Paths of quarantined referrers left byte-identical, old refs intact.
     pub skipped_conflicted_referrers: Vec<String>,
+    /// Every page whose file the rename moved or rewrote. The frontend reloads
+    /// exactly these and keeps every other open page, unsaved edits included
+    /// (GH #535).
+    pub touched: Vec<RenameTouchedPage>,
+}
+
+/// One page a rename moved or rewrote.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameTouchedPage {
+    /// The page's name before the rename.
+    pub name: String,
+    pub kind: PageKind,
+    /// Graph-root-relative path of the file before the rename.
+    pub path: String,
+    /// Set when the page itself moved: its name after the rename.
+    pub renamed_to: Option<String>,
 }
 
 /// A page whose ON-DISK bytes carry unresolved VCS merge-conflict markers
@@ -203,6 +231,14 @@ pub struct VcsMarkerConflict {
     /// Distinct marker kinds found, in order of first appearance
     /// (e.g. `["<<<<<<<", "=======", ">>>>>>>"]`).
     pub markers: Vec<String>,
+}
+
+/// Everything the conflicts UI shows; see [`Graph::conflict_inventory`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictInventory {
+    pub sync_conflicts: Vec<SyncConflict>,
+    pub vcs_markers: Vec<VcsMarkerConflict>,
+    pub queue: Vec<crate::concord_queue::ConflictObject>,
 }
 
 /// Exact asset-side result of one PDF-highlight merge. The annotation page is

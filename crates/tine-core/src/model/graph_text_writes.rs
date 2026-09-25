@@ -4,6 +4,35 @@
 use super::*;
 
 impl Graph {
+    /// Reconcile readable final owners after a mutation or its compensation
+    /// failed. The caller retains its identity mutation permit throughout.
+    pub(super) fn reconcile_failed_graph_text_paths<'a>(
+        &self,
+        permit: &GraphTextWritePermit,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) {
+        let mut seen = std::collections::HashSet::new();
+        for path in paths {
+            if !seen.insert(path) {
+                continue;
+            }
+            let Some(entry) = self.entry_for_path(path) else {
+                continue;
+            };
+            self.recent_writes.lock().unwrap().remove(path);
+            match self.graph_text_read_optional_text(permit, path) {
+                Ok(Some(content)) => match parse_exact_page(self, &entry, &content) {
+                    Ok((entry, document, revision)) => self.cache_upsert(entry, document, revision),
+                    // Unreadable now: recorded, or the name it may own stops
+                    // being refused (audit R15-02).
+                    Err(_) => self.record_watcher_identity_failure(path, false),
+                },
+                Ok(None) => self.cache_remove_path(&entry),
+                Err(_) => self.record_watcher_identity_failure(path, false),
+            }
+        }
+    }
+
     fn validate_direct_creation_proof_before_mutation(
         &self,
         permit: &GraphTextWritePermit,
@@ -152,12 +181,22 @@ impl Graph {
         validation: GraphTextPublicationValidation,
     ) -> io::Result<()> {
         if !create_new {
-            if validation == GraphTextPublicationValidation::CompleteIndex {
-                let _ = self.guarded_graph_text_identity_index()?;
-            }
             let expected_identity = self
                 .graph_text_optional_file_identity(permit, path)?
                 .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            // There is deliberately NO alias check here. Naming the other graph
+            // page that holds this inode requires the complete identity index,
+            // and an existing save must never build it (GH #267) — that is what
+            // keeps a save O(1) rather than O(graph). The raw link count that
+            // used to stand in for the check on this path could not tell a
+            // graph sibling from git-annex's `.git/annex/objects` link, so it
+            // refused every save on an annexed or deduplicated graph (GH #571,
+            // GH #555). Martin, 2026-09-21: allow it here. The precise refusal
+            // stays on page creation, where the index is already in hand, and
+            // the non-index move paths keep the blanket rule for now.
+            // `existing_save_local_proofs_cover_hardlinks_and_index_uncertainty`
+            // pins both halves of this: the save is allowed, and it builds no
+            // complete generation.
             return self.graph_text_atomic_replace_bound(
                 permit,
                 path,
@@ -269,11 +308,9 @@ impl Graph {
                 format!("guarded graph-text target is not portable: {error}"),
             )
         })?;
-        if let Err(error) = self.validate_existing_graph_text_target_exact(
-            &target,
-            &graph_text_path,
-            Some(expected_identity),
-        ) {
+        if let Err(error) =
+            self.validate_existing_graph_text_target_exact(&target, Some(expected_identity))
+        {
             if editor_episode.is_some()
                 && (error.kind() == io::ErrorKind::NotFound
                     || error
@@ -295,7 +332,6 @@ impl Graph {
         let staged_identity = match (|| {
             let staged_file = open_projection_file_nofollow(target.parent(), &temp)?;
             let identity = canonical_projection_file_resource_id(&staged_file)?;
-            validate_graph_text_single_link(&staged_file, graph_text_path.as_str())?;
             Ok::<_, io::Error>(identity)
         })() {
             Ok(identity) => identity,
@@ -326,11 +362,9 @@ impl Graph {
             // validation, but before the first live-name mutation.
             graph_text_write_before_mutation_hook()?;
             self.validate_graph_text_portable_aliases_path_local(permit, &graph_text_path, false)?;
-            if let Err(error) = self.validate_existing_graph_text_target_exact(
-                &target,
-                &graph_text_path,
-                Some(expected_identity),
-            ) {
+            if let Err(error) =
+                self.validate_existing_graph_text_target_exact(&target, Some(expected_identity))
+            {
                 if editor_episode.is_some()
                     && (error.kind() == io::ErrorKind::NotFound
                         || error
@@ -357,7 +391,6 @@ impl Graph {
                     "graph text target changed before durable retirement",
                 ));
             }
-            validate_graph_text_single_link(&live_file, graph_text_path.as_str())?;
             drop(live_file);
             rename_noreplace(&target.filename, &recovery, &live_bytes)?;
             retired = true;
@@ -365,7 +398,6 @@ impl Graph {
             let (retired_file, retired_bytes) =
                 open_and_read_projection_regular(target.parent(), &recovery)?;
             let retired_identity = canonical_projection_file_resource_id(&retired_file)?;
-            validate_graph_text_single_link(&retired_file, graph_text_path.as_str())?;
             drop(retired_file);
             if retired_identity != expected_identity
                 || expected_bytes.is_some_and(|expected| retired_bytes != expected)
@@ -386,7 +418,6 @@ impl Graph {
                     "staged editor identity changed before publication",
                 ));
             }
-            validate_graph_text_single_link(&staged_file, graph_text_path.as_str())?;
             drop(staged_file);
 
             if let Err(error) = rename_noreplace(&temp, &target.filename, bytes) {
@@ -397,11 +428,9 @@ impl Graph {
             }
             published = true;
             journal_projection_after_publish_hook()?;
-            if let Err(error) = self.validate_existing_graph_text_target_exact(
-                &target,
-                &graph_text_path,
-                Some(staged_identity),
-            ) {
+            if let Err(error) =
+                self.validate_existing_graph_text_target_exact(&target, Some(staged_identity))
+            {
                 if editor_episode.is_some()
                     && (error.kind() == io::ErrorKind::NotFound
                         || error
@@ -441,7 +470,6 @@ impl Graph {
                                 "displaced target identity changed before restore",
                             ));
                         }
-                        validate_graph_text_single_link(&recovery_file, graph_text_path.as_str())?;
                         let recovery_bytes = read_projection_regular(target.parent(), &recovery)?;
                         move_graph_text_exact_no_replace(
                             target.parent(),
@@ -573,7 +601,8 @@ impl Graph {
         projection_optional_regular_metadata(source.parent(), &source.filename)?;
         let source_file = open_projection_file_nofollow(source.parent(), &source.filename)?;
         let source_identity = canonical_projection_file_resource_id(&source_file)?;
-        validate_graph_text_single_link(&source_file, &self.rel_path(source_path))?;
+        // No link-count check: a move keeps the inode, so any other name linked
+        // to this artifact keeps exactly the bytes it had (GH #571, GH #555).
         drop(source_file);
 
         let destination = self.graph_text_target(permit, destination_path, true)?;
@@ -590,7 +619,6 @@ impl Graph {
                 "editor recovery artifact changed before reconciliation",
             ));
         }
-        validate_graph_text_single_link(&rebound, &self.rel_path(source_path))?;
         self.validate_graph_text_portable_aliases_path_local(
             permit,
             &destination_graph_text,
@@ -671,7 +699,13 @@ impl Graph {
                 &source_graph_text,
                 false,
             )?;
-            self.validate_existing_graph_text_target_exact(&source, &source_graph_text, None)?;
+            self.validate_existing_graph_text_target_exact(&source, None)?;
+            // No link-count check on the move source. `MS-REF-GRAPH-TEXT-ALIAS`
+            // is the divergence temp + rename PUBLICATION causes by giving one
+            // name a new inode; a move keeps the inode, so every other name
+            // linked to it keeps exactly the bytes it had. The raw count this
+            // used to refuse on defended nothing and made every page of an
+            // annexed or deduplicated graph unrenamable (GH #571, GH #555).
             self.validate_graph_text_portable_aliases_path_local(
                 permit,
                 &destination_graph_text,
@@ -689,12 +723,24 @@ impl Graph {
             destination.parent(),
             &destination.filename,
         )?;
-        sync_projection_chain_required(&source.chain)?;
-        sync_projection_chain_required(&destination.chain)?;
-        self.finish_tine_owned_graph_text_identity_paths([
-            source_path.as_path(),
-            destination_path.as_path(),
-        ])
+        let result = (|| {
+            sync_projection_chain_required(&source.chain)?;
+            sync_projection_chain_required(&destination.chain)?;
+            self.finish_tine_owned_graph_text_identity_paths([
+                source_path.as_path(),
+                destination_path.as_path(),
+            ])
+        })();
+        // The rename has already committed. Preserve its durability/identity
+        // error, but publish the filesystem state even when the caller exits
+        // before its ordinary successful-mutation publication.
+        if result.is_err() {
+            self.reconcile_failed_graph_text_paths(
+                permit,
+                [source_path.as_path(), destination_path.as_path()],
+            );
+        }
+        result
     }
 
     pub(super) fn graph_text_move_to_trash(

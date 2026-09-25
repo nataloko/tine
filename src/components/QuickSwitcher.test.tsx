@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render } from "solid-js/web";
 import { QuickSwitcher } from "./QuickSwitcher";
-import { closeSwitcher, openSwitcher, pageInventoryRev, rightSidebar, setGraphMeta, setGraphTransitioning, setRecentPages, setRightSidebar, setRightSidebarOpen, toasts } from "../ui";
+import { closeSwitcher, correctLaunchAnswers, openSwitcher, pageInventoryRev, rightSidebar, setGraphMeta, setGraphTransitioning, setRecentPages, setRightSidebar, setRightSidebarOpen, toasts } from "../ui";
 import { activeId, closeTab, route, tabRoute, tabs } from "../router";
 import { backend, QueryNotReadyError } from "../backend";
 import { closePane, focusPane, layoutPaneIds, paneRouter, resetPaneLayoutToSingle, setFocusedPaneId, splitPane } from "../panes";
@@ -30,6 +30,45 @@ afterEach(() => {
 });
 
 describe("QuickSwitcher search syntax help", () => {
+
+  // Launch design D4 (GH #550): a search answered from the index as the last
+  // session left it is asked again when the launch check lands, so a page
+  // edited while Tine was closed appears without another keystroke.
+  it("asks again when the launch index check lands", async () => {
+    const hit = (name: string) => ({
+      hits: [{
+        entity: "page" as const,
+        page: { name, kind: "page", date_key: null, path: `pages/${name}.md` },
+        display_text: name,
+        evidence: [{ clause_id: 1, field: "page_name", mode: "fuzzy", spans: [{ start: 0, end: 6 }] }],
+        score: 100,
+        match_class: "prefix",
+      }],
+      diagnostics: [],
+      explanation: { branches: [] },
+      cancelled: false,
+    });
+    let answer = hit("Needle stored");
+    const search = vi.spyOn(backend(), "runGraphSearch").mockImplementation(async () => answer as never);
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QuickSwitcher />, root);
+    try {
+      openSwitcher();
+      const input = root.querySelector<HTMLInputElement>(".switcher-input")!;
+      input.value = "Needle";
+      input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      await vi.waitFor(() => expect(root.textContent).toContain("Needle stored"));
+      const asked = search.mock.calls.length;
+      answer = hit("Needle fresh");
+      correctLaunchAnswers();
+      await vi.waitFor(() => expect(root.textContent).toContain("Needle fresh"));
+      expect(search.mock.calls.length).toBeGreaterThan(asked);
+      expect(search.mock.lastCall?.[0]).toBe("Needle");
+    } finally {
+      dispose();
+    }
+  });
 
   it("says a rebuild is a rebuild while search is not ready", async () => {
     // The index is REBUILDING, not merely catching up on edits. Keeping that
@@ -406,12 +445,15 @@ describe("QuickSwitcher search syntax help", () => {
       const input = root.querySelector<HTMLInputElement>(".switcher-input")!;
       input.value = "needle";
       input.dispatchEvent(new InputEvent("input", { bubbles: true }));
-      const rows = await vi.waitFor(() => {
+      const { pageRow, blockRow } = await vi.waitFor(() => {
         const found = [...root.querySelectorAll<HTMLElement>('.switcher-row[role="option"]')];
-        expect(found).toHaveLength(2);
-        return found;
+        const pageRow = found.find((row) => row.textContent?.includes("Twin"));
+        const blockRow = found.find((row) => row.textContent?.includes("owned needle"));
+        expect(pageRow).toBeDefined();
+        expect(blockRow).toBeDefined();
+        return { pageRow: pageRow!, blockRow: blockRow! };
       });
-      return { input, pageRow: rows[0], blockRow: rows[1] };
+      return { input, pageRow, blockRow };
     };
 
     try {
@@ -479,6 +521,7 @@ describe("QuickSwitcher search syntax help", () => {
     expect(search).toHaveBeenLastCalledWith(
       "needle", 0, 100, "quick-switch:current-page", false,
       { name: "Twin", pageKind: "page", path: "pages/second/Twin.md" },
+      undefined, "ctrl_k",
     );
     await vi.waitFor(() => expect([...root.querySelectorAll(".switcher-group-header")].map((node) => node.textContent)).toEqual(["Current page1"]));
     expect(root.textContent).not.toContain("Create page:");
@@ -499,18 +542,25 @@ describe("QuickSwitcher search syntax help", () => {
     input.dispatchEvent(new InputEvent("input", { bubbles: true }));
     await vi.waitFor(() => expect(search.mock.calls.at(-1)?.[0]).toBe("global"));
 
-    expect(search).toHaveBeenLastCalledWith("global", 100, 100, "quick-switch", false, undefined);
+    expect(search).toHaveBeenLastCalledWith(
+      "global", 100, 100, "quick-switch", false, undefined, undefined, "ctrl_k",
+    );
     expect(root.textContent).toContain("Create page: global");
     expect(root.querySelector("[data-open-search-tab]")).not.toBeNull();
     dispose();
   });
 
-  it("suppresses Create when the backend classifies a canonical-equivalent page as exact", async () => {
+  it.each([
+    ["cafe", "Café", true],
+    ["Café", "Cafe\u{301}", false],
+    ["Cafe\u{301}", "Café", false],
+    ["Ｃａｆｅ", "Cafe", true],
+  ] as const)("keeps search rank separate from page identity for %j", async (query, pageName, permitsCreate) => {
     vi.spyOn(backend(), "runGraphSearch").mockResolvedValue({
       hits: [{
         entity: "page",
-        page: { name: "Cafe\u0301", kind: "page", date_key: null, path: "pages/cafe.md" },
-        display_text: "Cafe\u0301",
+        page: { name: pageName, kind: "page", date_key: null, path: "pages/cafe.md" },
+        display_text: pageName,
         evidence: [{ clause_id: 1, field: "page_name", mode: "fuzzy", spans: [{ start: 0, end: 5 }] }],
         score: 1500,
         match_class: "exact",
@@ -521,10 +571,10 @@ describe("QuickSwitcher search syntax help", () => {
     const dispose = render(() => <QuickSwitcher />, root);
     openSwitcher();
     const input = root.querySelector<HTMLInputElement>(".switcher-input")!;
-    input.value = "Café";
+    input.value = query;
     input.dispatchEvent(new InputEvent("input", { bubbles: true }));
-    await vi.waitFor(() => expect(root.textContent).toContain("Cafe\u0301"));
-    expect(root.textContent).not.toContain("Create page:");
+    await vi.waitFor(() => expect(root.textContent).toContain(pageName));
+    expect(root.textContent?.includes("Create page:")).toBe(permitsCreate);
     dispose();
   });
 
@@ -713,5 +763,59 @@ describe("QuickSwitcher search syntax help", () => {
     await closeTab(activeId());
 
     dispose();
+  });
+});
+
+describe("QuickSwitcher while a newer search is running (GH #543)", () => {
+  const pageHit = (name: string) => ({
+    entity: "page" as const,
+    page: { name, kind: "page" as const, date_key: null, path: `pages/${name}.md` },
+    display_text: name,
+    evidence: [],
+    score: 100,
+    match_class: "prefix" as const,
+  });
+  const answer = (...names: string[]) => ({
+    hits: names.map(pageHit),
+    diagnostics: [],
+    explanation: { branches: [] },
+    cancelled: false,
+    has_more: { pages: false, blocks: false },
+  });
+
+  it("keeps the previous results on screen, and Enter chooses from the fresh answer", async () => {
+    let releaseSecond: (() => void) | undefined;
+    vi.spyOn(backend(), "runGraphSearch").mockImplementation(async (q: string) => {
+      if (q === "Alp") return answer("Alpine") as never;
+      await new Promise<void>((resolve) => { releaseSecond = resolve; });
+      return answer("Alpha") as never;
+    });
+    const root = document.createElement("div");
+    document.body.append(root);
+    const dispose = render(() => <QuickSwitcher />, root);
+    openSwitcher();
+    const input = root.querySelector<HTMLInputElement>(".switcher-input")!;
+    const type = (value: string) => {
+      input.value = value;
+      input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    };
+    const rows = () => [...root.querySelectorAll<HTMLElement>('.switcher-row[role="option"]')]
+      .map((row) => row.textContent ?? "");
+    try {
+      type("Alp");
+      await vi.waitFor(() => expect(rows().some((row) => row.includes("Alpine"))).toBe(true));
+
+      type("Alph");
+      await vi.waitFor(() => expect(releaseSecond).toBeDefined());
+      expect(rows().some((row) => row.includes("Alpine")), "the previous answer stays visible").toBe(true);
+
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+      expect(route().kind, "Enter on a stale list waits").not.toBe("page");
+
+      releaseSecond!();
+      await vi.waitFor(() => expect(route()).toMatchObject({ kind: "page", name: "Alpha" }));
+    } finally {
+      dispose();
+    }
   });
 });

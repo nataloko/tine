@@ -45,8 +45,8 @@ impl Graph {
         approved_assets: Option<&Path>,
     ) -> io::Result<Graph> {
         let mut graph = Self::open(root);
-        validate_graph_dir(&graph.root, &graph.config.journals_dir, "journals")?;
-        validate_graph_dir(&graph.root, &graph.config.pages_dir, "pages")?;
+        validate_graph_dir(&graph.root, &graph.config().journals_dir, "journals")?;
+        validate_graph_dir(&graph.root, &graph.config().pages_dir, "pages")?;
         validate_graph_dir(&graph.root, "logseq", "logseq")?;
         validate_graph_dir(&graph.root, "publish", "publish")?;
         // `.tine-sync` (left behind by the removed Managed Storage mode) is not
@@ -429,12 +429,14 @@ impl Graph {
             projection_root,
             interrupted_publication_claimants: RwLock::new(std::collections::BTreeSet::new()),
             root,
-            config,
+            config: RwLock::new(Arc::new(config)),
             graph_text_scope,
             reconciliation_scan_open_config_description: config_bytes
                 .as_deref()
                 .map(BlobDescription::of),
-            recent_config_write: RwLock::new(None),
+            served_config_description: RwLock::new(
+                config_bytes.as_deref().map(BlobDescription::of),
+            ),
             graph_text_admission_instance,
             guarded_graph_text_identity: RwLock::new(GuardedGraphTextIdentityState {
                 observed_resource_epoch: guarded_resource_epoch,
@@ -444,20 +446,26 @@ impl Graph {
             cache: RwLock::new(None),
             session_page_ids: RwLock::new(std::collections::HashMap::new()),
             projection_recovery: std::sync::Mutex::new(()),
-            page_index_failures: RwLock::new(Vec::new()),
+            page_index_failures: RwLock::new(Default::default()),
+            announced_page_failures: std::sync::Mutex::new(Vec::new()),
             cache_index: RwLock::new(None),
             effective_identity_index: RwLock::new(None),
             cache_gen: std::sync::atomic::AtomicU64::new(0),
+            cache_structural_gen: graph_drift::StructuralGeneration::new(),
+            indexing_progress: Default::default(),
             external_observation_epoch: std::sync::atomic::AtomicU64::new(0),
             external_reconciled_epoch: std::sync::atomic::AtomicU64::new(0),
             external_observation_instance: NEXT_EXTERNAL_OBSERVATION_INSTANCE
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             page_build_flight: std::sync::Mutex::new(None),
+            retired: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             page_build_test: PageBuildTestState::default(),
             derived_cache: RwLock::new(None),
-            direct_projection: std::sync::Mutex::new(None),
+            direct_projection: projection_slot::ProjectionSlot::empty(),
             page_list_cache: RwLock::new(None),
+            referenced_names_cache: RwLock::new(None),
+            pre_ready_inventory: std::sync::Mutex::new(None),
             find_entry_cache: RwLock::new(None),
             recent_writes: std::sync::Mutex::new(std::collections::HashMap::new()),
             recent_graph_text_states: std::sync::Mutex::new(std::collections::HashMap::new()),

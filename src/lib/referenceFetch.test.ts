@@ -1,25 +1,56 @@
 import { describe, expect, it } from "vitest";
 import { createRoot } from "solid-js";
 import { QueryNotReadyError } from "../backend";
-import { createReferenceFetcher } from "./referenceFetch";
+import { bumpGraphBinding } from "../persistence";
+import { createReferenceFetcher, referenceRead } from "./referenceFetch";
 import type { ReferenceLoadError } from "./referenceLoadError";
 
 function harness(currentName: () => string) {
   let dispose = () => {};
   const errors: (ReferenceLoadError | null)[] = [];
   const pending: (Error | null)[] = [];
-  const fetcher = createRoot((d) => {
+  const fetchRead = createRoot((d) => {
     dispose = d;
     return createReferenceFetcher({
-      currentName,
+      currentRead: () => referenceRead(currentName()),
       setLoadError: (error) => errors.push(error),
       setIndexPending: (error) => pending.push(error),
     });
   });
+  const fetcher = <T>(name: string, load: () => Promise<T[]>) => fetchRead(referenceRead(name), load);
   return { fetcher, dispose, errors, pending };
 }
 
 describe("createReferenceFetcher", () => {
+  // GH #543, audit R5-04: the eager first attempt of a read the pane has
+  // routed away from settles after the new page's read answered. Its
+  // readiness refusal must not mark the new panel failed.
+  it("a superseded first read cannot mark the new panel failed", async () => {
+    let showing = "Old";
+    const { fetcher, dispose, errors } = harness(() => showing);
+    let rejectOld!: (reason: unknown) => void;
+    const old = fetcher("Old", () => new Promise<string[]>((_resolve, reject) => { rejectOld = reject; }));
+    showing = "New";
+    expect(await fetcher("New", async () => ["current reference"])).toEqual(["current reference"]);
+    rejectOld(new QueryNotReadyError("indexing"));
+    expect(await old).toEqual([]);
+    dispose();
+    expect(errors.at(-1)).toBeNull();
+  });
+
+  it("a superseded first read's real failure does not mark the new panel failed either", async () => {
+    let showing = "Old";
+    const { fetcher, dispose, errors } = harness(() => showing);
+    let rejectOld!: (reason: unknown) => void;
+    const old = fetcher("Old", () => new Promise<string[]>((_resolve, reject) => { rejectOld = reject; }));
+    showing = "New";
+    expect(await fetcher("New", async () => ["current reference"])).toEqual(["current reference"]);
+    rejectOld(new Error("backend exploded"));
+    expect(await old).toEqual([]);
+    dispose();
+    expect(errors.at(-1)).toBeNull();
+  });
+
   it("waits out an indexing projection instead of surfacing an error", async () => {
     const { fetcher, dispose, errors, pending } = harness(() => "Target");
     let attempts = 0;
@@ -62,6 +93,25 @@ describe("createReferenceFetcher", () => {
     showing = "Somewhere Else";
     await expect(promise).resolves.toEqual([]);
     dispose();
+  });
+
+  // GH #543, audit R6-06: a panel that stays mounted across a rebind (the
+  // right sidebar) must not keep the previous binding's read alive.
+  it("stops retrying, and drops the answer, when the graph is rebound", async () => {
+    const { fetcher, dispose, errors } = harness(() => "Target");
+    let attempts = 0;
+    const promise = fetcher("Target", async () => {
+      attempts += 1;
+      throw new QueryNotReadyError("indexing");
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    bumpGraphBinding();
+    await expect(promise).resolves.toEqual([]);
+    const settled = attempts;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(attempts).toBe(settled);
+    dispose();
+    expect(errors.every((error) => error === null)).toBe(true);
   });
 
   it("still reports a real backend refusal", async () => {

@@ -31,8 +31,9 @@ impl Graph {
         path: &GraphTextPath,
     ) -> Result<GraphTextKind, UnsafeGraphTextPath> {
         let path_components = path.as_str().split('/').collect::<Vec<_>>();
-        let page_root = configured_root_components(&self.config.pages_dir);
-        let journal_root = configured_root_components(&self.config.journals_dir);
+        let config = self.config();
+        let page_root = configured_root_components(&config.pages_dir);
+        let journal_root = configured_root_components(&config.journals_dir);
         let Some(page_root) = page_root else {
             return Err(UnsafeGraphTextPath(path.as_str().to_owned()));
         };
@@ -353,13 +354,15 @@ impl Graph {
         validate_graph_text_event_parent(index, &target, &parent)?;
         let enumerated = open_projection_file_nofollow(parent.final_dir(), &target.filename)?;
         let enumerated_resource = canonical_projection_file_resource_id(&enumerated)?;
+        // Any link count is admissible, exactly as in a complete build: a second
+        // name outside graph-text scope (git-annex's `.git/annex/objects`, a
+        // deduplicator) is none of Tine's business, and a second GRAPH-TEXT name
+        // is refused precisely by the resource reverse group in
+        // `validate_graph_text_admission_delta`. Refusing here threw the warm
+        // index away on every external edit of an annexed graph (GH #571,
+        // GH #555). The count is still recorded and must hold still through
+        // the two-sided proof below.
         let link_count = projection_file_link_count(&enumerated)?;
-        if link_count != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("exact feed upsert has an unsafe link count: {relative}"),
-            ));
-        }
         let enumerated_len = enumerated.metadata()?.len();
         if let Some(charges) = actual_charges.as_deref_mut() {
             let worst_growth = self.graph_text_exact_feed_worst_permanent_growth(
@@ -514,7 +517,7 @@ impl Graph {
         validate_graph_text_event_parent(index, &target, &rebound_parent)?;
         let rebound = open_projection_file_nofollow(rebound_parent.final_dir(), &target.filename)?;
         if canonical_projection_file_resource_id(&rebound)? != file_resource_id
-            || projection_file_link_count(&rebound)? != 1
+            || projection_file_link_count(&rebound)? != link_count
         {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -540,7 +543,7 @@ impl Graph {
             || rebound_description != description
             || rebound_resource != file_resource_id
             || canonical_projection_file_resource_id(&final_file)? != file_resource_id
-            || projection_file_link_count(&final_file)? != 1
+            || projection_file_link_count(&final_file)? != link_count
         {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,

@@ -230,6 +230,20 @@ export interface SyncConflict {
 export interface RenameOutcome {
   /** Paths of quarantined referrers left byte-identical, old refs intact. */
   skippedConflictedReferrers: string[];
+  /** Every page whose file the rename moved or rewrote; the frontend reloads
+   *  exactly these and keeps every other open page (GH #535). */
+  touched: RenameTouchedPage[];
+}
+
+/** One page a rename moved or rewrote. */
+export interface RenameTouchedPage {
+  /** The page's name before the rename. */
+  name: string;
+  kind: PageKind;
+  /** Graph-root-relative path of the file before the rename. */
+  path: string;
+  /** Set when the page itself moved: its name after the rename. */
+  renamedTo: string | null;
 }
 
 /** A page whose on-disk bytes carry unresolved VCS merge-conflict markers
@@ -396,6 +410,14 @@ export interface ConflictObject {
   live?: LiveSaveConflictSnapshot;
 }
 
+/** Everything the conflicts UI shows, from one pass over the graph
+ *  (`conflict_inventory`); mirrors core's `ConflictInventory`. */
+export interface ConflictInventory {
+  sync_conflicts: SyncConflict[];
+  vcs_markers: VcsMarkerConflict[];
+  queue: ConflictObject[];
+}
+
 /** A marker-bearing page's own conflict, parsed out of its `<<<<<<<` sections
  *  and diffed with the same block machinery as a conflict copy (Concord L5). */
 export interface MarkerConflictDiff {
@@ -421,13 +443,14 @@ export interface BacklinkFilterTarget {
 }
 
 export interface BacklinkFilterEntry extends BacklinkFilterTarget {
-  text: string;
   facets: string[];
+  text_matches: boolean;
   truncated?: boolean;
 }
 
 export interface BacklinkFilterContext {
   entries: BacklinkFilterEntry[];
+  search_error?: string;
   truncated?: boolean;
 }
 

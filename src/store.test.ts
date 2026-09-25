@@ -90,7 +90,7 @@ import { editingId, startEditing, takeCaretFor } from "./editorController";
 import { exportOutline, DEFAULT_EXPORT_OPTIONS } from "./editor/exportText";
 import { splitProps, joinProps, isBuiltinHidden, hideAll } from "./editor/properties";
 import { setCopyIncludeSubtree, setCopyStripCollapsed } from "./copySettings";
-import { backend, SaveConflictError, type Backend } from "./backend";
+import { backend, DirectSaveFailureError, SaveConflictError, type Backend } from "./backend";
 import {
   isConflicted,
   conflicts,
@@ -3696,5 +3696,143 @@ describe("a watcher reload re-checks safety at the moment it applies", () => {
     expect(refusal).toEqual({ reason: "activation-failed", page: "Stale" });
     expect(activate).toHaveBeenCalledWith(stale.path, "replace", stale.rev);
     expect(pageByName("Stale")).toBeUndefined();
+  });
+});
+
+describe("GH #546 — page-header properties saved while the user is still typing", () => {
+  it("reconciles the store with the page header the save just wrote to disk", async () => {
+    // Page-header properties authored as the flagless properties-only first
+    // bullet: the projection folds them into pre_block (GH #198), so the file
+    // ends up carrying a preamble the STORE does not know about. That
+    // divergence is the root cause of the reporter's toast — from here on the
+    // store proposes pre_block=null, and the first keystroke that leaves the
+    // bullet transiently not properties-only ships the header property as
+    // outline content, which the disk firewall must refuse (GH #163).
+    load([blk("alias:: book")]);
+    markDirty("Test");
+    const saved: PageDto[] = [];
+    const saveSpy = vi.spyOn(backend(), "savePage").mockImplementation(async (dto) => {
+      saved.push(dto);
+      return { revision: "gh546-rev" };
+    });
+    try {
+      await flushPage("Test");
+    } finally {
+      saveSpy.mockRestore();
+    }
+
+    // Preconditions, asserted separately from the property below: the fold
+    // really did happen, so disk now carries the header as a preamble.
+    expect(saved).toHaveLength(1);
+    expect(saved[0].pre_block).toBe("alias:: book");
+    expect(saved[0].blocks).toEqual([]);
+
+    // One keystroke into a second property, whose `::` is not typed yet.
+    setRaw(doc.pages[0].roots[0], "alias:: book\ntag");
+
+    // The property this test exists to protect. The Rust data-preservation
+    // firewall refuses a DTO that empties `pre_block` while presenting a
+    // page-header property as outline content (GH #163), and that refusal
+    // reaches the user as `reason code: unknown`, is classified retryable, and
+    // after three tries becomes a red toast mid-edit. The store must therefore
+    // never propose that shape once the header is on disk as a preamble.
+    const dto = pageToDto("Test");
+    const strandsHeaderInOutline =
+      dto !== null
+      && !(dto.pre_block ?? "")
+      && JSON.stringify(dto.blocks).includes("alias:: book");
+    expect(strandsHeaderInOutline).toBe(false);
+
+    // And the edit is not stranded by deferring it: as soon as the properties
+    // are valid again the page serializes normally, header and all. Without
+    // this the bug could be "fixed" by never saving the page again.
+    setRaw(doc.pages[0].roots[0], "alias:: book\ntag:: x");
+    expect(pageToDto("Test")?.pre_block).toBe("alias:: book\ntag:: x");
+    expect(pageToDto("Test")?.blocks).toEqual([]);
+  });
+});
+
+describe("GH #535 — a save the data-preservation firewall refuses", () => {
+  it("is not retried, says so once, offers the draft, and clears when the page saves", async () => {
+    // The firewall's verdict is on the draft's content, so resending it cannot
+    // succeed. It used to arrive as `unknown`: retried at 100 and 300 ms, then
+    // a transient "after 3 tries" toast, then a page that silently never
+    // saved while every further edit repeated the cycle.
+    setToasts([]);
+    load([blk("Dosa")]);
+    let refuse = true;
+    let calls = 0;
+    const saveSpy = vi.spyOn(backend(), "savePage").mockImplementation(async () => {
+      calls++;
+      if (refuse) throw new DirectSaveFailureError("refused.data_preservation", "InvalidData");
+      return { revision: "gh535-rev" };
+    });
+    try {
+      for (const text of ["Dosa a", "Dosa ab", "Dosa abc"]) {
+        setRaw(doc.pages[0].roots[0], text);
+        markDirty("Test");
+        await flushPage("Test");
+      }
+      // Past the 400 ms autosave debounce and the old 100/300 ms retry timers.
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+
+      // One attempt per flush plus the one debounced autosave the edits armed;
+      // no timed retries of a draft the firewall has already judged.
+      expect(calls).toBe(4);
+      expect(isDirty("Test")).toBe(true); // the draft stays live in this window
+      const refused = toasts().filter((toast) => toast.message.includes("Test"));
+      expect(refused).toHaveLength(1);
+      expect(refused[0]).toMatchObject({ kind: "error", sticky: true, action: { label: "Review unsaved" } });
+      expect(refused[0].message).toContain("did not save");
+
+      refuse = false;
+      setRaw(doc.pages[0].roots[0], "Dosa abcd");
+      markDirty("Test");
+      await flushPage("Test");
+      expect(isDirty("Test")).toBe(false);
+      expect(toasts().filter((toast) => toast.message.includes("Test"))).toEqual([]);
+    } finally {
+      saveSpy.mockRestore();
+    }
+  });
+});
+
+describe("GH #540 — an empty numbered item as a page's first bullet", () => {
+  it("stays a list item, so typing its text keeps saving", async () => {
+    // The numbered-list command leaves an empty first bullet whose raw is
+    // exactly `logseq.order-list-type:: number`. Folding that into the page
+    // header made the list page properties; the text typed next then either
+    // jammed every save as `reason code: unknown` or, once the store adopted
+    // the fold (GH #546), was never saved at all.
+    load([blk("logseq.order-list-type:: number")]);
+    markDirty("Test");
+    const saved: PageDto[] = [];
+    const saveSpy = vi.spyOn(backend(), "savePage").mockImplementation(async (dto) => {
+      saved.push(dto);
+      return { revision: "gh540-rev" };
+    });
+    try {
+      await flushPage("Test");
+    } finally {
+      saveSpy.mockRestore();
+    }
+    expect(saved).toHaveLength(1);
+    expect(saved[0].pre_block ?? null).toBeNull();
+    expect(saved[0].blocks.map((b) => b.raw)).toEqual(["logseq.order-list-type:: number"]);
+
+    setRaw(doc.pages[0].roots[0], "Dosa\nlogseq.order-list-type:: number");
+    const dto = pageToDto("Test");
+    expect(dto?.pre_block ?? null).toBeNull();
+    expect(dto?.blocks.map((b) => b.raw)).toEqual(["Dosa\nlogseq.order-list-type:: number"]);
+  });
+
+  it("keeps the block-scoped property list identical to the Rust promotion rule", async () => {
+    const { readFileSync } = await import("node:fs");
+    const rust = readFileSync("crates/tine-core/src/model/page_header.rs", "utf8");
+    const body = /BLOCK_SCOPED_PROPERTY_KEYS: &\[&str\] = &\[([^\]]*)\]/.exec(rust)?.[1] ?? "";
+    const rustKeys = [...body.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+    const { BLOCK_SCOPED_PROPERTY_KEYS } = await import("./store/mutationPlans");
+    expect(rustKeys.length).toBeGreaterThan(0);
+    expect([...BLOCK_SCOPED_PROPERTY_KEYS]).toEqual(rustKeys);
   });
 });

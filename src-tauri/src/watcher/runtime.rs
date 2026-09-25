@@ -84,8 +84,9 @@ pub(super) fn graph_text_observation(
                 | EventKind::Modify(ModifyKind::Metadata(_))
                 | EventKind::Remove(RemoveKind::File)
         );
-    let rename_event = matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)));
-    let rename_has_file_witness = rename_event
+    // A rename pair whose surviving side is a file moved a file: the old name
+    // needs no index to answer for it.
+    let rename_has_file_witness = matches!(event.kind, EventKind::Modify(ModifyKind::Name(_)))
         && event
             .paths
             .iter()
@@ -109,10 +110,9 @@ pub(super) fn graph_text_observation(
         };
         match class {
             GraphTextExactFeedPathClass::Excluded => continue,
-            GraphTextExactFeedPathClass::Configuration => {
-                observation.uncertain = true;
-                break;
-            }
+            // Configuration is not graph text; its own queue decides how far a
+            // change reaches (GH #543, audit R9-05).
+            GraphTextExactFeedPathClass::Configuration => continue,
             GraphTextExactFeedPathClass::RetainedFile => {}
             _ => {
                 observation.uncertain = true;
@@ -136,23 +136,31 @@ pub(super) fn graph_text_observation(
             if is_page_file_path(path) {
                 observation.exact_paths.push(path.clone());
             }
-        } else if rename_event {
-            if !rename_has_file_witness {
-                if descendants_excluded {
-                    continue;
-                }
-                observation.uncertain = true;
-                break;
-            }
+        } else if rename_has_file_witness {
             if is_page_file_path(path) {
                 observation.exact_paths.push(path.clone());
             }
         } else {
-            if descendants_excluded {
-                continue;
+            // A rename without that witness, or a kind that did not say file or
+            // directory (such as `Remove(Any)`): the old name no longer exists
+            // to ask. `graph_text_watch_reach` answers from the current identity
+            // index, and is the same answer the batch queue uses (GH #543,
+            // audit R9-06).
+            match graph.graph_text_watch_reach(path) {
+                GraphTextWatchReach::Nothing => continue,
+                GraphTextWatchReach::File => {
+                    if is_page_file_path(path) {
+                        observation.exact_paths.push(path.clone());
+                    }
+                }
+                GraphTextWatchReach::Subtree => {
+                    if descendants_excluded {
+                        continue;
+                    }
+                    observation.uncertain = true;
+                    break;
+                }
             }
-            observation.uncertain = true;
-            break;
         }
     }
 
@@ -201,6 +209,76 @@ pub(super) struct WatchedGraph {
     /// successfully. It survives retry cycles and is acknowledged only after
     /// the matching graph batch succeeds.
     pub(super) pending_observation_epoch: Option<GraphTextExternalObservationTicket>,
+    /// A cycle skipped this graph because its storage transition lane was
+    /// held; the paths it drained are gone, so the next cycle diffs in full.
+    pub(super) transition_skipped: bool,
+}
+
+impl WatchedGraph {
+    pub(super) fn new(graph: Arc<Graph>, root: PathBuf, asset_root: Option<PathBuf>) -> Self {
+        Self::with_assets(
+            graph,
+            root,
+            asset_root.map(AssetWatchState::new).unwrap_or_default(),
+        )
+    }
+
+    fn with_assets(graph: Arc<Graph>, root: PathBuf, assets: AssetWatchState) -> Self {
+        Self {
+            assets,
+            graph,
+            root,
+            snap: HashMap::new(),
+            baseline: false,
+            last_reconcile_error: None,
+            retry: RetrySchedule::default(),
+            pending_observation_epoch: None,
+            transition_skipped: false,
+        }
+    }
+
+    /// The slot at this root handed the watcher `graph` and `asset_root`:
+    /// the one place a same-root watch takes them on (GH #543, audit R12-03).
+    ///
+    /// Which state belongs to what? The graph-text half belongs to the
+    /// graph. A reopen (a restore, a config change) that replaced the graph
+    /// read the files itself, and its owner indexes them, so the watch
+    /// starts from the new graph's own baseline. Diffing the old graph's
+    /// stamps against it re-synced every file a restore rewrote, identical
+    /// bytes included (audit R11-05). Only a drained frontier the new graph
+    /// owns carries over: it is still owed its acknowledgement.
+    ///
+    /// The asset half belongs to the asset folder, which a reopen does not
+    /// replace. Re-snapshotting it took an asset change still queued for
+    /// this cycle into the baseline, and the old image stayed on screen
+    /// (audit R13-02). It is started afresh only when the folder changes.
+    pub(super) fn take_on(&mut self, graph: Arc<Graph>, asset_root: Option<PathBuf>) {
+        let assets = if asset_root.as_ref() == self.assets.active_root() {
+            std::mem::take(&mut self.assets)
+        } else {
+            asset_root.map(AssetWatchState::new).unwrap_or_default()
+        };
+        if Arc::ptr_eq(&self.graph, &graph) {
+            self.assets = assets;
+            return;
+        }
+        let owed = self
+            .pending_observation_epoch
+            .filter(|ticket| graph.owns_graph_text_external_observation_ticket(*ticket));
+        let root = std::mem::take(&mut self.root);
+        *self = Self::with_assets(graph, root, assets);
+        self.pending_observation_epoch = owed;
+    }
+}
+
+/// Whether this cycle walks a root in full. A root that is polled, or newly
+/// watched, is walked because events for it may have been missed; but a
+/// first cycle just walked it for its baseline. Walking it again cost every
+/// newly watched graph two whole-graph stat walks (GH #543, audit R12-07).
+/// Events drained this cycle still diff, so their observation is still
+/// acknowledged.
+pub(super) fn rewalks_root(initial_cycle: bool, polled: bool, handed_over: bool) -> bool {
+    !initial_cycle && (polled || handed_over)
 }
 
 fn asset_root_for_slot(app: &tauri::AppHandle, slot: &GraphSlot) -> Option<PathBuf> {
@@ -238,35 +316,11 @@ pub(super) fn route_drained_direct_frontiers(
                     .graph
                     .owns_graph_text_external_observation_ticket(ticket)
                 {
-                    current.assets = asset_root
-                        .clone()
-                        .map(AssetWatchState::new)
-                        .unwrap_or_default();
-                    current.graph = latest_graph;
-                    current.snap.clear();
-                    current.baseline = false;
-                    current.last_reconcile_error = None;
-                    current.retry = RetrySchedule::default();
-                    current.pending_observation_epoch = None;
+                    current.take_on(latest_graph, asset_root);
                 }
             }
             _ => {
-                graphs.insert(
-                    label,
-                    WatchedGraph {
-                        assets: asset_root
-                            .clone()
-                            .map(AssetWatchState::new)
-                            .unwrap_or_default(),
-                        graph: latest_graph,
-                        root,
-                        snap: HashMap::new(),
-                        baseline: false,
-                        last_reconcile_error: None,
-                        retry: RetrySchedule::default(),
-                        pending_observation_epoch: None,
-                    },
-                );
+                graphs.insert(label, WatchedGraph::new(latest_graph, root, asset_root));
             }
         }
     }
@@ -285,7 +339,8 @@ pub(super) fn route_drained_direct_frontiers(
 ///     wakeups. Use this only when inotify misses external edits.
 ///
 /// In both modes the reconcile is identical and suppresses Tine's *own* writes
-/// via the cache comparison inside `sync_file`. A control channel (poked by
+/// by comparing each file with the revision Tine last wrote or read
+/// (`page_revision_current`, inside `sync_file`). A control channel (poked by
 /// `load_graph` on a graph switch and by `set_watch_mode`) lets the thread
 /// re-target or switch mechanism at once, without polling for those either.
 pub(crate) fn start_watcher(app: tauri::AppHandle) {
@@ -313,8 +368,11 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
         // Last surfaced `watch()` failure per graph root, so a root that keeps
         // failing reports once instead of every cycle.
         let mut watch_failures: HashMap<PathBuf, String> = HashMap::new();
+        // Last surfaced failure to create the OS watcher, so a retry loop
+        // reports once.
+        let mut watcher_failure: Option<String> = None;
         loop {
-            let inotify = watch_mode(&app) != "poll";
+            let wants_inotify = watch_mode(&app) != "poll";
             let entries = app.state::<AppState>().graphs.read().unwrap().entries();
             let live: HashSet<String> = entries.iter().map(|(label, _)| label.clone()).collect();
             query_images.retain(|label, _| live.contains(label));
@@ -339,31 +397,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         }) {
                             current.pending_observation_epoch = None;
                         }
-                        current.graph = slot_graph;
-                        if asset_root.as_ref() != current.assets.active_root() {
-                            current.assets = asset_root
-                                .clone()
-                                .map(AssetWatchState::new)
-                                .unwrap_or_default();
-                        }
+                        current.take_on(slot_graph, asset_root);
                     }
                     _ => {
-                        graphs.insert(
-                            label,
-                            WatchedGraph {
-                                assets: asset_root
-                                    .clone()
-                                    .map(AssetWatchState::new)
-                                    .unwrap_or_default(),
-                                graph: slot_graph,
-                                root,
-                                snap: HashMap::new(),
-                                baseline: false,
-                                last_reconcile_error: None,
-                                retry: RetrySchedule::default(),
-                                pending_observation_epoch: None,
-                            },
-                        );
+                        graphs.insert(label, WatchedGraph::new(slot_graph, root, asset_root));
                     }
                 }
             }
@@ -394,13 +431,13 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
 
             // Bring the OS watcher in line with the current mode + graph roots.
             let mut newly_watched = HashSet::new();
-            if inotify {
+            if wants_inotify {
                 if watcher.is_none() {
                     let txc = tx.clone();
                     let pendingc = pending.clone();
                     let appc = app.clone();
                     let rootsc = watched_roots.clone();
-                    watcher =
+                    let created =
                         notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                             // A repository's own churn is not a graph change.
                             // Dropped here, before the app-state lock, the graph
@@ -425,8 +462,31 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                                 }
                             }
                             let _ = txc.send(());
-                        })
-                        .ok();
+                        });
+                    watcher = match created {
+                        Ok(created) => {
+                            watcher_failure = None;
+                            Some(created)
+                        }
+                        Err(error) => {
+                            // No OS watcher (for example at the inotify
+                            // instance limit): this cycle polls instead, and
+                            // the next one tries again. Swallowing the error
+                            // left every external change, and every graph
+                            // configuration change, unseen for the session
+                            // (GH #543, audit R10-07).
+                            let message = format!(
+                                "file watching is unavailable ({error}); checking for changes by polling"
+                            );
+                            if watcher_failure.as_ref() != Some(&message) {
+                                for (label, _) in watch_labels.iter() {
+                                    let _ = app.emit_to(label, "graph-watch-error", &message);
+                                }
+                                watcher_failure = Some(message);
+                            }
+                            None
+                        }
+                    };
                     watched.clear();
                 }
                 if let Some(w) = watcher.as_mut() {
@@ -469,6 +529,9 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 watched.clear();
                 watch_failures.clear();
             }
+            // Events come from the OS watcher only while there is one;
+            // otherwise this cycle is a poll, whatever the setting says.
+            let inotify = wants_inotify && watcher.is_some();
             watch_failures.retain(|dir, _| desired.contains(dir));
 
             // --- reconcile (identical in both modes) ---
@@ -567,17 +630,30 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
             // text. Observe only their metadata here and emit one
             // assets-relative cache-invalidation batch; this lane never calls
             // Graph reconciliation.
+            // A root the OS refused to watch sends no events, so it is polled
+            // like poll mode until a watch succeeds, and a root that becomes
+            // watched is diffed once against what it held while unwatched.
+            // Both only emitted an error before: nothing in or under it,
+            // configuration included, was seen until the next rescan (GH
+            // #543, audit R11-04).
+            let unwatched =
+                |root: &Path| !inotify || !watched.iter().any(|dir| root.starts_with(dir));
+            let handed_over = |root: &Path| newly_watched.iter().any(|dir| root.starts_with(dir));
+            for (label, graph) in graphs.iter() {
+                if unwatched(&graph.root) || handed_over(&graph.root) {
+                    config_recheck.insert(label.clone());
+                }
+            }
             for (label, graph) in graphs.iter_mut() {
-                let watch_handoff = newly_watched
-                    .iter()
-                    .any(|root| graph.assets.root.starts_with(root));
+                let assets_handed_over = handed_over(&graph.assets.root);
+                let assets_polled = unwatched(&graph.assets.root);
                 let changed = reconcile_asset_observation(
                     label,
                     &mut graph.assets,
                     &asset_paths,
                     &asset_full_paths,
-                    event_need_full || notify_error || watch_handoff,
-                    !inotify,
+                    event_need_full || notify_error || assets_handed_over,
+                    assets_polled,
                 );
                 if !changed.is_empty() {
                     if crate::debug::debug_enabled() {
@@ -590,6 +666,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                         app.emit_to(label, "asset-changed", AssetChangedBatch { paths: changed });
                 }
             }
+            let mut transition_deferred = false;
             for (label, graph) in graphs.iter_mut() {
                 if let Some(epoch) = drained_observation_epochs.get(&graph.root).copied() {
                     if graph
@@ -613,21 +690,51 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     graph.baseline = true;
                 }
                 let retry_due = graph.retry.take_due(Instant::now());
-                let owned = pending_for_graph(&paths, &graph.graph);
-                let full_owned = full_scan_owner_for_graph(&full_paths, &graph.graph);
-                let need_full = event_need_full || !inotify || !full_owned.is_empty() || retry_due;
+                let (full_owned, exact_owned) =
+                    unclassified_paths_for_graph(&full_paths, &graph.graph);
+                let mut owned = pending_for_graph(&paths, &graph.graph);
+                owned.extend(exact_owned);
+                let polled = unwatched(&graph.root);
+                let rewalk = rewalks_root(initial_cycle, polled, handed_over(&graph.root));
+                let need_full = event_need_full
+                    || rewalk
+                    || !full_owned.is_empty()
+                    || retry_due
+                    || graph.transition_skipped;
+                // Nothing is reconciled into a graph while a load or reopen
+                // holds its root's transition lane: a restore rewrites the
+                // tree under it, and lowering those files into the graph it
+                // is about to retire doubled the work and kept the retiring
+                // projection worker busy past its detach bound (GH #543,
+                // audit R10-13). Never wait for the lane here -- that would
+                // stall every graph behind one -- carry a full diff instead.
+                let lane = app
+                    .state::<AppState>()
+                    .storage_supervisor
+                    .transition_lane(&graph.root);
+                let _transition = if need_full || !owned.is_empty() {
+                    match lane.try_lock() {
+                        Ok(guard) => Some(guard),
+                        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                            Some(poisoned.into_inner())
+                        }
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            graph.transition_skipped = true;
+                            transition_deferred = true;
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                graph.transition_skipped = false;
                 let mut cycle_failed = false;
                 let mut attempted = false;
                 if need_full || !owned.is_empty() {
                     attempted = true;
                     let reconcile_started = Instant::now();
-                    let (changes, conflicts_dirty, used_full, errors) = reconcile_pending(
-                        &graph.graph,
-                        &mut graph.snap,
-                        &owned,
-                        need_full,
-                        !inotify,
-                    );
+                    let (changes, conflicts_dirty, used_full, errors) =
+                        reconcile_pending(&graph.graph, &mut graph.snap, &owned, need_full, polled);
                     let pages = changes.len();
                     if emit_as_bulk(pages) {
                         // One epoch, one notification: the frontend answers with
@@ -648,7 +755,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     if pages > 0 || !errors.is_empty() {
                         record_latency_receipt(latency_receipt(
                             label,
-                            inotify,
+                            !polled,
                             pages,
                             owned.len(),
                             // The branch actually taken — a burst-escalated
@@ -671,6 +778,7 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                     if conflicts_dirty {
                         let _ = app.emit_to(label, "conflicts-changed", ());
                     }
+                    super::announce_unreadable_pages(&app, label, &graph.graph);
                 }
                 if cycle_failed {
                     graph.retry.failed(Instant::now());
@@ -698,8 +806,10 @@ pub(crate) fn start_watcher(app: tauri::AppHandle) {
                 &config_paths,
                 event_need_full || notify_error || !inotify,
                 &mut config_recheck,
-            ) {
-                // A deferral means the lane was busy, not that the change went
+            ) || transition_deferred
+            {
+                // A deferral (of a configuration change or of a graph's
+                // reconcile) means the lane was busy, not that the change went
                 // away. Wake again; the 200 ms coalescing sleep below bounds
                 // how fast this can retry while a transition holds the lane.
                 let _ = tx.send(());

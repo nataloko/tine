@@ -305,15 +305,17 @@ describe("I-9/I-11 typed backend error boundary", () => {
     expect(commands).not.toMatch(/map_err\(\|\w+\| \w+\.to_string\(\)\)/);
     expect(state).not.toMatch(/map_err\(\|\w+\| \w+\.to_string\(\)\)/);
     expect(contract).toContain("## `CommandError` boundary");
-    expect(contract).toContain("The syntactic census is 47 production sites");
+    expect(contract).toContain("The syntactic census is 46 production sites");
 
     const proseSites = (withoutRustTestModules(commands).match(/CommandError::prose/g) ?? []).length
       + (withoutRustTestModules(state).match(/CommandError::prose/g) ?? []).length;
     // 47 after the Managed Storage removal (2026-09-15): the managed command
     // surface and its wrong-reply arms are gone; the one site added since is
     // query_publication_error's pass-through of the core's composed refusal. The ratchet retires legacy
-    // untyped WORDING; see docs/contracts/typed-errors.md.
-    expect(proseSites).toBe(47);
+    // untyped WORDING; see docs/contracts/typed-errors.md. 46 since GH #490
+    // moved the capsule review into core: a capsule with no live observation
+    // is now reviewed durably, so its prose refusal is gone.
+    expect(proseSites).toBe(46);
 
     const phaseB = parity.slice(
       parity.indexOf("const PHASE_B_COMMANDS"),
@@ -336,9 +338,9 @@ describe("I-9/I-11 typed backend error boundary", () => {
       vocab.indexOf("impl DirectSaveFailureCode"),
       vocab.indexOf("/// Typed inner error", vocab.indexOf("impl DirectSaveFailureCode")),
     );
-    const directCodes = [...directImpl.matchAll(/"((?:precheck|identity|conflict|conflict_retry|conflict_authority)\.[a-z_]+|unknown)"/g)]
+    const directCodes = [...directImpl.matchAll(/"((?:precheck|identity|conflict|conflict_retry|conflict_authority|refused)\.[a-z_]+|unknown)"/g)]
       .map((match) => match[1]);
-    expect(directCodes).toHaveLength(35);
+    expect(directCodes).toHaveLength(36);
 
     for (const code of directCodes) expect(contract).toContain(code);
 

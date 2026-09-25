@@ -243,7 +243,7 @@
       "coverage": {
         "tests": [
           "scripts/e2e-external-assets.mjs",
-          "src-tauri/src/watcher.rs::external_asset_alias_events_refresh_replacement_and_deletion"
+          "src-tauri/src/watcher/tests.rs::external_asset_alias_events_refresh_replacement_and_deletion"
         ],
         "scenario": "external-assets-lexical-watch-alias",
         "failBefore": "proven"
@@ -712,7 +712,7 @@
       "coverage": {
         "tests": [
           "crates/tine-core/tests/graph.rs::resolve_sync_conflict_merges_and_trashes",
-          "src-tauri/src/watcher.rs::unset_watch_mode_prefers_native_events_on_every_platform",
+          "src-tauri/src/watcher/tests.rs::unset_watch_mode_prefers_native_events_on_every_platform",
           "src/components/ConflictResolution.test.tsx",
           "src/components/ConflictQueueBadge.test.tsx",
           "scripts/e2e-concord-sync-copy.mjs"
@@ -11363,8 +11363,65 @@
       "notes": "Real touch Chromium reproduces pointerup dispatch, focused-editor bridge handoff, toolbar replacement, and duplicate synthesized click on eb1f83d3. Scrolled strip loses its position; packet preserves toolbar ownership and consumes only the matching pointer click. Pass-after: six actual touch structural cases, rapid independent taps and horizontal swipe pass; same DOM and scroll retained. Native Android/iOS acceptance pending."
     },
     {
+      "id": "UI-CONFLICT-OVERVIEW-ROUTE-536",
+      "title": "The N conflicts badge opens one overview of every conflicted page, with block counts, that stays usable while pages are resolved",
+      "family": "concord-conflict-queue",
+      "sources": {
+        "issues": [
+          536
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/ConflictQueueBadge.test.tsx::opens the conflict overview, whatever the count",
+          "src/components/ConflictOverview.test.tsx::lists every conflicted page by source with its block count, absent shown as —",
+          "src/components/ConflictOverview.test.tsx::opens the exact conflicted file, or the right sidebar on shift-click",
+          "src/components/ConflictOverview.test.tsx::discards a sync copy by its own file, after confirmation",
+          "src/components/ConflictOverview.test.tsx::stays a valid page when nothing is left",
+          "src/components/ConflictOverview.test.tsx::drops a row as soon as the queue re-derives without it",
+          "src/components/Settings.conflictInventory.test.tsx::still points there for a stray copy whose page is gone",
+          "src/session.test.ts::restores a conflict overview tab instead of dropping it (GH #536)"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "Source: EllisMorrow on discussion #534, design in #536. Clicking the badge walked to the next conflicted page, so after a large sync or branch switch there was no view of what was left. It now opens a built-in `conflicts` route rendered from the live queue (never a graph file): rows grouped by source, the side labels, `k blocks` or — when not computed, Open (exact file; shift/middle-click to the right sidebar so the overview stays visible), and Discard copy for sync copies, including a copy whose page is gone. The Settings inventory panels moved there; Settings keeps a pointer. The page-to-page cursor (advanceConflictCursor) is removed; the in-page up/down walk between blocks is unchanged. Duplicate journal days keep their Settings panel. No cross-page bulk resolution, by design. Fail-before: the badge test fails against the previous Sidebar (it navigated to a page instead). Checked visually with scripts/shot-conflict-queue.mjs at desktop and phone widths."
+    },
+    {
+      "id": "UI-LINK-AUTOCOMPLETE-ALIAS-OWNER-558",
+      "title": "Typing a page alias after [[ offers it and says which page it belongs to",
+      "family": "link-autocomplete",
+      "sources": {
+        "issues": [
+          558,
+          482
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/Block.referenceAuthoring.test.tsx::labels an alias suggestion with the page it belongs to and inserts the alias (GH #558, GH #482)",
+          "crates/tine-core/src/model_tests.rs::quick_switch_offers_each_matching_authored_alias_before_and_after_readiness"
+        ],
+        "scenario": "link-autocomplete.alias-row-names-owner",
+        "failBefore": "proven"
+      },
+      "notes": "GH #558 (Windows, v0.6.982) and GH #482 (v0.6.981): typing a page alias after [[ did not offer that page. Membership was fixed on master by 5435566b: quick_switch returns each matching authored alias as its own row on its owner's file, before and after the projection is ready. Following Brikas's comment on #558, the alias text is inserted as written (a link that resolves to the owner) rather than being swapped for the canonical title. This change adds the missing indication: an alias row carries an 'alias of <page>' label, taken from the per-graph alias map, where an existing file wins a colliding name, so an ordinary page never gets the label. Fail-before: the label test fails without the change (no .ac-sub). Not verified natively on Windows."
+    },
+    {
       "id": "UI-PAGE-RENAME-FLUSH-DIAGNOSTIC-535",
-      "title": "A refused page rename names pending or conflicted pages without inventing a conflict",
+      "title": "One page that cannot save no longer blocks every rename in the graph",
       "family": "page-rename",
       "sources": {
         "issues": [
@@ -11379,12 +11436,17 @@
       "status": "covered",
       "coverage": {
         "tests": [
-          "src/components/Page.test.tsx"
+          "src/components/Page.test.tsx::a stuck page blocks a title rename only when the rename would touch it: %s (GH #535)",
+          "src/components/Page.test.tsx::refreshes only the pages a rename rewrote, and keeps unsaved edits (GH #535)",
+          "src/graph.test.tsx::refuses a merge while any page is unsaved, because a merge still reloads every page (GH #535)",
+          "crates/tine-core/src/model_rename_refresh_tests.rs::a_rename_reports_every_page_it_moved_or_rewrote_and_nothing_else",
+          "crates/tine-core/src/model_rename_refresh_tests.rs::a_rename_refuses_to_rewrite_a_file_with_unsaved_edits_and_changes_nothing",
+          "crates/tine-core/src/model_rename_refresh_tests.rs::a_rename_retires_only_the_moved_editor_and_a_stale_referrer_conflicts_reviewably"
         ],
         "scenario": "page-rename.actual-flush-blocker-preserves-drafts",
         "failBefore": "proven"
       },
-      "notes": "Partial GH #535: actual title DOM submission through real persistence with a typed non-conflict save failure and an unrelated conflict. Rename remains refused and pending body edits remain intact; message names the actual pending/conflicted page, caps listed names at three, and never directs the user to absent conflict review UI. Windows native save refusal and reporter-specific root cause remain unverified. Context-menu caller uses the identical read-only diagnostic; ContextMenu render suite passes."
+      "notes": "GH #535. A rename required every page in the graph to save first (flushAll's verdict is graph-wide) because the post-rename refresh reset the whole working set and the backend burned every editor activation; so one page whose save was refused - the reporter's refusal is unexplained and the test replays it on EVERY attempt - blocked every rename for the session. The rename now reports the pages it moved or rewrote (RenameOutcome.touched); the frontend forgets moved pages under their old names, reloads clean rewritten pages, and keeps every other page including unsaved edits; the backend retires only moved pages' activations and revokes conflict authority only for touched paths, so a referrer edited during the rename conflicts reviewably. A stuck page still blocks, and is named, when it is the renamed page or a namespace child, or when its unsaved text mentions the old name (the rename could not update a reference that exists only in memory); otherwise its path is passed as unsavedPaths and the backend refuses to rewrite it. Merge still resets everything, so it still needs every page saved. Fail-before: under the old all-pages rule the unrelated-page cases refuse the rename; under the old full reset the stuck page's draft is lost. The earlier attempt a9cac72c (reverted in ab42a9ed) only changed the message: its test mocked the next save to succeed. Not addressed: a page that meets an epoch-less save refusal is itself still stuck without a review banner; Windows native behaviour and the reporter's root cause remain unverified."
     },
     {
       "id": "UI-EMBED-INPUT-OWNERSHIP-20260913",
@@ -11657,7 +11719,7 @@
         "scenario": null,
         "failBefore": "reconstructed"
       },
-      "notes": "Blocking core operation: search is unusable, and the reporter rolled back to v0.6.982 to keep working. User outcome: after typing a query in Ctrl+K or the search tab on a large graph (reporter: fine below roughly 10,000 pages, broken above; Windows 11, though other Windows 11 users differ), the panel stays on \u201cIndexing \u2014 waiting for search to be ready\u2026\u201d for at least 20 minutes and never returns rows, while Tine keeps consuming CPU and disk when idle. Accepted 2026-09-16 from GH #543. MEASURED here 2026-09-16; evidence tine-agents/evidence/gh-543/measurements.md. Two fixtures, both 10,365 files (10,000 pages + 365 journals). CORRECTION to this row's first version: they do NOT differ only in per-file size - the fat pages carry far more bullets, so block count moved too (thin 40,365 blocks / 1.25 MB of block text; fat 605,840 blocks / 56.7 MB, about 94 B per block). Time-to-projection-ready 20.8 s thin and 160-163 s fat over three runs. After ready, five successive searches took 11.5-15.6 s each on fat versus 0.34 s on thin, flat across five different tokens, so that is steady-state per-query cost and not a one-time index build. Normalized, the cost is essentially PER BLOCK RANKED: about 8.4 us/block thin and 20 us/block fat, so the 15x block growth explains most of the 35x slowdown, with a smaller per-byte term. TWO INDEPENDENT DEFECTS. (1) Time to first searchable state is about 2 ms per file plus a per-byte term - 10,365 files alone account for the 20.8 s case - so a 10k-page graph breaches the recorded 10 s rebuild ceiling before any content is considered; until readiness every query is a genuine NotReady(indexing), which is the reporter's literal symptom. (2) After ready, each search ranks EVERY block in the graph: crates/tine-core/src/query/friendly.rs:895 (the ((-picker route) and friendly.rs:560 (the Ctrl+K and search-tab content branch, which friendly_plan pushes alongside a Pages branch) build \"WITH ranked AS MATERIALIZED (... tine_query_rank(?1, bt.query_visible) ... FROM blocks b LEFT JOIN block_text bt ...)\" with NO text predicate inside the CTE and filters on the computed rank afterwards, so cost scales with total graph text. The two surfaces differ in whether an index COULD help: the ((-picker's QueryPlan::block_search_literal uses TextMatchMode::Fuzzy (OG ordered-subsequence), which no substring index can serve, whereas Ctrl+K's Blocks branch uses expr_from_matcher over TextField::VisibleContent with ordinary contains/phrase/regex semantics, for which the existing trigram bound WOULD apply - but the friendly route never consults it, because query/friendly.rs contains no FTS reference at all and never reads fts_ready. REFUTED BY MEASUREMENT - do not re-derive: the FTS is COMPLETE and Ready (search_fts_build phase=1, search_substring_fts=50730=pages(10365)+blocks(40365), outbox=0), so this is not an unbuilt index, and advance_search_index_build is a deferred-mode backfill this projection does not use because apply_graph_projection_rows -> reconcile_fts_rows maintains rows inline. Also refuted: warm-stream abandon/needs_full restart loops (needs_full=false and no generation drift in any run); and Busy capacity exhaustion from typing (both call sites pass a lane - quick-switch, quick-switch:current-page, block-picker - and run_graph_search_latest_displayed bumps a per-lane epoch so superseded jobs self-cancel via check_lane). STILL UNREPRODUCED: the reporter's \u201cnever returns\u201d wording; what is measured is a severe slowdown proportional to graph size in both phases. Separately outstanding regardless of cause: both call sites (src/components/QuickSwitcher.tsx:136, src/components/Block.tsx:1602) discard the error's own QueryReadinessReason and hardcode the word Indexing, so busy/pending_edits/recovering all read as indexing; and src/queryReadiness.ts retries with no total bound. FIXED (defect 2 ONLY) at ff51d119 on batch/search-readiness-543: the block rank program now reads the projection's stored fold (blocks.query_visible_folded) through the existing framed_pair_sql/bind_pair seam instead of recomputing canonical_fold for every candidate row. Post-fix A/B, same fat fixture and same invocation: pooled pre-fix median 11.833 s per search (10 samples) -> 6.190 s = 1.91x, a 47.7% reduction, and the spread collapsed from 4.04 s to 0.20 s because 605,840 per-search String allocations are gone. MY OWN PROJECTION WAS WRONG: I predicted about 2.1 s (5.6x) from the 72-77% fold share and measured 1.9x; the UNMEASURED hypothesis is that SQLite now builds a <len>:<left><right> string per row and bind_pair splits it per row, adding back cost the isolated Rust probe underestimated. Absolute seconds in BOTH arms are debug profile and are not user-facing; only the ratio transfers. Time-to-ready is unchanged (158.7 s post vs 160.4 and 162.6 pre), so defect (1) is untouched BY MY CHANGE. RECONCILED 2026-09-16 on merging origin/master: defect (1)'s per-launch half was fixed CONCURRENTLY by another session at f001020c (+4074ed6e), which stops the Stale repair erasing an intact projection - an ordinary startup query (journal feed, backlinks, Ctrl-K) used to arrive before the background warm, be reported Stale, latch pending.rebuild, and make the worker reset() away every source stamp, so every launch re-lowered every page. Their measured evidence, 32,250-file corpus, real app: three unchanged restarts took 97/102/142 s to search-ready and rewrote a 524 MB WAL each time; after, the same reopen reached ready in 14 s with the database file untouched (row REG-QUERY-PROJECTION-REUSE-543 in tests/regressions/non-ui.json). Consequence for MY numbers: every one of my runs was effectively a FIRST build, because the base erased the index each time, so 158-163 s is a first-build figure and not a per-launch one. Their change also makes Working(Reason::Recovering) genuinely reachable at startup (a repair now publishes an in-flight marker so a racing query waits instead of reporting a terminal read failure), which gives the rebuild wording below a live trigger instead of a purely latent one. coverage.tests stays EMPTY deliberately: the new producer guard (crates/tine-core/src/query/sql_gates_tests.rs, the_projection_stores_the_exact_fold_of_every_visible_text, necessity proven by corrupting one stored fold and observing red) pins the equality the fix RELIES ON but does not detect the user-visible harm, and nothing yet pins large-graph search latency. Status is therefore fixing, not covered: at 6.2 s per search after a 159 s wait the reported outcome is still unusable. Also corrected: the hardcoded Indexing wording is a REAL but SEPARATE latent defect, not part of this symptom - the measured state genuinely is indexing for 159 s here, so Indexing is the correct word for the reporter's case. Remaining, carded not absorbed: defect (1)'s FIRST-BUILD half - building the index once is still about 2 ms per file plus a per-byte term, so 10,365 files alone breach the recorded 10 s rebuild ceiling before any content is weighed; master fixed paying that cost on EVERY launch, not the cost of paying it once; and candidate narrowing via the existing trigram bound for the contains/phrase surfaces, which friendly.rs cannot use today because it never reads fts_ready. Status stays fixing rather than covered even with both fixes in: coverage.tests is empty here by design, nothing pins large-graph search latency or the UI outcome, and I have NOT re-measured time-to-ready or per-search cost on the merged head - the 14 s figure above is another session's measurement on a different corpus, and inheriting it as proof of this row's user outcome would be exactly the stale-evidence move the currency rule forbids."
+      "notes": "Blocking core operation: search is unusable, and the reporter rolled back to v0.6.982 to keep working. User outcome: after typing a query in Ctrl+K or the search tab on a large graph (reporter: fine below roughly 10,000 pages, broken above; Windows 11, though other Windows 11 users differ), the panel stays on \u201cIndexing \u2014 waiting for search to be ready\u2026\u201d for at least 20 minutes and never returns rows, while Tine keeps consuming CPU and disk when idle. Accepted 2026-09-16 from GH #543. MEASURED here 2026-09-16; evidence tine-agents/evidence/gh-543/measurements.md. Two fixtures, both 10,365 files (10,000 pages + 365 journals). CORRECTION to this row's first version: they do NOT differ only in per-file size - the fat pages carry far more bullets, so block count moved too (thin 40,365 blocks / 1.25 MB of block text; fat 605,840 blocks / 56.7 MB, about 94 B per block). Time-to-projection-ready 20.8 s thin and 160-163 s fat over three runs. After ready, five successive searches took 11.5-15.6 s each on fat versus 0.34 s on thin, flat across five different tokens, so that is steady-state per-query cost and not a one-time index build. Normalized, the cost is essentially PER BLOCK RANKED: about 8.4 us/block thin and 20 us/block fat, so the 15x block growth explains most of the 35x slowdown, with a smaller per-byte term. TWO INDEPENDENT DEFECTS. (1) Time to first searchable state is about 2 ms per file plus a per-byte term - 10,365 files alone account for the 20.8 s case - so a 10k-page graph breaches the recorded 10 s rebuild ceiling before any content is considered; until readiness every query is a genuine NotReady(indexing), which is the reporter's literal symptom. (2) After ready, each search ranks EVERY block in the graph: crates/tine-core/src/query/friendly.rs:895 (the ((-picker route) and friendly.rs:560 (the Ctrl+K and search-tab content branch, which friendly_plan pushes alongside a Pages branch) build \"WITH ranked AS MATERIALIZED (... tine_query_rank(?1, bt.query_visible) ... FROM blocks b LEFT JOIN block_text bt ...)\" with NO text predicate inside the CTE and filters on the computed rank afterwards, so cost scales with total graph text. The two surfaces differ in whether an index COULD help: the ((-picker's QueryPlan::block_search_literal uses TextMatchMode::Fuzzy (OG ordered-subsequence), which no substring index can serve, whereas Ctrl+K's Blocks branch uses expr_from_matcher over TextField::VisibleContent with ordinary contains/phrase/regex semantics, for which the existing trigram bound WOULD apply - but the friendly route never consults it, because query/friendly.rs contains no FTS reference at all and never reads fts_ready. REFUTED BY MEASUREMENT - do not re-derive: the FTS is COMPLETE and Ready (search_fts_build phase=1, search_substring_fts=50730=pages(10365)+blocks(40365), outbox=0), so this is not an unbuilt index, and advance_search_index_build is a deferred-mode backfill this projection does not use because apply_graph_projection_rows -> reconcile_fts_rows maintains rows inline. Also refuted: warm-stream abandon/needs_full restart loops (needs_full=false and no generation drift in any run); and Busy capacity exhaustion from typing (both call sites pass a lane - quick-switch, quick-switch:current-page, block-picker - and run_graph_search_latest_displayed bumps a per-lane epoch so superseded jobs self-cancel via check_lane). STILL UNREPRODUCED: the reporter's \u201cnever returns\u201d wording; what is measured is a severe slowdown proportional to graph size in both phases. Separately outstanding regardless of cause: both call sites (src/components/QuickSwitcher.tsx:136, src/components/Block.tsx:1602) discard the error's own QueryReadinessReason and hardcode the word Indexing, so busy/pending_edits/recovering all read as indexing; and src/queryReadiness.ts retries with no total bound. FIXED (defect 2 ONLY) at ff51d119 on batch/search-readiness-543: the block rank program now reads the projection's stored fold (blocks.query_visible_folded) through the existing framed_pair_sql/bind_pair seam instead of recomputing canonical_fold for every candidate row. Post-fix A/B, same fat fixture and same invocation: pooled pre-fix median 11.833 s per search (10 samples) -> 6.190 s = 1.91x, a 47.7% reduction, and the spread collapsed from 4.04 s to 0.20 s because 605,840 per-search String allocations are gone. MY OWN PROJECTION WAS WRONG: I predicted about 2.1 s (5.6x) from the 72-77% fold share and measured 1.9x; the UNMEASURED hypothesis is that SQLite now builds a <len>:<left><right> string per row and bind_pair splits it per row, adding back cost the isolated Rust probe underestimated. Absolute seconds in BOTH arms are debug profile and are not user-facing; only the ratio transfers. Time-to-ready is unchanged (158.7 s post vs 160.4 and 162.6 pre), so defect (1) is untouched BY MY CHANGE. RECONCILED 2026-09-16 on merging origin/master: defect (1)'s per-launch half was fixed CONCURRENTLY by another session at f001020c (+4074ed6e), which stops the Stale repair erasing an intact projection - an ordinary startup query (journal feed, backlinks, Ctrl-K) used to arrive before the background warm, be reported Stale, latch pending.rebuild, and make the worker reset() away every source stamp, so every launch re-lowered every page. Their measured evidence, 32,250-file corpus, real app: three unchanged restarts took 97/102/142 s to search-ready and rewrote a 524 MB WAL each time; after, the same reopen reached ready in 14 s with the database file untouched (row REG-QUERY-PROJECTION-REUSE-543 in tests/regressions/non-ui.json). Consequence for MY numbers: every one of my runs was effectively a FIRST build, because the base erased the index each time, so 158-163 s is a first-build figure and not a per-launch one. Their change also makes Working(Reason::Recovering) genuinely reachable at startup (a repair now publishes an in-flight marker so a racing query waits instead of reporting a terminal read failure), which gives the rebuild wording below a live trigger instead of a purely latent one. coverage.tests stays EMPTY deliberately: the new producer guard (crates/tine-core/src/query/sql_gates_tests.rs, the_projection_stores_the_exact_fold_of_every_visible_text, necessity proven by corrupting one stored fold and observing red) pins the equality the fix RELIES ON but does not detect the user-visible harm, and nothing yet pins large-graph search latency. Status is therefore fixing, not covered: at 6.2 s per search after a 159 s wait the reported outcome is still unusable. Also corrected: the hardcoded Indexing wording is a REAL but SEPARATE latent defect, not part of this symptom - the measured state genuinely is indexing for 159 s here, so Indexing is the correct word for the reporter's case. Remaining, carded not absorbed: defect (1)'s FIRST-BUILD half - building the index once is still about 2 ms per file plus a per-byte term, so 10,365 files alone breach the recorded 10 s rebuild ceiling before any content is weighed; master fixed paying that cost on EVERY launch, not the cost of paying it once; and candidate narrowing via the existing trigram bound for the contains/phrase surfaces, which friendly.rs cannot use today because it never reads fts_ready. Status stays fixing rather than covered even with both fixes in: coverage.tests is empty here by design, nothing pins large-graph search latency or the UI outcome, and I have NOT re-measured time-to-ready or per-search cost on the merged head - the 14 s figure above is another session's measurement on a different corpus, and inheriting it as proof of this row's user outcome would be exactly the stale-evidence move the currency rule forbids. UPDATE 2026-09-18 (batch/gh543-convergence). CORRECTION to the refutation above: the probe that recorded no warm-stream abandon/needs_full restart loop ran on a fixture with no concurrent save or watcher traffic, so no generation drift ever occurred. It refuted drift HAPPENING in that run, not the loop's cost when it does. MEASURED here: one save racing the warm stream costs a complete re-read of every page file's bytes, because the retry re-runs the whole inventory validation from the top (crates/tine-core/src/model/page_cache.rs, warm_cache_cancellable, WARM_DRIFT_RETRIES = 24). Fail-before test a_drift_retry_does_not_re_read_the_whole_graph_inventory reports 266 file reads for 133 pages across 1 drift, exactly two full passes. NOT fixed here: skipping unchanged files on a retry needs drift to name its changed paths across six cache_gen bump sites including the save path, so it is carded, not absorbed. SEPARATE DEFECT FIXED HERE: DirectProjection::index_progress tested only the projection's pending QUEUE, while progress_at already counts warms_in_flight, so the two disagreed for the whole of the warm's inventory read - the longest phase of a large cold build, and the phase every drift retry re-enters. The switcher's Indexing N of M pages line therefore vanished while the search below it still said Indexing - waiting for search to be ready, and QuickSwitcher.tsx reads that non-null to null transition as the build finished and re-runs the query, so every retry fired a spurious search at a machine already saturated by the rebuild the user is waiting for. index_progress now uses the same in-flight predicate as progress_at, and reports a total of 0 while the inventory read is still counting the graph; the switcher renders that as Indexing - results may be incomplete rather than Indexing 0 of 0 pages. Fail-before evidence: the new Rust test reports warm=false warm_stream=None order=None during the read, and the render test reports Indexing 0 of 0 pages. THREE frontend consumer defects previously suspected on this row did NOT survive checking and were not patched: list_pages never returns NotReady (it falls back to a whole-graph parse), quick_switch is walk-backed and never returns NotReady, and waitForWarmCache's unbounded wait requires block_ref_counts to fail with the graph epoch unchanged, for which no concrete failing input was found. coverage.tests stays empty deliberately: the two new tests pin a contributing defect, not this row's user outcome."
     },
     {
       "id": "UI-PROPS-ARBITRARY-EDIT-164",
@@ -11837,6 +11899,99 @@
         "failBefore": "proven"
       },
       "notes": "The other half of UI-REGION-FAILURE-BOUNDARY-001. The boundary catches the throw; this row is about the throw happening at all. Reading a Solid resource is how this app throws into render: read() (solid-js 1.9.13, dist/solid.js:318-322) does `if (err !== undefined && !pr) throw err`, and the `latest` getter (:390-397) does the same - so `hljs()`, `katex()`, `preview()`, `contentDays()`, `icons()` on a rejected fetch threw, and runUpdates discarded every effect batched with it. The finding that shaped the fix: nearly every one of these sites had ALREADY written what to do without a value - escaped plain text for un-highlighted code, the raw TeX for an un-typeset formula, `?? {}`, `?? []` - and not one of those branches could ever run, because the read threw first. So the fix is behaviour-preserving on the happy path: readOr/readLatestOr (src/resourceRead.ts) consult resource.error, which never throws, and hand back the fallback the site already had; 42 reads across 21 files. What this row covers: a failed background fetch costs only the value it was fetching, and a panel whose emptiness would MISINFORM says so instead - ResourceFailure (src/components/ResourceFailure.tsx) keeps the panel's heading and controls and shows 'Couldn't load <what>' with a Retry where refetching is possible, in the sidebar page list and in Block References. Linked and Unlinked References are NOT in that set and do not need to be: createReferenceFetcher (src/lib/referenceFetch.ts) catches its own failures into loadError and already renders a role=alert row, so those resources never reject. Deliberately NOT a boundary per panel: a boundary costs the panel's whole subtree and its state, and a panel that knows its own resource failed can keep its place. Fail-before PROVEN by a control arm kept permanently in src/resourceRead.test.tsx: a settled-rejected resource throws on both `resource()` and `resource.latest`, and the bare render leaves its healthy sibling unmounted where the readOr render shows both. Recurrence is prevented by shape plus a ratchet: src/resourceReads.guard.test.ts walks the TSX AST of every non-test file in src/, scopes each binding to its own function (Page.tsx has a resource named `groups` AND a parameter named `groups`), and fails on any call of a resource binding or any read of a non-safe property - `.latest` is explicitly not safe. It carries two self-checks because an earlier version parsed the file twice and compared scope nodes by identity, which silently made the whole scan vacuous. Evidence layer: render/unit. Not driven at the native observation boundary - a failing backend fetch is not reproducible in a stable E2E journey - so the claim is that the fallback path is reachable and correct, not that a specific field failure is cured."
+    },
+    {
+      "id": "UI-QUERY-PAGE-ANCHORED-VIEWS-547",
+      "title": "A query that matched pages shows the same pages in every display view, and the header counts them",
+      "family": "query-results",
+      "sources": {
+        "issues": [
+          547
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QueryMacro.ir.test.tsx"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "Reported for {{query (page-property tags gptpro)}}: List showed seven pages and the count 7, Table said \"No results\", and Search showed a summary group \"(none) 7\" beside a header count of 0. One answer, three producers. A page-anchored run returns `pages` and leaves `groups` EMPTY by construction (Macro.tsx fetchQueryOperation, the anchor === page branch), but only the List branch consulted pageRows(): the Table/Board branch rendered the BLOCK sheet from groups() and fell back to \"No results\", and the Search branch rendered blockSearchRows() over searchPresentationHits(), which is also built from groups(). The header count was a fourth derivation keyed on currentView(), which is why it read 0 in Search while the backend's own statistics fold (crates/tine-core/src/query/statistics.rs), the source of the summary panel, correctly reported 7 - every page row has no `state`, so all of them land in the null-key \"(none)\" group. Fix: a page-anchored answer routes to the ONE page renderer (QueryPageResults) in all four presentations - it already implemented search/list/table/board and was simply never reached - and total() chooses its row family from what the run RETURNED rather than from the presentation, so hide-when-empty and 'why empty?' stop misreading a non-empty page answer too. Evidence layer: render/unit; the backend answer is mocked, so this proves the view routing, not the engine's page-property matching. Fail-before PROVEN: the three new tests (tine.view:: table, board and search over a page-anchored answer) each rendered 0 page rows on the pre-fix tree."
+    },
+    {
+      "id": "UI-INDEXING-BAR-SHOWS-A-LATER-PASS-543",
+      "title": "The indexing bar also shows a graph-sized pass that starts after launch indexing has finished, in the same graph session",
+      "family": "direct-files-performance",
+      "sources": {
+        "issues": [
+          543
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/indexingProgress.test.ts"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "Audit finding IT-08. followIndexingProgress returned once the warm had finished and two polls were empty, and IndexingProgressBar restarts it only on a graph epoch change. A later whole-graph pass in the same session (a repair after a damaged index, which moves no epoch) therefore ran with no toolbar indication. The follower now keeps watching at a 5 s cadence after launch settles, gives a new pass the same 700 ms no-flash grace, skips polls while the window is hidden, and stops on component cleanup. Fail-before: 'shows a later pass in the same graph session' failed (building(400) never published). Evidence: tine-agents/evidence/gh550-batch/it08-later-pass-fail-before.log."
+    },
+    {
+      "id": "UI-UNRESOLVED-BLOCK-REF-SOURCE-TEXT-589",
+      "title": "An unresolved block reference, including `(((uuid)))`, shows its full source text as OG does instead of an eight-character id",
+      "family": "block-references",
+      "sources": {
+        "issues": [
+          589
+        ],
+        "commits": []
+      },
+      "platforms": [
+        "all"
+      ],
+      "layer": "unit",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/render/blockRefLive.test.tsx",
+          "src/render/renderedText.test.tsx",
+          "crates/tine-core/src/publish_tests.rs::block_refs_resolve_via_decoration"
+        ],
+        "scenario": null,
+        "failBefore": "proven"
+      },
+      "notes": "Flexible presentation with OG parity. mldoc 1.5.9 and lsdoc v0.5.7 both parse `(((uuid)))` as Block_ref `(uuid` plus plain `)` (grammar `((` take_while1(≠')') `))`); OG's block-reference runs parse-uuid, which rejects `(uuid`, and shows the literal `((id))` as a 'Block ref invalid' warning, so the reporter's expected `(` + content + `)` is beyond OG (Martin chose parity, option A, 2026-09-24). Tine's BlockRefView fell back to `((` + first 8 id chars + `))` for any miss, so `(((uuid)))` read as a short hash, and a valid-but-missing uuid was truncated too. Now: the view shows `((id))` in full and skips the lookup for a non-UUID id; the rendered-text path (in-page find, text export) gives `((id))` for a resolver miss (no-resolver callers keep the bare id); publish replaces lsdoc's 8-char placeholder with the full id when the target is unresolved (labels unchanged). Reference indexing already matched OG (UUID-gated). Fail-before: the three tests fail against the pre-change inline.tsx/renderedText.ts/publish.rs. Workaround in both OG and Tine for a parenthesised ref: `( ((uuid)))` or `[label](((uuid)))`."
+    },
+    {
+      "id": "UI-SWITCHER-KEEPS-RESULTS-WHILE-TYPING-543",
+      "title": "Ctrl+K keeps the previous results visible while a newer search runs, and Enter on them waits for the fresh answer",
+      "family": "search",
+      "sources": {
+        "issues": [543],
+        "commits": []
+      },
+      "platforms": ["all"],
+      "layer": "render",
+      "status": "covered",
+      "coverage": {
+        "tests": [
+          "src/components/QuickSwitcher.test.tsx::keeps the previous results on screen, and Enter chooses from the fresh answer"
+        ],
+        "failBefore": "proven"
+      },
+      "notes": "Fail-before: tine-agents/evidence/batch-gh594/necessity-ctrlk.txt (the previous answer was blanked on the new keystroke). Stateful UX, Martin's Ctrl-K latency follow-up to GH #543. Blanking the list on every keystroke made each search look slower than it was. Enter on a stale list defers to the fresh answer so it never opens a row of the earlier query."
     }
   ]
 }

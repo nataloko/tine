@@ -26,6 +26,8 @@ const LAYERS: &[(&str, &[&str])] = &[
             "filesystem_durability",
             "property_line",
             "search_query",
+            "projection_budget",
+            "indexing_progress",
         ],
     ),
     (
