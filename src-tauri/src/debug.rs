@@ -76,6 +76,9 @@ pub(crate) fn debug_init() {
     // through `runtime_debug_diagnostics_enabled()`.
     tine_core::backend_error::set_runtime_debug_diagnostics(debug_opt_in_requested());
     DEBUG_START.get_or_init(std::time::Instant::now);
+    // tine-core's lines already went to stderr; this adds them to the file,
+    // which is what a Windows reporter can actually send (GH #594).
+    tine_core::backend_error::set_diagnostic_line_sink(write_debug_file);
     DEBUG_LOG.get_or_init(|| {
         if !debug_enabled() {
             return None;
@@ -102,6 +105,11 @@ pub(crate) fn diag(msg: impl std::fmt::Display) {
     }
     let msg = msg.to_string();
     eprintln!("[tine] {msg}");
+    write_debug_file(&msg);
+}
+
+/// Append one line to the opt-in debug log, when it is open.
+fn write_debug_file(msg: &str) {
     if let Some(Some(lock)) = DEBUG_LOG.get() {
         if let Ok(mut file) = lock.lock() {
             let _ = writeln!(file, "[+{:>7}ms] {msg}", elapsed_ms());
@@ -391,11 +399,20 @@ pub(crate) fn flight_init(dir: PathBuf) {
         }
     });
     if recorder.is_some() {
-        record_fixed_event("runtime.started", Map::new());
+        record_fixed_event("runtime.started", runtime_started_fields());
         if PREVIOUS_EXIT_UNCLEAN.load(Ordering::Acquire) {
             record_fixed_event("runtime.previous_exit_unclean", Map::new());
         }
     }
+}
+
+/// A previous session's events are all a report has of it, so its start names
+/// the build: fixed tokens only (GH #594 could not tell an x86 session apart).
+fn runtime_started_fields() -> Map<String, Value> {
+    let mut fields = Map::new();
+    fields.insert("version".into(), json!(env!("CARGO_PKG_VERSION")));
+    fields.insert("arch".into(), json!(std::env::consts::ARCH));
+    fields
 }
 
 pub(crate) fn mark_clean_shutdown() {
@@ -560,6 +577,7 @@ pub(crate) fn record_direct_save(
 fn record_index_failure(event: tine_core::IndexFailureEvent) {
     let mut fields = Map::new();
     fields.insert("class".into(), json!(event.class.as_str()));
+    fields.insert("site".into(), json!(event.site.as_str()));
     fields.insert("attempt".into(), json!(event.attempt));
     fields.insert("terminal".into(), json!(event.terminal));
     record_fixed_event("index.failure", fields);
@@ -641,6 +659,14 @@ pub(crate) fn diagnostic_frontend_event(
         if let Some(fields) = close_discard_fields(close_reason.as_deref(), pages) {
             record_fixed_event("runtime.close_discarded_unsaved", fields);
         }
+        return;
+    }
+    if kind == "updater_manual_only" {
+        // The experimental x86 build updates manually by policy; the event
+        // says which build the session ran, not that anything failed (GH #594).
+        let mut fields = Map::new();
+        fields.insert("reason".into(), json!("x86"));
+        record_fixed_event("updater.manual_only", fields);
         return;
     }
     if kind == "updater_failure" {
@@ -1194,8 +1220,50 @@ mod tests {
             .find("fn record_index_failure(")
             .expect("the recorder exists")..];
         let body = &body[..body.find("\n}\n").expect("its body ends")];
-        assert_eq!(body.matches("fields.insert(").count(), 3, "{body}");
+        for site in tine_core::query::IndexFailureSite::ALL {
+            let code = site.as_str();
+            assert!(
+                !code.is_empty() && code.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{code:?}"
+            );
+        }
+        assert_eq!(body.matches("fields.insert(").count(), 4, "{body}");
         assert!(production.contains("set_index_failure_observer(record_index_failure)"));
+    }
+
+    /// GH #594: a previous session's start names its build, so a report can
+    /// tell an x86 session from an x64 one; both values are fixed tokens.
+    #[test]
+    fn a_session_start_names_its_version_and_arch() {
+        let fields = runtime_started_fields();
+        assert_eq!(
+            fields.get("version"),
+            Some(&json!(env!("CARGO_PKG_VERSION")))
+        );
+        assert_eq!(fields.get("arch"), Some(&json!(std::env::consts::ARCH)));
+        assert_eq!(fields.len(), 2);
+        let production = include_str!("debug.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production diagnostics precede their tests");
+        assert!(production
+            .contains("record_fixed_event(\"runtime.started\", runtime_started_fields())"));
+    }
+
+    /// GH #594: the x86 build's manual-update policy is its own event, not
+    /// `updater.failure unsupported_target` on every launch.
+    #[test]
+    fn a_manual_only_build_is_not_an_updater_failure() {
+        let production = include_str!("debug.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production diagnostics precede their tests");
+        let branch = &production[production
+            .find("if kind == \"updater_manual_only\" {")
+            .expect("the manual-only kind is accepted")..];
+        let branch = &branch[..branch.find("return;").expect("it returns")];
+        assert!(branch.contains("record_fixed_event(\"updater.manual_only\", fields)"));
+        assert!(!branch.contains("updater.failure"));
     }
 
     #[test]

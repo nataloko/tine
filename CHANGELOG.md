@@ -8,6 +8,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.6.987] - 2026-09-28
+
+### Fixed
+
+- The search index could not be built at all, on every launch, when any page contained a reference whose name is blank or only a slash, such as `[[ ]]`, `[[/]]`, `#/`, `tags:: /` or `[[　]]` (an ideographic space); Linked/Unlinked References and queries then showed "couldn't be built (code: other)". Such references are now ignored, as they name no page, and a page whose own name is blank or `/` is indexed normally (GH #594).
+- Linked and Unlinked References answer again while the search index is building or has failed, by reading the pages as v0.6.982 did. Before, a graph whose index could not be built showed no references for the whole session. Query blocks still wait for the index (GH #594, #543).
+- The search tab ("Open search tab" in Ctrl+K) shows results again while the search index is building or has failed, as it did in v0.6.982. Until the index is ready they come from a scan of your pages, in page order, and the tab says so; they are replaced by the index's results once it answers. Before, the tab showed "Rebuilding the query index…" for as long as the index was not ready, while Ctrl+K worked (GH #543).
+- Journals stopped loading for an hour every night where the Linux AppImage's built-in time-zone data is out of date, for example in Mexico City, which no longer observes daylight saving time: the window and the app disagreed about which day it was. The app's calendar now follows the system's time-zone rules everywhere (GH #607).
+- A query table's column picker offers Page, so a hand-picked column selection can keep it (GH #606).
+
+### Changed
+
+- In a narrow window the indexing indicator in the toolbar says "Indexing" beside its bar; before, it showed a bare bar (suggested by EllisMorrow, GH #594).
+- Diagnostics: an index failure in the diagnostic report now names the step that failed as well as its class, and with `--debug` the underlying error text reaches the debug log file on every platform; before, the Windows app dropped it, so repeated `other` failures could not be diagnosed (GH #594).
+- Diagnostics: the experimental 32-bit Windows build no longer records its manual-update policy as an updater failure on every launch, and each session's start in the report names the build version and architecture, so a report can tell which build a previous session ran (GH #594).
+
 ## [0.6.986] - 2026-09-25
 
 ### Fixed

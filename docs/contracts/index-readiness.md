@@ -60,18 +60,35 @@ retry.
 
 ## L4 · The user always sees the state
 
-Linked References, Unlinked References and query blocks show one of: an
-answer; "indexing…" / "rebuilding the index…" while not ready; or, once Failed,
-the failure's code with **Retry** and **Create diagnostic report**
-(`src/components/IndexFailedNotice.tsx`). A failed index is shown as failed:
-there is no page-scan fallback for queries or references (D-10). Search keeps
-answering from an already-parsed page cache, as it does for any unavailable
-index.
+Query blocks show one of: an answer; "indexing…" / "rebuilding the index…"
+while not ready; or, once Failed, the failure's code with **Retry** and
+**Create diagnostic report** (`src/components/IndexFailedNotice.tsx`). There is
+no page-scan fallback for queries (D-10).
+
+Linked and Unlinked References always answer unless the only wait is short
+(Martin, 2026-09-25, GH #594; this reverses the 2026-09-24 "no fallback for
+references"): once Failed they walk the pages, as for `Stale`; while the index
+is indexing or recovering they walk the parsed pages already in memory, and
+say "indexing…" only when none are loaded, so they never parse beside a
+build. Waiting for pending edits or a busy turn stays "indexing…": the index
+answers it sooner than a walk. v0.6.982 always walked, and on a graph whose
+index fails every build the panels otherwise never answered.
+
+Search answers from an already-parsed page cache while the index is not ready
+or has failed, on the surfaces whose consumer takes it
+(`FriendlyConsumer::answers_before_ready`): Ctrl+K and the search tab. The
+search tab labels that answer (`QueryExecution.page_scan`: page order, no
+ranking, sort, page-match scope or table rows) and keeps asking the index,
+which replaces it when it answers; its Save page validation takes the scan's
+answer too, since it reads only diagnostics and the explanation (GH #543).
 
 ## L5 · Every failure is observable
 
 Each failed attempt reaches the flight recorder as `index.failure` with its
-class, attempt number and whether it was terminal
+class, the site that decided it (`IndexFailureSite::as_str`: the worker turn
+or setup, the fresh build and which step, the survey and why, a pass that left
+its need standing), attempt number and whether it was terminal. Under `--debug`
+the error text behind the class reaches the debug log
 (`docs/contracts/diagnostics.md`). The classes, `IndexFailureClass::as_str`:
 
 | Code | Cause |

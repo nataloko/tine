@@ -29,7 +29,8 @@ mod oracle_gate1;
 #[path = "query/oracle_walk_tests.rs"]
 mod oracle_walk;
 pub use execution_error::{
-    IndexFailureClass, QueryExecutionError, QueryReadinessReason, QueryUnavailableReason,
+    IndexFailureAt, IndexFailureClass, IndexFailureSite, QueryExecutionError, QueryReadinessReason,
+    QueryUnavailableReason,
 };
 mod advanced_patterns;
 use advanced_patterns::{scan_groups, where_groups};
@@ -679,7 +680,7 @@ pub(crate) fn document_alias_spellings(doc: &Document) -> Vec<(String, String)> 
                 }
                 for alias in v.split([',', '，']) {
                     let alias = strip_ref(alias.trim());
-                    if !alias.is_empty() {
+                    if refs::names_a_page(&alias) {
                         aliases.push((alias.clone(), refs::page_key(&alias)));
                     }
                 }

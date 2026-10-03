@@ -99,12 +99,7 @@ impl Graph {
             display,
             consumer,
         );
-        self.read_friendly_plan(
-            &plan,
-            explain,
-            None,
-            consumer == crate::query_plan::FriendlyConsumer::CtrlK,
-        )
+        self.read_friendly_plan(&plan, explain, None, consumer.answers_before_ready())
     }
 
     /// Interactive search lane: a newer request in the same lane cooperatively
@@ -226,7 +221,7 @@ impl Graph {
             &plan,
             explain,
             Some(Arc::new(move || epoch.load(Ordering::Acquire) != mine)),
-            consumer == crate::query_plan::FriendlyConsumer::CtrlK,
+            consumer.answers_before_ready(),
         )
     }
 

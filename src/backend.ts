@@ -521,6 +521,9 @@ export interface Backend {
   /** Show a known graph's root folder in the OS file manager (desktop only). */
   revealKnownGraph(path: string): Promise<void>;
   appPlatform(): Promise<"android" | "ios" | "desktop">;
+  /** The backend's current UTC offset and sample instant: the app's calendar
+   * authority (see `appNow` in journal.ts, GH #607). */
+  localClock(): Promise<{ offset_minutes: number; unix_ms: number }>;
   /** Compile-time process architecture. Used to avoid offering updater targets
    * that the signed release manifest deliberately does not publish. */
   appArchitecture(): Promise<string>;
@@ -1132,7 +1135,7 @@ export interface Backend {
   saveGraphVerificationReport(text: string): Promise<boolean>;
   onGraphVerificationProgress(cb: (progress: GraphVerificationProgress) => void): Promise<() => void>;
   diagnosticFrontendEvent(
-    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure" | "close_discarded_unsaved",
+    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure" | "updater_manual_only" | "close_discarded_unsaved",
     line?: number,
     column?: number,
     delayMs?: number,
@@ -1445,6 +1448,9 @@ class TauriBackend implements Backend {
   }
   appPlatform() {
     return this.call<"android" | "ios" | "desktop">("app_platform");
+  }
+  localClock() {
+    return this.call<{ offset_minutes: number; unix_ms: number }>("local_clock");
   }
   appArchitecture() {
     return this.call<string>("app_architecture");
@@ -2241,7 +2247,7 @@ class TauriBackend implements Backend {
     return listen<GraphVerificationProgress>("graph-verification-progress", (event) => cb(event.payload));
   }
   diagnosticFrontendEvent(
-    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure" | "close_discarded_unsaved",
+    kind: "uncaught_error" | "unhandled_rejection" | "heartbeat_delay" | "updater_failure" | "updater_manual_only" | "close_discarded_unsaved",
     line?: number,
     column?: number,
     delayMs?: number,
