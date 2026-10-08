@@ -41,6 +41,13 @@ The AppImage embeds update-information, so [GearLever](https://mijorus.it/projec
 auto-detects new versions. The built-in Tauri auto-updater is **off** (this fork never silently
 updates itself to an upstream, feature-less release).
 
+## Build cache
+
+`source scripts/env.sh` points `CARGO_TARGET_DIR` at the persistent `.toolchain/` mount and
+symlinks `./target` to it, so a `git clean` or a fresh session reuses the warm build cache instead
+of recompiling from scratch (`./target/release/…` still resolves through the symlink). Upstream's
+README has the rest of the build steps.
+
 ## Build locally (non-NixOS AppImage)
 
 The host here is NixOS, whose glibc/loader an AppImage can't assume elsewhere, so the AppImage is

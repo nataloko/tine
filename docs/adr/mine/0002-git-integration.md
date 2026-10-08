@@ -80,3 +80,9 @@ that shells out to the *system* git and never bypasses the save/reload protocol.
   single global graph. Each window owns its own graph, so each is its own repo and
   git acts on the one you invoked it from — auto-commit on a window's close commits
   that window's graph even with other graph windows open.
+- **0.7 save engine (adopted v0.7.0):** `persistence.ts` is gone (the document core
+  moved to `src/document/`) and a landed save no longer bumps `dataRev`. The
+  read-only accumulator moved to `src/gitSaves.ts`, fed by one fork call in the save
+  engine's `notePublished()`, which runs exactly when a page save lands on disk. The
+  auto-commit debounce re-arms on that (`savedRev`) and on `dataRev`. The decisions
+  above are unchanged: git still only sees bytes the save protocol already wrote.

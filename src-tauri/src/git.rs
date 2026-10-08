@@ -16,7 +16,6 @@
 //! also keeps the process alive long enough for an on-close push to finish before
 //! Tine quits.
 
-use crate::command_error::CommandError;
 use crate::state::{slot_for_window, AppState};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -44,9 +43,7 @@ pub(crate) struct GitResult {
     detail: String,
     /// The remote moved, so the user must Pull before Push. A FIELD rather than a
     /// phrase the frontend re-reads out of `detail`: `src/git.ts` keeps exactly
-    /// that toast sticky, and upstream's I-9 ratchet
-    /// (`src/typedErrorRatchet.test.ts`) forbids classifying a backend result by
-    /// parsing its message. Rewording the detail can no longer lose the sticky.
+    /// that toast sticky, so rewording the detail can never lose the sticky.
     needs_pull: bool,
 }
 
@@ -72,17 +69,12 @@ impl GitResult {
     }
 }
 
-/// FORK: git's failures have no typed source in upstream's error taxonomy, so they
-/// take the command boundary's remainder row (`command_error.rs`
-/// PHASE_B_PRODUCER_MANIFEST, "literal/context-only remainder" -> `Prose`). The
-/// variant is constructed directly rather than through the boundary's lowercase
-/// constructor helper, deliberately: `backend_command_parity.rs` fingerprints every
-/// lowercase-helper mapper site and pins the count, so calling the helper here
-/// would force the fork to re-pin an upstream constant — and re-pin it again at
-/// every sync. Same value on the wire either way. (Naming the helper in prose is
-/// avoided too: `src/typedErrorRatchet.test.ts` greps its raw name.)
-fn git_error(detail: impl Into<String>) -> CommandError {
-    CommandError::Prose(detail.into())
+/// A git failure's user-facing detail. Upstream's Tauri boundary returns plain
+/// `String` errors (the typed `String` of v0.6.982 to v0.6.987 did not
+/// carry into the 0.7 line), so this is the identity; it stays a named helper so
+/// every git failure site reads the same.
+fn git_error(detail: impl Into<String>) -> String {
+    detail.into()
 }
 
 /// Default `.gitignore` written on auto-init — keeps Logseq's local-only churn
@@ -101,7 +93,7 @@ logseq/version-files/
 /// acts on *that* window's graph — its own repo — even with other graph windows
 /// open. `slot_for_window` clones the `Arc<GraphSlot>` out under the read lock and
 /// releases it, so no lock is held past this call.
-fn graph_root(window: &tauri::WebviewWindow) -> Result<PathBuf, CommandError> {
+fn graph_root(window: &tauri::WebviewWindow) -> Result<PathBuf, String> {
     let state = window.state::<AppState>();
     Ok(slot_for_window(&state, window.label())?.root_key.clone())
 }
@@ -143,7 +135,7 @@ fn git_base(root: &Path) -> Command {
 
 /// Run a git subcommand to completion, capturing output. `Err` only when git
 /// itself couldn't be launched (not installed) — a non-zero git exit is still `Ok`.
-fn run_git(root: &Path, args: &[&str]) -> Result<Output, CommandError> {
+fn run_git(root: &Path, args: &[&str]) -> Result<Output, String> {
     git_base(root)
         .args(args)
         .output()
@@ -282,7 +274,7 @@ fn status_in(root: &Path) -> GitStatus {
     st
 }
 
-fn init_in(root: &Path) -> Result<GitStatus, CommandError> {
+fn init_in(root: &Path) -> Result<GitStatus, String> {
     let out = run_git(root, &["init"])?;
     if !out.status.success() {
         return Err(git_error(first_line(&combined(&out))));
@@ -294,7 +286,7 @@ fn init_in(root: &Path) -> Result<GitStatus, CommandError> {
     Ok(status_in(root))
 }
 
-fn commit_in(root: &Path, message: &str) -> Result<GitResult, CommandError> {
+fn commit_in(root: &Path, message: &str) -> Result<GitResult, String> {
     let add = run_git(root, &["add", "-A"])?;
     if !add.status.success() {
         return Ok(GitResult::new("commit", false, first_line(&combined(&add))));
@@ -380,21 +372,21 @@ fn force_pull_in(root: &Path) -> GitResult {
 
 /// Read-only status of the graph repo. Cheap; polled + refreshed after ops.
 #[tauri::command]
-pub(crate) async fn git_status(window: tauri::WebviewWindow) -> Result<GitStatus, CommandError> {
+pub(crate) async fn git_status(window: tauri::WebviewWindow) -> Result<GitStatus, String> {
     let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || status_in(&root))
         .await
-        .map_err(|e| CommandError::Worker { message: e.to_string() })
+        .map_err(|e| e.to_string())
 }
 
 /// `git init` the graph root and drop a default Logseq `.gitignore` if absent. An
 /// affordance for turning an un-versioned graph into a repo — never forced.
 #[tauri::command]
-pub(crate) async fn git_init(window: tauri::WebviewWindow) -> Result<GitStatus, CommandError> {
+pub(crate) async fn git_init(window: tauri::WebviewWindow) -> Result<GitStatus, String> {
     let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || init_in(&root))
         .await
-        .map_err(|e| CommandError::Worker { message: e.to_string() })?
+        .map_err(|e| e.to_string())?
 }
 
 /// `git add -A` then `git commit -m <message>`. "Nothing to commit" is a success
@@ -403,54 +395,54 @@ pub(crate) async fn git_init(window: tauri::WebviewWindow) -> Result<GitStatus, 
 pub(crate) async fn git_commit(
     message: String,
     window: tauri::WebviewWindow,
-) -> Result<GitResult, CommandError> {
+) -> Result<GitResult, String> {
     let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || commit_in(&root, &message))
         .await
-        .map_err(|e| CommandError::Worker { message: e.to_string() })?
+        .map_err(|e| e.to_string())?
 }
 
 /// Push the current branch. Never forces — a non-fast-forward reject becomes a
 /// "Pull first" message. Awaited by the frontend, so an on-close push completes
 /// before the process exits.
 #[tauri::command]
-pub(crate) async fn git_push(window: tauri::WebviewWindow) -> Result<GitResult, CommandError> {
+pub(crate) async fn git_push(window: tauri::WebviewWindow) -> Result<GitResult, String> {
     let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || push_in(&root))
         .await
-        .map_err(|e| CommandError::Worker { message: e.to_string() })
+        .map_err(|e| e.to_string())
 }
 
 /// Pull with `--ff-only`. A fast-forward-only pull never creates a merge and never
 /// rewrites local edits; pulled files land on disk and flow through the watcher →
 /// reloadDisposition, so dirty/edited pages are guarded by the sync-conflict UI.
 #[tauri::command]
-pub(crate) async fn git_pull(window: tauri::WebviewWindow) -> Result<GitResult, CommandError> {
+pub(crate) async fn git_pull(window: tauri::WebviewWindow) -> Result<GitResult, String> {
     let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || pull_in(&root))
         .await
-        .map_err(|e| CommandError::Worker { message: e.to_string() })
+        .map_err(|e| e.to_string())
 }
 
 /// Force-push the current branch — overwrites remote history. Destructive; the
 /// frontend gates it behind a confirmation dialog.
 #[tauri::command]
-pub(crate) async fn git_force_push(window: tauri::WebviewWindow) -> Result<GitResult, CommandError> {
+pub(crate) async fn git_force_push(window: tauri::WebviewWindow) -> Result<GitResult, String> {
     let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || force_push_in(&root))
         .await
-        .map_err(|e| CommandError::Worker { message: e.to_string() })
+        .map_err(|e| e.to_string())
 }
 
 /// Force-pull (fetch + hard reset to upstream) — overwrites local commits and
 /// tracked-file edits. Destructive; the frontend gates it behind a confirmation
 /// dialog. Reset writes reload through the file watcher like any external change.
 #[tauri::command]
-pub(crate) async fn git_force_pull(window: tauri::WebviewWindow) -> Result<GitResult, CommandError> {
+pub(crate) async fn git_force_pull(window: tauri::WebviewWindow) -> Result<GitResult, String> {
     let root = graph_root(&window)?;
     tauri::async_runtime::spawn_blocking(move || force_pull_in(&root))
         .await
-        .map_err(|e| CommandError::Worker { message: e.to_string() })
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

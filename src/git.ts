@@ -4,9 +4,10 @@
 // OFF by default; opt-in from the "mine (extras)" settings tab.
 //
 // Shape:
-//   • Commit rides the post-save `dataRev` bump (fires ~700ms after a save batch
-//     lands = disk is current), on a long ~60s idle debounce so it never commits
-//     mid-keystroke. It also commits on app close (after flushAll) and on demand.
+//   • Commit rides every landed save (`savedRev`, src/gitSaves.ts) and every
+//     `dataRev` bump (a delete, an external reload), on a long ~60s idle debounce
+//     so it never commits mid-keystroke. It also commits on app close (after the
+//     close gate saved everything) and on demand.
 //   • Push timing is configurable: on close (default) / on every idle commit /
 //     manual only. Push never forces — a non-fast-forward reject says "Pull first".
 //   • Pull is opt-in on startup + manual; `--ff-only`, so it never merges. Pulled
@@ -19,9 +20,11 @@
 // touches credentials — the machine's git credential helper / ssh-agent does.
 
 import { createEffect, createRoot, createSignal, on } from "solid-js";
-import { backend, type GitResult, type GitStatus } from "./backend";
-import { dataRev, pushToast } from "./ui";
-import { drainSavedPages } from "./persistence";
+import { backend } from "./backend";
+import type { GitResult, GitStatus } from "./gitBackend";
+import { dataRev } from "./graphSession";
+import { pushToast } from "./toasts";
+import { drainSavedPages, savedRev } from "./gitSaves";
 
 export type PushMode = "on-close" | "on-idle" | "manual";
 
@@ -162,13 +165,13 @@ async function autoCommit(): Promise<void> {
   if (r?.ok && mode() === "on-idle") await runPush(true);
 }
 
-// Every post-save `dataRev` bump (re)arms the idle debounce. `on(..., {defer:true})`
-// so it tracks ONLY dataRev (not `enabled`) and never fires on initial run —
-// created once, app-lifetime.
+// Every landed save and every `dataRev` bump (re)arms the idle debounce.
+// `on(..., {defer:true})` so it tracks ONLY those two (not `enabled`) and never
+// fires on initial run — created once, app-lifetime.
 createRoot(() =>
   createEffect(
     on(
-      dataRev,
+      [savedRev, dataRev],
       () => {
         if (enabled()) scheduleAutoCommit();
       },
@@ -200,8 +203,9 @@ export async function initGit(): Promise<void> {
 }
 
 /** Commit (and, unless push-mode is manual, push) on app close — called after
- *  `flushAll()` so the disk is current. Awaited within the close cap; best-effort
- *  and quiet since the window is going away. */
+ *  App's close gate (`safeClose.prepare()`) accepted, so the disk is current.
+ *  Awaited within the close cap; best-effort and quiet since the window is going
+ *  away. */
 export async function commitOnClose(): Promise<void> {
   if (!enabled()) return;
   if (autoTimer) {

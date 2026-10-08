@@ -9,7 +9,7 @@
 import { createMemo, createRoot, createSignal } from "solid-js";
 import { backend } from "./backend";
 import { editingId } from "./editorController";
-import { doc } from "./store";
+import { childIds, node } from "./document";
 
 const KEY = "bullet_threading";
 const COLOR_KEY = "bullet_threading_color";
@@ -95,16 +95,16 @@ export const threadRoles = createRoot(() =>
   createMemo((): Map<string, ThreadRole> => {
     const roles = new Map<string, ThreadRole>();
     const cursor = editingId();
-    if (!cursor || !doc.byId[cursor]) return roles;
+    if (!cursor || !node(cursor)) return roles;
     // chain = [root, …, cursor]
     const chain: string[] = [];
-    for (let n: string | null = cursor; n; n = doc.byId[n]?.parent ?? null) chain.unshift(n);
+    for (let n: string | null = cursor; n; n = node(n)?.parent ?? null) chain.unshift(n);
     // Edge e connects chain[e] (parent, depth e) → chain[e+1] (child), coloured e.
     for (let e = 0; e < chain.length - 1; e++) {
       const parent = chain[e];
       const child = chain[e + 1];
       roles.set(child, { elbow: e });
-      const sibs = doc.byId[parent]?.children ?? [];
+      const sibs = childIds(parent);
       const idx = sibs.indexOf(child);
       for (let s = 0; s < idx; s++) roles.set(sibs[s], { spine: e });
     }

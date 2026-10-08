@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import type { GitStatus } from "./backend";
+import type { GitStatus } from "./gitBackend";
 import { composeCommitMessage, gitBadgeText, nextGitAction, gitBadgeTitle } from "./git";
 
 function status(overrides: Partial<GitStatus> = {}): GitStatus {
