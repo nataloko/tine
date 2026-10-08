@@ -2,9 +2,9 @@
 
 This repository is `nataloko/tine`, a personal fork of upstream
 `martinkoutecky/tine`. Fork-only features are layered on upstream and ship in
-separate personal builds. The upstream pointer to
-`/aux/koutecky/logseq/tine-agents/AGENTS.md` refers to Martin's machine and is
-not available here; do not block on it.
+separate personal builds. Upstream's pointer to its private working agreement
+(a sibling `../tine-agents/AGENTS.md` on Martin's machine) is not available
+here; do not block on it.
 
 ## Branches and releases
 
@@ -237,93 +237,75 @@ Cargo commands run in `nix-shell` with `cargo rustc gcc pkg-config`. The `tine`
 app crate also needs `webkitgtk_4_1 gtk3 librsvg glib cairo pango gdk-pixbuf atk
 libsoup_3 openssl`.
 
-Run these gates before shipping:
+Run these gates before shipping (the Rust line is whatever upstream's `ci.yml`
+"Rust core tests" step runs; re-read it each sync):
 
 ```bash
+node scripts/check-wasm-pin.mjs
 npx tsc --noEmit
-npm test
+npx vitest run --maxWorkers=2 --testTimeout=30000
+npx vitest run --config vitest.render.config.ts --maxWorkers=2 --testTimeout=30000
+npm run test:e2e-harness
 npm run build
-# NOT `cargo test -p tine-core` — see the note below. This is upstream's release gate:
-PATH="<dir with cargo-nextest 0.9.143>:$PATH" nix-shell -p cargo rustc gcc pkg-config \
-  --run 'node scripts/tine-core-nextest-contract.mjs --mode linux --run-selection'
+nix-shell -p cargo rustc gcc pkg-config \
+  --run 'TMPDIR=/tmp cargo test --no-fail-fast -p tine-core -p tine-store -p tine-graph-features'
 nix-shell -p cargo rustc gcc pkg-config webkitgtk_4_1 gtk3 librsvg glib cairo pango gdk-pixbuf atk libsoup_3 openssl --run 'cargo check -p tine'
 ```
 
-This host has **4 cores**, and Vitest's default worker count starves the
-timing-sensitive suites: a default `npm test` here reported 10 failures on one
-run and 19 on the next, across `store.test.ts`'s selection-move burst cases, the
-source-scanning guards (`conflictAuthority`, `resourceReads`, `clipboard`,
-`pagePropsEditorSurface`), `themeCheckerCli`, `systemBars`, `systemTheme` and
-`clipboard.paste`. Every one passed in isolation, and the whole suite is green
-at `npx vitest run --maxWorkers=2 --testTimeout=30000` (4,053 passed, 2 skipped,
-~4.5 min at v0.6.986). Use that invocation as the real signal; a failure that
-survives it is a real failure. None of these tests is modified by the fork.
+At v0.7.0 `npm test` is exactly the two Vitest passes plus `test:e2e-harness`;
+run them as above. This host has **4 cores**, and Vitest's default worker count
+starves the timing-sensitive suites, so `--maxWorkers=2 --testTimeout=30000` is
+the real signal; a failure that survives it is a real failure. A single guard
+file run on its own still needs `--testTimeout=30000`: 0.7's whole-repo scans
+(`graphScopedState`, `lateLanding`) exceed Vitest's 5s default here.
 
-`npm test` is more than Vitest, and upstream keeps adding steps to it — at
-v0.6.986 it also runs `test:search-scaling-fixture`, `test:script-identifiers`
-and `test:e2e-provenance`, and `test:e2e-harness` grew to seven files. Run the
-two Vitest passes with the worker settings above, then the remaining `npm test`
-scripts individually; all of them are quick. The render pass
-(`vitest run --config vitest.render.config.ts`) takes ~13.5 min here on its own
-(229 files, 2,040 tests).
+0.7's source-scanning safety guards apply to fork code like any other code, and
+the fork follows them rather than pinning exemptions:
 
-**The known-red exclusion list is now EMPTY, and the machinery that carried it is
-gone.** Every red it ever named was a Managed Storage runtime defect, and v0.6.984
-removed Managed Storage (ADR 0066), so upstream deleted
-`scripts/release-ci-exception.{mjs,json}` outright and
-`KNOWN_RED_TINE_CORE_EXCLUDED_TEST_NAMES` in
-`scripts/tine-core-nextest-contract.mjs` is `[]` — the Linux filterset is now
-plain `all()`. Both `PRE_07_SYNC_RUNTIME_EXCLUDED_TEST_NAMES` and
-`KNOWN_RED_SYNC_RUNTIME_FAILURE_FAMILIES` are also gone. Adding a name back is
-an open-bug declaration, not a waiver.
+- I-20 (`src/lateLanding.guard.test.ts`): every awaited backend call goes
+  through `readOwned`/`writeOwned` with an owner from `src/owned.ts`. `git.ts`
+  runs each git op under `bindingOwner()` (the op always completes; its toast and
+  status land only while that graph is open), status reads under `graphOwner()`,
+  and `ExtrasTab.tsx`'s force-op confirm dialogs under `bindingOwner()`.
+- Device preferences use `writePreference`/`loadPreference`
+  (`src/preferenceWrites.ts`): `bulletThreading.ts` and `git.ts`'s three
+  settings. That also satisfies I-9 (`errorSwallow`: no `.catch(() => {})`).
+- I-2/I-9 (`failedRead`): a catch never returns an invented empty value; git's
+  runners report and `return;`, and a failed status read keeps the last good one.
+- I-21 (`graphScopedState`): `gitSaves.ts`'s Set clears through
+  `clearOnBindingInvalidated`, and the repo status is a `graphScopedSignal`. The
+  guard matches graph-scoped signals by NAME across files, so it is called
+  `repoStatus`; a generic name like `status` trips over unrelated variables.
 
-Keep running the contract script rather than bare `cargo test -p tine-core`
-anyway: it is upstream's actual release gate and it is the stricter one — four
-hash shards, one process per test, and no retries, none of which plain libtest
-gives you. The timeout is `slow-timeout = { period = "5m", terminate-after = 2,
-on-timeout = "fail" }` in `.config/nextest.toml`: a test is MARKED slow at 5
-minutes but KILLED at 10, which matters on this host (see the fuzz test below).
-The old hazard (scenarios that never terminate, so the bare run hangs and prints
-no summary) left with Managed Storage, but the bare command has NOT been re-tested
-on this fork since; treat it as unverified, not as known-good.
+Two upstream tests carry `FORK:` edits for the updater, besides `update.test.ts`:
+`src/browserPlatform.test.ts` drops `src/update.ts` from its I-12 list (the
+fork's `updateMode()` reads no browser hint at all, so there is no
+`browserPlatform(` call to find), and `src/components/AboutTab.test.tsx` asserts
+the fork's "available upstream" wording. `src/repositoryPaths.test.ts` (GH #579)
+rejects absolute machine paths in tracked files, this one included.
 
-It needs cargo-nextest **exactly 0.9.143** (nixpkgs has 0.9.140, and the prebuilt
-binary needs `patchelf` on NixOS — see the `sync-upstream` skill for the one-time
-fix). NOTE: the patched interpreter is a `/nix/store` path, so a later garbage
-collection breaks the binary again with `cannot execute: required file not
-found`. Re-run the same `patchelf` line; the fix is idempotent.
+At v0.7.0 the frontend reported `3019 passed | 13 skipped` (unit pass, ~4.5 min) and
+`2499 passed | 3 skipped` (render pass, ~11.5 min), and the Rust core gate `1988 passed,
+2 failed, 9 ignored` in ~31 min. The fork's `crates/`, `Cargo.toml` and
+`Cargo.lock` delta against upstream is EMPTY
+(`git diff --stat 84f4de34a mine -- crates Cargo.toml Cargo.lock`), so no core
+test result can be a fork regression; re-run that diff before investigating
+one. Both reds are this host:
 
-At v0.6.986 the gate reports `1949 tests run: 1946 passed (1 slow), 2 failed,
-1 timed out, 44 skipped` in ~20 min. All three reds were triaged at that sync and
-NONE is a fork regression. The proof is structural rather than comparative: the
-fork's ENTIRE `crates/` delta against the release tag is 8 added lines inside two
-`#[test]` pin tables in `projection_producer_census.rs`
-(`git diff --stat v0.6.986 mine -- crates/`). Test-only data tables cannot change
-runtime throughput or scheduling, so a slow or worker-starved core test here is
-this host, not the fork. Re-run that one-line diff next sync before spending time
-on a pristine-tree comparison.
+- `tine-store` `store::checkpoint::checkpoint_tests::the_golden_body_is_pinned_to_format`
+  hashes a checkpoint body after replacing the temp root path with a same-length
+  stand-in. Under `nix-shell`'s own `TMPDIR` the digest differs; with
+  `TMPDIR=/tmp` it passes. Hence the `TMPDIR=/tmp` in the gate above.
+- `tine-graph-features --test i22_macro_fanout`
+  `self_embedding_fan_out_is_cut_with_a_visible_marker` asserts a 24^4 embed
+  fan-out prints in under 60s. It takes ~90s here in a debug build, alone or not.
+  A speed bound on a weak CPU; expect it to stay red.
 
-- `model::tests::the_registry_build_is_measured_and_bounded` asserts
-  `median < 2_000_000` µs. Measured 4,240,687 µs in the full run and 2,138,153 µs
-  in isolation — so at v0.6.986 it fails even ALONE, by ~7%, where at v0.6.984 it
-  still passed in isolation at 2,460,217 µs under contention. A performance bound
-  on a weak CPU, not a correctness failure. Expect it to stay red.
-- `model::tests::gh543_r12::a_corrupt_derived_row_asks_for_a_new_image` (new at
-  this release) fails in the full run and PASSES in isolation in 0.78s. It waits
-  on a background index worker (`wait_ready(10s)`, `wait_drained_test()`), and the
-  failure's own state dump shows the tell: `rebuild=true building=false
-  worker_available=true worker_busy=false` — the rebuild was owed and never got
-  scheduled. Contention, not logic. Check it in isolation first.
-- `derived_cache_fuzz::derived_cache_matches_fresh_under_random_edits` is now
-  KILLED at the 600s terminate-after bound. It still PASSES in isolation, in
-  798s — up from ~365s at v0.6.984 although the test file itself is byte-identical
-  upstream, because the derived-cache path under it was rewritten by the GH #543
-  and compact-projection work. A duration problem on this host only.
-
-Upstream's v0.6.984 red
-`direct_projection::tests::cold_open_streams_without_retaining_the_graph` is FIXED
-at v0.6.986 and no longer appears; the note about reproducing it on a pristine tag
-can go.
+The 0.6 line's nextest contract script, its cargo-nextest 0.9.143 pin and its
+triaged timing reds (`the_registry_build_is_measured_and_bounded`,
+`a_corrupt_derived_row_asks_for_a_new_image`, `derived_cache_fuzz`) left with
+that line. If a future `ci.yml` brings nextest back, the `sync-upstream` skill
+has the NixOS `patchelf` fix.
 
 The public roadmap is `docs/BACKLOG.md`. Architecture decisions are in
 `docs/adr/`, with fork-specific decisions in `docs/adr/mine/`.

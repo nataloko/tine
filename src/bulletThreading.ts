@@ -9,6 +9,7 @@
 import { createMemo, createRoot, createSignal } from "solid-js";
 import { backend } from "./backend";
 import { editingId } from "./editorController";
+import { loadPreference, writePreference } from "./preferenceWrites";
 import { childIds, node } from "./document";
 
 const KEY = "bullet_threading";
@@ -42,39 +43,35 @@ export const threadThicknessPx = () => WEIGHT_PX[weight()];
  *  or "beat" (a slow pulse). */
 export const threadAnimation = anim;
 
+// Each setter applies now and queues a device-local write through upstream's
+// preference queue: a failed latest write rolls back and toasts.
 export function setThreadingEnabled(on: boolean): void {
-  setEnabledSig(on);
-  void backend().setAppBool(KEY, on).catch(() => {});
+  writePreference(enabled, setEnabledSig, on, (next) => backend().setAppBool(KEY, next), "bullet threading preference");
 }
 
 export function setThreadColorMode(mode: ThreadColorMode): void {
-  setColorModeSig(mode);
-  void backend().setAppString(COLOR_KEY, mode).catch(() => {});
+  writePreference(colorMode, setColorModeSig, mode, (next) => backend().setAppString(COLOR_KEY, next), "thread colour");
 }
 
 export function setThreadWeight(w: ThreadWeight): void {
-  setWeightSig(w);
-  void backend().setAppString(WEIGHT_KEY, w).catch(() => {});
+  writePreference(weight, setWeightSig, w, (next) => backend().setAppString(WEIGHT_KEY, next), "thread thickness");
 }
 
 export function setThreadAnimation(mode: ThreadAnimation): void {
-  setAnimSig(mode);
-  void backend().setAppString(ANIM_KEY, mode).catch(() => {});
+  writePreference(anim, setAnimSig, mode, (next) => backend().setAppString(ANIM_KEY, next), "thread animation");
 }
 
-/** Load the persisted preferences at startup. Defaults: OFF, rainbow, medium, no animation. */
-export async function initBulletThreading(): Promise<void> {
-  try {
-    setEnabledSig(await backend().getAppBool(KEY, false));
-    const c = await backend().getAppString(COLOR_KEY, "rainbow");
-    setColorModeSig(c === "accent" ? "accent" : "rainbow");
-    const w = await backend().getAppString(WEIGHT_KEY, "medium");
-    setWeightSig(w === "thin" || w === "thick" ? w : "medium");
-    const a = await backend().getAppString(ANIM_KEY, "none");
-    setAnimSig(a === "flow" || a === "beat" ? a : "none");
-  } catch {
-    /* defaults */
-  }
+/** Load the persisted preferences at startup. Defaults: OFF, rainbow, medium, no
+ *  animation. Each lands only if the user has not changed it meanwhile; a failed
+ *  read toasts and keeps the default. */
+export function initBulletThreading(): void {
+  loadPreference(enabled, setEnabledSig, () => backend().getAppBool(KEY, false), (on) => on, "bullet threading preference");
+  loadPreference(colorMode, setColorModeSig, () => backend().getAppString(COLOR_KEY, "rainbow"),
+    (c): ThreadColorMode => (c === "accent" ? "accent" : "rainbow"), "thread colour");
+  loadPreference(weight, setWeightSig, () => backend().getAppString(WEIGHT_KEY, "medium"),
+    (w): ThreadWeight => (w === "thin" || w === "thick" ? w : "medium"), "thread thickness");
+  loadPreference(anim, setAnimSig, () => backend().getAppString(ANIM_KEY, "none"),
+    (a): ThreadAnimation => (a === "flow" || a === "beat" ? a : "none"), "thread animation");
 }
 
 /** Rainbow palette — one vivid colour per nesting depth (cycles). Theme-agnostic. */

@@ -146,7 +146,8 @@ describe("AboutTab", () => {
       const button = [...host.querySelectorAll("button")].find((b) => b.textContent?.includes("Check for updates"));
       button?.click();
       await flush();
-      expect(host.textContent).toContain(`${IDENTITY.productName} 0.6.0 is available — choose Install update in the notification.`);
+      // FORK: this build only announces upstream releases; upstream asserts "choose Install update in the notification."
+      expect(host.textContent).toContain(`${IDENTITY.productName} 0.6.0 is available upstream — you're on 0.5.3. Merge it into your fork.`);
       expect(host.textContent).not.toContain("downloading");
     } finally {
       dispose();

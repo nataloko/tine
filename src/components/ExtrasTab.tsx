@@ -4,6 +4,7 @@
 // Settings edits merge without touching fork code. Add future fork toggles here.
 import { Show, onMount, type JSX } from "solid-js";
 import { backend } from "../backend";
+import { bindingOwner, readOwned } from "../owned";
 import type { GitStatus } from "../gitBackend";
 import {
   threadingEnabled,
@@ -151,33 +152,31 @@ function GitSection(): JSX.Element {
     </button>
   );
   // Native GTK confirm — window.confirm silently returns true under WebKitGTK,
-  // which would run the destructive op with no prompt (Settings' backup restore does the same).
+  // which would run the destructive op with no prompt (Settings' backup restore
+  // does the same). The answer counts only for the graph it was asked about: a
+  // graph switch while the dialog is open drops it.
   const forcePush = async () => {
     const s = gitStatus();
     const branch = s?.branch ? `“${s.branch}”` : "this branch";
-    if (
-      !(await backend().confirm(
-        `Force push ${branch} to the remote?\n\n` +
-          `This overwrites the remote branch with your local one, permanently ` +
-          `discarding any commits on the remote you don’t have. It can’t be undone.`,
-        "Force push",
-      ))
-    )
-      return;
+    const confirmed = await readOwned(bindingOwner(), backend().confirm(
+      `Force push ${branch} to the remote?\n\n` +
+        `This overwrites the remote branch with your local one, permanently ` +
+        `discarding any commits on the remote you don’t have. It can’t be undone.`,
+      "Force push",
+    ));
+    if (confirmed.kind === "stale" || !confirmed.value) return;
     await forcePushNow();
   };
   const forcePull = async () => {
     const s = gitStatus();
     const branch = s?.branch ? `“${s.branch}”` : "this branch";
-    if (
-      !(await backend().confirm(
-        `Force pull ${branch} from the remote?\n\n` +
-          `This discards every local commit and every uncommitted change to tracked ` +
-          `files, resetting this graph to exactly match the remote. It can’t be undone.`,
-        "Force pull",
-      ))
-    )
-      return;
+    const confirmed = await readOwned(bindingOwner(), backend().confirm(
+      `Force pull ${branch} from the remote?\n\n` +
+        `This discards every local commit and every uncommitted change to tracked ` +
+        `files, resetting this graph to exactly match the remote. It can’t be undone.`,
+      "Force pull",
+    ));
+    if (confirmed.kind === "stale" || !confirmed.value) return;
     await forcePullNow();
   };
   return (

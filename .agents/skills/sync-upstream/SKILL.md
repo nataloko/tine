@@ -134,7 +134,8 @@ npx tsc --noEmit
 npm test
 # Upstream's Rust gate is whatever ci.yml's "Rust core tests" step runs. At v0.7.0:
 nix-shell -p cargo rustc gcc pkg-config \
-  --run 'cargo test --no-fail-fast -p tine-core -p tine-store -p tine-graph-features'
+  --run 'TMPDIR=/tmp cargo test --no-fail-fast -p tine-core -p tine-store -p tine-graph-features'
+# (TMPDIR=/tmp: a checkpoint golden-digest test fails under nix-shell's own TMPDIR.)
 npm run build
 ```
 Any gate failure → **STOP and report** (this is where upstream changes to shared files like
