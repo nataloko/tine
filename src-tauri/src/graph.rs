@@ -53,13 +53,6 @@ pub(crate) fn usable_last_graph_path(path: Option<String>) -> Option<String> {
 
 #[tauri::command]
 pub(crate) fn startup_graph_path(app: tauri::AppHandle) -> Option<String> {
-    #[cfg(desktop)]
-    if matches!(
-        crate::cli::launch_request_env(),
-        crate::cli::LaunchRequest::Link(_)
-    ) {
-        return None;
-    }
     resolve_root("").or_else(|| usable_last_graph_path(crate::settings::last_graph_path(&app)))
 }
 
@@ -253,7 +246,10 @@ pub(crate) fn forget_launch_checkpoint(app_data: Option<&Path>, root: &str) {
 #[derive(serde::Serialize)]
 pub(crate) struct GraphAccessInspection {
     graph_root: String,
+    display_graph_root: String,
+    wsl_rootfs: bool,
     external_assets_path: Option<String>,
+    display_external_assets_path: Option<String>,
     approved: bool,
 }
 
@@ -273,7 +269,16 @@ pub(crate) fn inspect_graph_access(
         || approved_external_assets(&app, &root)
             .is_some_and(|path| inspection.approves_external_assets(&path).unwrap_or(false));
     Ok(GraphAccessInspection {
+        wsl_rootfs: cfg!(target_os = "windows")
+            && tine_core::graph_paths::is_windows_wsl_rootfs(&root.to_string_lossy()),
         graph_root: root.display().to_string(),
+        display_graph_root: tine_core::graph_paths::normalize_graph_path(
+            &root.display().to_string(),
+        ),
+        display_external_assets_path: inspection
+            .external_assets
+            .as_ref()
+            .map(|path| tine_core::graph_paths::normalize_graph_path(&path.display().to_string())),
         external_assets_path: inspection
             .external_assets
             .map(|path| path.display().to_string()),
@@ -347,6 +352,9 @@ pub(crate) async fn load_graph(
                 .write()
                 .unwrap()
                 .release_binding(&label, binding_generation);
+            if released.is_some() {
+                crate::spotlight::released(&app, &label, Some(binding_generation));
+            }
             // Closed (and its ~200 ms Store teardown) outside the lock.
             drop(released);
         }
@@ -361,6 +369,32 @@ pub(crate) async fn load_graph(
     } = &result
     {
         crate::complete_pending_capture_show(&app, label.clone(), *binding_generation);
+    }
+    // The iOS Simulator probe (.github/workflows/ios-probe.yml) copies the Guide
+    // into the graph it just opened, through the same bound-slot writer as the
+    // Guide button (master 3fa9d51d7). Simulator-only, so a hidden launch
+    // argument never becomes product behaviour on physical devices.
+    #[cfg(all(target_os = "ios", target_abi = "sim"))]
+    if std::env::args().any(|argument| argument == "--tine-ci-copy-guide") {
+        let binding_generation = result
+            .binding_generation()
+            .ok_or_else(|| "iOS Guide-copy probe did not retain the requested graph".to_string())?;
+        let worker_app = app.clone();
+        let worker_label = label.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let state = worker_app.state::<AppState>();
+            let slot = crate::state::slot_for_bound_window(
+                &state,
+                &worker_label,
+                Some(binding_generation),
+            )?;
+            tine_graph_features::guide::copy_guide_into_graph(&slot.store, "Tine Guide")
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| format!("iOS Guide-copy probe worker failed: {error}"))?
+        .map_err(|error| format!("iOS Guide-copy probe failed: {error}"))?;
+        crate::debug::diag("ios-guide-copy-probe-completed");
     }
     Ok(result)
 }
@@ -462,6 +496,9 @@ pub(crate) fn load_graph_for_label(
         .bind(window_label.to_string(), slot.clone())?;
     // The replaced graph's Store closes here, after the registry lock is
     // released, so other graph commands do not wait on its teardown.
+    // The previous binding's pages leave Spotlight; this graph's reindex
+    // follows its warm.
+    crate::spotlight::bound(app, window_label, &slot);
     drop(displaced);
     state.note_focused(window_label);
     crate::concord_ledger::attach(app.path().app_data_dir().ok(), &slot);
@@ -551,6 +588,7 @@ pub(crate) async fn open_graph_window(
                 }
                 Err(error) => {
                     let _ = crate::state::release_window_graph(&state.graphs, &label);
+                    crate::spotlight::released(&app, &label, None);
                     return Err(format!("couldn't create graph window: {error}"));
                 }
             }
@@ -616,9 +654,21 @@ impl LoadGraphResult {
 /// write into a user's existing files. Does NOT load the graph — the frontend
 /// calls `load_graph` with the returned path (matching the "open existing" flow).
 #[tauri::command]
-pub(crate) async fn create_graph(dir: String) -> Result<String, String> {
+pub(crate) async fn create_graph(dir: String) -> Result<CreatedGraph, String> {
     // Writes and fsyncs every demo page (R3): off the main thread.
-    crate::state::off_ui(move || create_graph_blocking(dir)).await
+    crate::state::off_ui(move || {
+        create_graph_blocking(dir).map(|root| CreatedGraph {
+            display_root: tine_core::graph_paths::normalize_graph_path(&root),
+            root,
+        })
+    })
+    .await
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct CreatedGraph {
+    root: String,
+    display_root: String,
 }
 
 fn create_graph_blocking(dir: String) -> Result<String, String> {
@@ -739,6 +789,10 @@ pub(crate) fn warm_cache_async(
                 });
                 if still_current && current.unwrap().finish_startup_warm(warm_generation) {
                     let _ = app.emit_to(&window_label, "warm-cache-done", ());
+                }
+                if still_current {
+                    // The graph is warm: (re)build its Spotlight index (iOS).
+                    crate::spotlight::reindex(&app, &window_label, &slot);
                 }
             },
         );

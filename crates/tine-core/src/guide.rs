@@ -543,10 +543,102 @@ mod rename_guide_tests {
     }
 
     #[test]
+    fn desktop_guide_says_a_store_install_updates_through_the_store() {
+        // GH #307: an MSIX install is updated by the Microsoft Store; the About text is quoted.
+        let platforms = include_str!("templates/platforms-and-mobile.md");
+        for outcome in [
+            "**Installed from the Microsoft Store (MSIX)?**",
+            "\"Updates come from the Microsoft Store.\"",
+            "Tine's own update checker and installer stay off",
+        ] {
+            assert!(
+                platforms.contains(outcome),
+                "missing Store-update Guide outcome: {outcome}"
+            );
+        }
+        let about = include_str!("../../../src/components/AboutTab.tsx");
+        assert!(
+            about.contains(">Updates come from the Microsoft Store.<"),
+            "the Guide quotes Settings → About's Store line; keep them in step"
+        );
+    }
+
+    #[test]
+    fn mobile_guide_names_each_store_as_its_update_channel() {
+        // Store builds ship this Guide, so it must not claim a store listing is missing,
+        // and each store install updates through its store (the in-app updater is off).
+        let platforms = include_str!("templates/platforms-and-mobile.md");
+        for outcome in [
+            "a Google Play install updates through Google Play",
+            "An App Store install updates through the App Store",
+        ] {
+            assert!(
+                platforms.contains(outcome),
+                "missing store-update Guide outcome: {outcome}"
+            );
+        }
+        assert!(
+            !platforms.contains("no App Store listing"),
+            "the App Store build ships this Guide; it must not say there is no listing"
+        );
+    }
+
+    #[test]
     fn a_capture_finished_after_a_graph_switch_is_documented() {
         // og H1b: kept in the graph it was started in, never the new one.
         let mobile = include_str!("templates/platforms-and-mobile.md");
         assert!(mobile.contains("saved into the graph it was started in and not inserted"));
+    }
+
+    #[test]
+    fn ios_guide_says_where_graphs_live_and_that_plugins_stay_off() {
+        // The iOS picker opens only the app's own On My iPhone / iCloud Drive
+        // folders (src/graph.ts switchGraph) and Settings hides Plugins on iOS.
+        let mobile = include_str!("templates/platforms-and-mobile.md");
+        for outcome in [
+            "**On My iPhone → TineOutline** or **iCloud Drive → TineOutline**",
+            "refuses folders from other Files providers",
+            "a remembered graph reopens after an app update",
+            "**Plugins do not run on iOS yet.**",
+        ] {
+            assert!(
+                mobile.contains(outcome),
+                "missing iOS Guide outcome: {outcome}"
+            );
+        }
+        assert!(!mobile.contains("there is no public iOS build yet"));
+    }
+
+    #[test]
+    fn mobile_guide_says_how_to_capture_from_outside_tine() {
+        // GH #608 / ADR 0073: the share target, shortcuts, tile, Spotlight and
+        // App Intents are invisible until the Guide names them, and quick
+        // capture is no longer desktop-only.
+        let mobile = include_str!("templates/platforms-and-mobile.md");
+        for outcome in [
+            "**Share to Tine from any app.**",
+            "a new block at the bottom of today's journal",
+            "keeps the item and tries again",
+            "Retrying never loses the item",
+            "It can add it twice in one rare case",
+            "Tine saves a share whole or not at all",
+            "On iOS the shared text is kept as it is",
+            "**Launcher shortcuts and a Quick Settings tile.**",
+            "The sheet confirms **Saved to Tine**.",
+            "**Spotlight finds your pages.**",
+            "Hidden pages are never added.",
+            "**Add to Tine journal** (it saves without opening Tine, and the block appears the next time you open it)",
+            "`:quick-capture-templates`",
+            "`**{time}** [[quick capture]]: {text} {url}`",
+            "`tine://capture`",
+            "never writes to your graph",
+        ] {
+            assert!(
+                mobile.contains(outcome),
+                "missing mobile capture Guide outcome: {outcome}"
+            );
+        }
+        assert!(!mobile.contains("Global quick capture is desktop-only"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import { installTineLinks } from "./deepLinkNavigation";
+import { installShareIngest } from "./shareIngest";
 import { DeepLinkGraphChoice } from "./components/DeepLinkGraphChoice";
 import { resizeSidebar, commitSidebarWidth } from "./sidebarSizing";
 import { Match, Show, Suspense, Switch, createEffect, createSignal, lazy, on, onCleanup, onMount, type JSX } from "solid-js";
@@ -747,7 +748,8 @@ export function App(): JSX.Element {
   onMount(async () => {
     let alive = true;
     let disposeLinks = () => {};
-    onCleanup(() => { alive = false; disposeLinks(); });
+    let disposeShares = () => {};
+    onCleanup(() => { alive = false; disposeLinks(); disposeShares(); });
     const owner = graphOwner(() => alive);
     const injected = (window as any).__GRAPH_PATH__ ?? "";
     let startup = "";
@@ -761,7 +763,7 @@ export function App(): JSX.Element {
     const graphPath = injected || startup || persistedGraphPath();
     dbg(`loading graph: ${graphPath || "(default/configured)"}`);
     try {
-      if (!(window as any).__TINE_LINK_LAUNCH__ || injected) await loadGraphPath(graphPath);
+      await loadGraphPath(graphPath);
       dbg("graph load call returned");
     } catch (e) {
       // No graph configured (fresh install), or it failed to open. Fall through to
@@ -781,6 +783,9 @@ export function App(): JSX.Element {
       if (!isPublishedExport() && alive) {
         disposeLinks = await installTineLinks(() => alive);
         if (!alive) disposeLinks();
+        // Shared items (ADR 0073) land after the graph is bound.
+        disposeShares = await installShareIngest(() => alive);
+        if (!alive) disposeShares();
       }
     }
   });

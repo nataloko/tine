@@ -920,6 +920,7 @@ impl Store {
             path: path.to_path_buf(),
             cause: error.into(),
         };
+        crate::path_identity::check_new_graph_parent(parent)?;
         let empty = fs::read_dir(parent)
             .map_err(|error| failed(parent, error))?
             .next()

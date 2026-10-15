@@ -1442,6 +1442,9 @@ export function mockBackend(extraPages: PageDto[] = conflictDemoBodies().map((bl
     async pickGraphFolder() {
       return { status: "cancelled" as const };
     },
+    async prepareGraphFolder(_path: string) {
+      return { status: "ready" as const, location: "local" as const };
+    },
     async pickFile(): Promise<string | null> {
       return null;
     },
@@ -1539,7 +1542,7 @@ export function mockBackend(extraPages: PageDto[] = conflictDemoBodies().map((bl
       mockWorkspaces = data; return "durable";
     },
     async gpuEnv(): Promise<GpuEnv> {
-      return { software_forced: false, appimage: false };
+      return { software_forced: false, appimage: false, packaged: false };
     },
     async takeDataHomeFallbackNotice(): Promise<string | null> {
       return null;

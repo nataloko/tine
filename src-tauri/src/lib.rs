@@ -31,12 +31,16 @@ mod flight_store;
 mod git;
 mod graph;
 mod graph_verification;
+#[cfg(target_os = "ios")]
+mod ios_folder_picker;
 #[cfg(target_os = "linux")]
 mod linux_window_identity;
 #[cfg(test)]
 mod load_wait_guard_tests;
 mod media_protocol;
 mod migrate_identifier;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+mod native_integrations;
 mod native_mouse_history;
 mod pdf_crop_rollback;
 mod platform;
@@ -47,7 +51,9 @@ mod query_export;
 mod query_ir;
 mod search_workspace;
 mod settings;
+mod share_inbox;
 mod spellcheck;
+mod spotlight;
 mod state;
 mod watcher;
 mod youtube_identity;
@@ -751,6 +757,13 @@ pub fn run() {
     // (src/edgeSwipe.ts). src/androidBack.test.ts pins this set.
     #[cfg(target_os = "android")]
     let builder = builder.plugin(android_safe_back::init());
+    #[cfg(target_os = "ios")]
+    let builder = builder.plugin(ios_folder_picker::init());
+    // Share inbox, Spotlight and routes (native_integrations.rs, ADR 0073).
+    // Desktop has no share sheet producer: share_inbox.rs and spotlight.rs
+    // name all five targets in their own platform splits.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let builder = builder.plugin(native_integrations::init());
     // Mobile has no xdg-open/open/explorer, so `open_external` routes URL opens
     // through this plugin's platform Intent instead (GH #49). Windows uses it
     // for ShellExecute, because `explorer <url>` opens a File Explorer window
@@ -790,6 +803,7 @@ pub fn run() {
                     }
                 }
                 tauri::WindowEvent::Destroyed => {
+                    spotlight::released(app, label, None);
                     if state::release_window_graph(&state.graphs, label) {
                         #[cfg(target_os = "linux")]
                         platform::kill_webkit_children();
@@ -817,6 +831,8 @@ pub fn run() {
                 flight::persist_init(dir.join("diagnostics"));
             }
             diag("setup() begin");
+            // The persisted Spotlight index may hold a graph this launch never binds.
+            spotlight::launched(app.handle());
             #[cfg(target_os = "linux")]
             youtube_identity::create_windows(app, &youtube_windows);
             #[cfg(desktop)]
@@ -877,6 +893,9 @@ pub fn run() {
             deep_links::scan_known_graphs_for_link,
             deep_links::take_tine_links,
             deep_links::handoff_tine_link,
+            share_inbox::share_inbox_list,
+            share_inbox::share_inbox_prepare,
+            share_inbox::share_inbox_commit,
             open_graph_window,
             startup_graph_path,
             capture_target,
@@ -886,7 +905,12 @@ pub fn run() {
             app_platform,
             local_clock,
             default_graph_parent,
+            #[cfg(not(target_os = "ios"))]
             android_folder_picker::pick_graph_folder,
+            #[cfg(target_os = "ios")]
+            ios_folder_picker::pick_graph_folder,
+            #[cfg(target_os = "ios")]
+            ios_folder_picker::prepare_graph_folder,
             android_media::capture_photo,
             android_media::start_recording,
             android_media::stop_recording,
@@ -1185,6 +1209,34 @@ mod mobile_drawer_policy_tests {
             .additional_browser_args
             .as_deref()
             .is_some_and(|args| args.contains("--remote-debugging-port=9222"))));
+    }
+}
+
+#[cfg(all(test, feature = "custom-protocol"))]
+mod packaged_csp_tests {
+    #[test]
+    fn production_context_embeds_the_configured_csp_and_frontend() {
+        let context: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let source: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let embedded = context
+            .config()
+            .app
+            .security
+            .csp
+            .as_ref()
+            .expect("packaged CSP");
+        assert!(
+            !tauri::is_dev(),
+            "test must exercise the production protocol"
+        );
+        assert_eq!(
+            serde_json::to_value(embedded).unwrap(),
+            source["app"]["security"]["csp"],
+            "the compiled context must carry every configured directive"
+        );
+        assert!(context.assets().get(&"index.html".into()).is_some());
+        assert!(context.assets().get(&"capture.html".into()).is_some());
     }
 }
 

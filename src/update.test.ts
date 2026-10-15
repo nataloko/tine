@@ -18,6 +18,8 @@ async function loadUpdate(opts: {
   platformReject?: boolean;
   version?: string;
   architecture?: string;
+  packaging?: string;
+  packagingReject?: boolean;
   updaterReject?: Error;
   updaterUpdate?: object;
   channel?: "stable" | "beta";
@@ -35,6 +37,10 @@ async function loadUpdate(opts: {
   const openSettingsMock = vi.fn();
   const diagnosticFrontendEventMock = vi.fn(async () => {});
   const appArchitectureMock = vi.fn(async () => opts.architecture ?? "x86_64");
+  const gpuEnvMock = vi.fn(async () => {
+    if (opts.packagingReject) throw new Error("package probe unavailable");
+    return { software_forced: false, appimage: false, packaged: opts.packaging === "msix" };
+  });
   const getVersionMock = vi.fn(async () => opts.version ?? "0.5.3");
   const updaterCheckMock = opts.updaterReject
     ? vi.fn<() => Promise<unknown>>(async () => { throw opts.updaterReject; })
@@ -50,6 +56,7 @@ async function loadUpdate(opts: {
       setAppBool: setAppBoolMock,
       openExternal: openExternalMock,
       appArchitecture: appArchitectureMock,
+      gpuEnv: gpuEnvMock,
       diagnosticFrontendEvent: diagnosticFrontendEventMock,
     }),
   }));
@@ -69,6 +76,7 @@ async function loadUpdate(opts: {
   const update = await import("./update");
   return {
     update,
+    gpuEnvMock,
     getAppBoolMock,
     setAppBoolMock,
     platformKindMock,
@@ -88,6 +96,52 @@ async function loadUpdate(opts: {
 // else null. `mockLatest` sets what the channel's manifest says; the mocked plugin
 // applies the same newer-than rule.
 let channelVersion: string | null = null;
+
+describe("MSIX update policy", () => {
+  it("resolves packaged, unpackaged, and failed detection independently for installation", async () => {
+    const { update } = await loadUpdate({});
+    expect(update.resolvePackagedUpdateMode(true, false)).toBe("unavailable");
+    expect(update.resolvePackagedUpdateMode(true, true)).toBe("unavailable");
+    expect(update.resolvePackagedUpdateMode(false, false)).toBe("self");
+    expect(update.resolvePackagedUpdateMode(false, true)).toBe("self");
+    expect(update.resolvePackagedUpdateMode("unknown", false)).toBe("self");
+    expect(update.resolvePackagedUpdateMode("unknown", true)).toBe("unavailable");
+  });
+  it("never checks or offers an update from an MSIX", async () => {
+    const { update, updaterCheckMock, pushToastMock } = await loadUpdate({ packaging: "msix" });
+    await update.checkForUpdate();
+    expect(await update.checkForUpdateNow()).toEqual({ kind: "unavailable" });
+    expect(updaterCheckMock).not.toHaveBeenCalled();
+    expect(pushToastMock).not.toHaveBeenCalled();
+  });
+  it("blocks an existing install action when the package probe reports MSIX", async () => {
+    const download = vi.fn();
+    const { update, gpuEnvMock, updaterCheckMock, pushToastMock, openExternalMock } = await loadUpdate({
+      updaterUpdate: { version: "0.6.0-beta.1", close: vi.fn(), download },
+    });
+    expect((await update.checkForUpdateNow()).kind).toBe("available");
+    gpuEnvMock.mockResolvedValue({ software_forced: false, appimage: false, packaged: true });
+    const checks = updaterCheckMock.mock.calls.length;
+    toastCalls(pushToastMock)[0][2]!.action!.run();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(updaterCheckMock).toHaveBeenCalledTimes(checks);
+    expect(download).not.toHaveBeenCalled();
+    expect(openExternalMock).not.toHaveBeenCalled();
+  });
+  it("a failed package probe retains notification but blocks the install action", async () => {
+    const download = vi.fn();
+    const { update, updaterCheckMock, pushToastMock, openExternalMock } = await loadUpdate({
+      packagingReject: true, version: "0.5.3", updaterUpdate: { version: "0.6.0-beta.1", close: vi.fn(), download },
+    });
+    expect((await update.checkForUpdateNow()).kind).toBe("available");
+    const checks = updaterCheckMock.mock.calls.length;
+    toastCalls(pushToastMock)[0][2]!.action!.run();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(updaterCheckMock).toHaveBeenCalledTimes(checks);
+    expect(download).not.toHaveBeenCalled();
+    expect(openExternalMock).not.toHaveBeenCalled();
+  });
+});
 const triple = (v: string) => (/(\d+)\.(\d+)\.(\d+)/.exec(v) ?? []).slice(1).map(Number);
 function offerFromChannel(running: string) {
   if (!channelVersion) return null;

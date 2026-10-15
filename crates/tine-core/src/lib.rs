@@ -11,6 +11,7 @@ pub mod date;
 pub mod diag_line;
 pub mod doc;
 pub mod edn;
+pub mod graph_paths;
 pub mod guide;
 pub mod html_sanitize;
 pub mod logbook;

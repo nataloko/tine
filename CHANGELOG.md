@@ -8,6 +8,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-10-13
+
+### Added
+
+- Windows MSIX installs show that updates come from the Microsoft Store and disable Tine's self-updater (GH #307).
+- Android: Tine appears in the share sheet. Shared text, links and images become a new block at the bottom of today's journal, the same place quick capture files to, with the same "Captured to today's journal" notice. If an item can't be added yet, for example because no graph is open or saving fails, Tine keeps it and retries the next time it opens. A retry never loses the item; it can add it twice only if Tine is closed or crashes right after the journal was saved, or when an old share is reopened from Android's recent apps after Tine was closed. A share Tine can't save whole (more than 32 images, a file over 64 MiB, a non-image file, a file from Tine itself) is refused with a message instead of being saved in part (GH #608, REG-GH608-SHARE-INBOX-EXACTLY-ONCE).
+- Android: long-press the launcher icon for **Today**, **Quick capture** and **Search**. A **Quick capture** Quick Settings tile (with the Tine mark) opens today's journal with an empty block ready for typing (REG-GH608-ANDROID-SHARE-TARGET). Search and quick capture open with the keyboard already up (UI-ANDROID-ROUTE-KEYBOARD).
+- iOS: a **Tine** share extension saves text, web pages, links and up to five images ("Saved to Tine"), and they land at the bottom of today's journal the next time you open Tine. Pages of the open graph appear in Spotlight search; hidden pages never do. The Shortcuts app and Siri offer **Add to Tine journal**, **Search Tine** and **Open page**, and the Home Screen icon has **Today's journal**, **Quick capture** and **Search** quick actions (REG-IOS-NATIVE-INTEGRATIONS).
+- Shared items are shaped like Logseq's mobile share on each platform, using Logseq's `:quick-capture-templates` from `config.edn`. On Android links become titled links, video links become `{{video}}` embeds and posts on X become `{{twitter}}` embeds; on iOS the shared text and link are kept as they are (REG-GH608-SHARE-SHAPE-OG).
+- `tine://today`, `tine://capture`, `tine://search?q=…` and `tine://page/<name>` open those places in the current graph. They only navigate and never write (REG-NATIVE-APP-ROUTES).
+
+### Fixed
+
+- Android: the native library is aligned for 16 KB memory pages, which Google Play requires and newer Android devices can use; release builds also produce the app bundle Google Play takes.
+- Representable Windows graph paths display without verbatim prefixes; stored canonical paths retain existing graph identity (REG-WIN-GRAPH-PATH).
+- Cold launches from a Tine link restore the last graph before handling the link (UI-WIN-LINK-COLD-START).
+- New graphs refuse Windows access to WSL1 backing rootfs folders; existing graphs warn and remain openable, with advice to use `\\wsl.localhost\<distro>\…` (UI-WIN-WSL-ROOTFS).
+- Opening another graph replaces the previous graph's undismissed Guide announcement (UI-WIN-GUIDE-TOAST-ONCE).
+
+- A page that changed on disk while you were editing one of its blocks (a Syncthing delivery, another editor) now keeps the new text and your editor stays open on that block. Before, on Windows and Android an open code block, or a block whose SCHEDULED/DEADLINE line was not yet in its usual place, could write its old text back over the change and save it, and the editor closed (UI-CARRY-RELOAD-STALE-BLUR).
+- iOS (discussion #421): the folder-choice message now names both places a graph can live, On My iPhone → TineOutline and iCloud Drive → TineOutline. It said "inside On My iPhone", which read as if another app's folder there (such as Logseq's) would work.
+
+## [0.7.1] - 2026-10-08
+
+### Changed
+
+- Security: updated HTML sanitizers and desktop updater TLS dependencies, plus compatible dependency fixes from the review in discussion #564.
+
 ## [0.7.0] - 2026-10-08
 
 Tine 0.7.0 makes the Tine Beta line stable. It is Tine Beta 0.7.0-beta.2 (the
@@ -6553,7 +6581,8 @@ takes over your graph.
 - macOS and Windows installers are currently **unsigned** — on macOS right-click →
   Open; on Windows choose *More info → Run anyway*.
 
-[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/martinkoutecky/tine/compare/v0.7.1...v0.7.2
 [0.6.98]: https://github.com/martinkoutecky/tine/compare/v0.6.97...v0.6.98
 [0.6.90]: https://github.com/martinkoutecky/tine/compare/v0.6.5...v0.6.90
 [0.6.0]: https://github.com/martinkoutecky/tine/compare/v0.5.10...v0.6.0

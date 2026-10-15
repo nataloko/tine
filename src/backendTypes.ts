@@ -43,6 +43,7 @@ export interface GpuEnv {
   /** Running from an AppImage (`$APPIMAGE` set) — its bundled GL stack is the
    *  usual culprit for a silent CPU fallback; steer the user to the deb/rpm. */
   appimage: boolean;
+  packaged: boolean | null;
 }
 
 export interface BackupInfo {
@@ -92,7 +93,11 @@ export interface GraphSources {
 
 export type GraphFolderPickResult =
   | { status: "picked"; path: string }
-  | { status: "permission-requested" | "permission-needed" | "cancelled"; path?: string };
+  | { status: "permission-requested" | "permission-needed" | "cancelled" | "refused"; path?: string };
+
+export type PreparedGraphFolder =
+  | { status: "ready"; location: "local" | "icloud"; path?: string }
+  | { status: "refused"; location?: undefined };
 
 export interface ClipboardAssetFile {
   path: string;
@@ -117,6 +122,7 @@ export interface MediaCaptureResult {
 
 export interface KnownGraph {
   path: string;
+  display_path?: string;
   name: string;
 }
 
@@ -150,6 +156,9 @@ export interface CaptureGraphBindingResult {
 
 export interface GraphAccessInspection {
   graph_root: string;
+  display_graph_root?: string;
+  display_external_assets_path?: string | null;
+  wsl_rootfs?: boolean;
   external_assets_path: string | null;
   approved: boolean;
 }
