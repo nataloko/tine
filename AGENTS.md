@@ -291,13 +291,14 @@ fork's `updateMode()` reads no browser hint at all, so there is no
 the fork's "available upstream" wording. `src/repositoryPaths.test.ts` (GH #579)
 rejects absolute machine paths in tracked files, this one included.
 
-At v0.7.0 the frontend reported `3019 passed | 13 skipped` (unit pass, ~4.5 min) and
-`2499 passed | 3 skipped` (render pass, ~11.5 min), and the Rust core gate `1988 passed,
-2 failed, 9 ignored` in ~31 min. The fork's `crates/`, `Cargo.toml` and
+At v0.7.2 the frontend reported `3082 passed | 13 skipped` (unit pass, ~5 min) and
+`2524 passed | 3 skipped` (render pass, ~12 min), and the Rust core gate `2000 passed,
+1 failed, 9 ignored` in ~30 min (the one red is `i22_macro_fanout` below; the
+checkpoint digest passes under `TMPDIR=/tmp`). The fork's `crates/`, `Cargo.toml` and
 `Cargo.lock` delta against upstream is EMPTY
-(`git diff --stat 84f4de34a mine -- crates Cargo.toml Cargo.lock`), so no core
+(`git diff --stat v0.7.2 mine -- crates Cargo.toml Cargo.lock`), so no core
 test result can be a fork regression; re-run that diff before investigating
-one. Both reds are this host:
+one. Both known reds are this host:
 
 - `tine-store` `store::checkpoint::checkpoint_tests::the_golden_body_is_pinned_to_format`
   hashes a checkpoint body after replacing the temp root path with a same-length
