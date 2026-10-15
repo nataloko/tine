@@ -21,7 +21,7 @@
 
 import { createEffect, createRoot, createSignal, on } from "solid-js";
 import { backend } from "./backend";
-import type { GitResult, GitStatus } from "./gitBackend";
+import { gitBackend, type GitResult, type GitStatus } from "./gitBackend";
 import { graphScopedSignal } from "./binding";
 import { dbg } from "./debug";
 import { dataRev } from "./graphSession";
@@ -76,7 +76,7 @@ export function composeCommitMessage(pages: string[]): string {
  *  lands after a graph switch is dropped. */
 async function refreshGitStatus(): Promise<void> {
   try {
-    const result = await readOwned(graphOwner(), backend().gitStatus());
+    const result = await readOwned(graphOwner(), gitBackend().gitStatus());
     if (result.kind === "current") setRepoStatus(result.value);
   } catch (e) {
     dbg(`git status failed: ${String(e)}`);
@@ -92,7 +92,7 @@ async function refreshGitStatus(): Promise<void> {
 
 async function runCommit(message: string, quiet: boolean): Promise<GitResult | undefined> {
   try {
-    const result = await writeOwned(bindingOwner(), backend().gitCommit(message));
+    const result = await writeOwned(bindingOwner(), gitBackend().gitCommit(message));
     if (result.kind === "stale") return;
     const r = result.value;
     if (!r.ok) pushToast(r.detail, "error");
@@ -108,7 +108,7 @@ async function runCommit(message: string, quiet: boolean): Promise<GitResult | u
 
 async function runPush(quiet: boolean): Promise<GitResult | undefined> {
   try {
-    const result = await writeOwned(bindingOwner(), backend().gitPush());
+    const result = await writeOwned(bindingOwner(), gitBackend().gitPush());
     if (result.kind === "stale") return;
     const r = result.value;
     // A push rejected because the remote moved stays sticky so the user can act on
@@ -127,7 +127,7 @@ async function runPush(quiet: boolean): Promise<GitResult | undefined> {
 
 async function runPull(quiet: boolean): Promise<GitResult | undefined> {
   try {
-    const result = await writeOwned(bindingOwner(), backend().gitPull());
+    const result = await writeOwned(bindingOwner(), gitBackend().gitPull());
     if (result.kind === "stale") return;
     const r = result.value;
     if (!r.ok) pushToast(r.detail, "warn");
@@ -145,7 +145,7 @@ async function runPull(quiet: boolean): Promise<GitResult | undefined> {
 // loud — they overwrite data, so the outcome must be visible.
 async function runForcePush(): Promise<void> {
   try {
-    const result = await writeOwned(bindingOwner(), backend().gitForcePush());
+    const result = await writeOwned(bindingOwner(), gitBackend().gitForcePush());
     if (result.kind === "stale") return;
     pushToast(result.value.detail, result.value.ok ? "success" : "warn");
     await refreshGitStatus();
@@ -156,7 +156,7 @@ async function runForcePush(): Promise<void> {
 
 async function runForcePull(): Promise<void> {
   try {
-    const result = await writeOwned(bindingOwner(), backend().gitForcePull());
+    const result = await writeOwned(bindingOwner(), gitBackend().gitForcePull());
     if (result.kind === "stale") return;
     pushToast(result.value.detail, result.value.ok ? "success" : "warn");
     await refreshGitStatus();
@@ -268,7 +268,7 @@ export async function forcePullNow(): Promise<void> {
 /** "Initialize git repo" affordance for an un-versioned graph. */
 export async function initRepo(): Promise<void> {
   try {
-    const result = await writeOwned(bindingOwner(), backend().gitInit());
+    const result = await writeOwned(bindingOwner(), gitBackend().gitInit());
     if (result.kind === "stale") return;
     setRepoStatus(result.value);
     pushToast("Initialized a git repo for this graph.", "success");

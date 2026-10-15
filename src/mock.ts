@@ -6,7 +6,6 @@ import type { GraphVerificationReport } from "./graphVerification";
 import type { Backend, GpuEnv, DebugInfo, DiagnosticFrontendKind, DiagnosticReport, InstalledPluginRecord, PluginRegistryCacheEnvelope } from "./backend";
 import { CONFLICT_DEMO_PAGE, conflictDemoBodies, mockConflictApi } from "./mockConflicts";
 import { mockQueryCommands } from "./mockQuery";
-import { mockGitCommands } from "./gitBackend"; // FORK: git integration
 import type { BacklinkFilterContext, BacklinkFilterTarget, BlockDto, DraftRecord, BlockPreview, GuideCopyResult, GuidePage, Highlight, PageDto, PageEntry, PageInventory, PageInventoryEntry, PdfState, QueryExecution, QueryExportBatch, QueryExportSpec, RefGroup, ResolvedPage } from "./types";
 import { SAMPLE_PDF_B64 } from "./sample-pdf";
 import { previewDtoSubtree } from "./previewProjection";
@@ -1579,7 +1578,6 @@ export function mockBackend(extraPages: PageDto[] = conflictDemoBodies().map((bl
     async listSpellcheckDictionaries(): Promise<string[]> { return ["cs_CZ", "de_DE", "en_GB", "en_US", "fr_FR", "sk_SK"]; },
     async debugInfo(): Promise<DebugInfo> { return { enabled: false, path: "", recorderActive: false, previousExitUnclean: false }; },
     async debugLog(_line: string): Promise<void> { /* no-op in the browser mock */ },
-    ...mockGitCommands(), // FORK: a simulated repo for the "mine (extras)" Git UI
     async diagnosticReport(): Promise<DiagnosticReport> { return { text: JSON.stringify({ schemaVersion: 1, sessions: { current: mockDiagnostics.map((kind) => ({ event: "frontend", kind })) } }, null, 2), suggestedFileName: "tine-diagnostics.json" }; },
     async saveDiagnosticReport(): Promise<boolean> { return false; },
     async clearDiagnostics(): Promise<void> { mockDiagnostics.length = 0; },

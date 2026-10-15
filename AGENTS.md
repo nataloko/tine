@@ -57,8 +57,10 @@ constrain the fork are in `src/ogEnforcement.test.ts`, driven by
   not exceed 1,500 lines, and a file already over that at the frozen baseline
   `2d0349368` may not grow past its baseline count. Fork code therefore lives in
   fork-only files, with only a few hook lines in upstream files. `src/backend.ts`
-  is the tight one: 1,498 of 1,500 at v0.7.0, so the fork has two lines of
-  headroom there.
+  is the tight one: upstream's own copy is exactly 1,500 lines since v0.7.2, so
+  the fork keeps no lines there at all (see Git integration). Before a sync,
+  count every shared surface near the cap with `lines()` from
+  `scripts/lib/og-enforcement.mjs`; Git merges an overflow without a conflict.
 - **Writer sites.** Every low-level file write per file is counted. The fork
   pins `src-tauri/src/git.rs` (one `fs::write`, the default `.gitignore`) with a
   `FORK:` row in `APPROVED_WRITER_SITES`. Any new write in `git.rs` must update it.
@@ -83,16 +85,15 @@ The surfaces:
     again, like every 0.7 command; `GitResult` still carries `needs_pull`, so
     `src/git.ts` never parses the detail text.
   - `src/gitBackend.ts` owns the frontend contract: `GitStatus`, `GitResult`, the
-    `GitBackend` interface, `installGitCommands` (puts the seven methods on
-    `TauriBackend.prototype`, each through the class's own `call`), and
-    `mockGitCommands` (spread into `mockBackend()`). `src/backend.ts` carries
-    four `FORK` lines: the import, `Backend extends GitBackend`,
-    `interface TauriBackend extends GitBackend {}`, and the install call.
-    `src/mock.ts` carries two. Import the git types from `./gitBackend`;
-    `backend.ts` does not re-export them.
-  - `src/publishedBackend.ts` lists the seven `git*` methods in
-    `PUBLISHED_REFUSED_METHODS`. Its guard only sees direct `Backend` members, so
-    it no longer demands them, but the refusal is still the right behavior.
+    `GitBackend` interface, and `gitBackend()`, which `src/git.ts` calls instead
+    of `backend()`. In the app it invokes the seven commands directly (dynamic
+    `@tauri-apps/api/core` import, like `nativeTineLinks.ts`); in the browser mock
+    it is a small simulated repo; in a published export it returns the published
+    backend, whose catch-all refuses every method it does not answer. Since the
+    v0.7.2 sync the git methods are NOT on upstream's `Backend`, so `backend.ts`,
+    `mock.ts` and `publishedBackend.ts` carry no fork lines. The cost: git calls
+    skip `TauriBackend.call`'s slow-IPC timing. The I-20 guard only scans
+    `backend()` calls, so `git.ts` keeps `readOwned`/`writeOwned` by convention.
   - `src/gitSaves.ts` is the auto-commit's view of saving. 0.7 no longer bumps
     `dataRev` when a save lands, so upstream's `notePublished()` in
     `src/document/save/engine.ts` (called at every landed save) carries one
@@ -120,7 +121,10 @@ The surfaces:
   forever, because the fork publishes no manifest (`createUpdaterArtifacts:
   false`). One behavior keeps it safe: `updateMode()` returns `"manual"` on every
   desktop platform, so upstream's download, exit-gate, install and relaunch
-  block is never reached. That matters more now: the endpoint and `pubkey` are
+  block is never reached. Upstream's v0.7.2 MSIX check stays just above the
+  fork's return: inside a Microsoft Store package it answers `"unavailable"`, and
+  when the package probe fails the toast still shows but its button does nothing
+  (the fork never ships an MSIX, so upstream's four MSIX tests pass unedited). That matters more now: the endpoint and `pubkey` are
   upstream's, so `"self"` would install stock Tine over the fork. Keep that
   block unedited so upstream's fixes keep merging. The fork's edits, each
   marked `FORK:`:
@@ -134,7 +138,7 @@ The surfaces:
     `it.skip`/`it.skip.each` (stable payload refusal on the install check, the
     GH #343 failed-install report, and the whole exit-gate block except its App
     source scan). Skipped rather than deleted so upstream's edits to them keep
-    merging; expect `45 passed | 11 skipped` for the updater files.
+    merging; expect `45 passed | 11 skipped` for `src/update.test.ts` (v0.7.2).
 - Full highlight.js: `src/render/body.tsx` lazy-loads `highlight.js` (every
   language) where upstream loads `highlight.js/lib/common`.
 - Fork CSS: `src/styles/mine.css`, imported last from `src/main.tsx`. 0.7 has no
@@ -246,14 +250,15 @@ npx tsc --noEmit
 npx vitest run --maxWorkers=2 --testTimeout=30000
 npx vitest run --config vitest.render.config.ts --maxWorkers=2 --testTimeout=30000
 npm run test:e2e-harness
+npm run test:github
 npm run build
 nix-shell -p cargo rustc gcc pkg-config \
   --run 'TMPDIR=/tmp cargo test --no-fail-fast -p tine-core -p tine-store -p tine-graph-features'
 nix-shell -p cargo rustc gcc pkg-config webkitgtk_4_1 gtk3 librsvg glib cairo pango gdk-pixbuf atk libsoup_3 openssl --run 'cargo check -p tine'
 ```
 
-At v0.7.0 `npm test` is exactly the two Vitest passes plus `test:e2e-harness`;
-run them as above. This host has **4 cores**, and Vitest's default worker count
+At v0.7.2 `npm test` is exactly the two Vitest passes plus `test:e2e-harness`
+and `test:github`; run them as above. This host has **4 cores**, and Vitest's default worker count
 starves the timing-sensitive suites, so `--maxWorkers=2 --testTimeout=30000` is
 the real signal; a failure that survives it is a real failure. A single guard
 file run on its own still needs `--testTimeout=30000`: 0.7's whole-repo scans
@@ -266,7 +271,9 @@ the fork follows them rather than pinning exemptions:
   through `readOwned`/`writeOwned` with an owner from `src/owned.ts`. `git.ts`
   runs each git op under `bindingOwner()` (the op always completes; its toast and
   status land only while that graph is open), status reads under `graphOwner()`,
-  and `ExtrasTab.tsx`'s force-op confirm dialogs under `bindingOwner()`.
+  and `ExtrasTab.tsx`'s force-op confirm dialogs under `bindingOwner()`. The
+  guard only sees `backend()` calls, so it no longer checks `gitBackend()`; keep
+  the owners anyway.
 - Device preferences use `writePreference`/`loadPreference`
   (`src/preferenceWrites.ts`): `bulletThreading.ts` and `git.ts`'s three
   settings. That also satisfies I-9 (`errorSwallow`: no `.catch(() => {})`).

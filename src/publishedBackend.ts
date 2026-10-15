@@ -1096,16 +1096,6 @@ export const PUBLISHED_REFUSED_METHODS = [
   "createGraphVerification",
   "cancelGraphVerification",
   "saveGraphVerificationReport",
-  // FORK: the git integration. A published export is a baked snapshot with no
-  // working tree and no repository behind it, so every one of these refuses —
-  // gitStatus included, which is a read but has nothing to read from.
-  "gitStatus",
-  "gitInit",
-  "gitCommit",
-  "gitPush",
-  "gitPull",
-  "gitForcePush",
-  "gitForcePull",
 ] as const;
 
 /** Optional `Backend` members a published export leaves absent. */

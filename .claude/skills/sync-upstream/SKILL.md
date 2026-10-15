@@ -28,7 +28,7 @@ when there's something to decide.
   - **Shared** — exists upstream AND carries fork edits on top. These are the files that can
     interact silently, so every one upstream touched must be read. Currently ~20 files, from
     the obvious (`Block.tsx`, `Settings.tsx`, `update.ts`, `app.css`) to easily-forgotten ones
-    (`AboutTab.tsx`, `mock.ts`, `backend.ts`, `ui.ts`, `App.tsx`, `main.tsx`,
+    (`AboutTab.tsx`, `ui.ts`, `App.tsx`, `main.tsx`,
     `settingsSearch.ts`, `src/document/save/engine.ts`, `scripts/lib/og-enforcement.mjs`,
     `src-tauri/src/lib.rs`, `tauri.conf.json`).
   - **Fork-only** — upstream has never seen these, so they can never conflict:
@@ -110,6 +110,24 @@ Then judge three things:
   reached `mine` unnoticed by every mechanical check.
 - **Dep/pin check:** did `package.json` / `Cargo.*` change (→ reinstall)? did the lsdoc pin
   (`crates/tine-core/Cargo.toml`) or `src/render/wasm/` change (→ `npm run build:wasm` + wasm-pin)?
+- **Size check:** upstream's 1,500-line cap (`src/ogEnforcement.test.ts`) can break on a
+  merge that git reports clean, when upstream fills a file the fork also adds lines to.
+  v0.7.2 did exactly that to `src/backend.ts` (upstream 1,500 + fork 3), so the fork moved
+  its git methods out. Run the ratchet's own rule over the merged shared surfaces:
+  ```bash
+  T=$(git merge-tree --write-tree mine "$TAG" | head -1)
+  node -e 'import("./scripts/lib/og-enforcement.mjs").then((m) => {
+    const git = (rev, f) => { try { return m.lines(require("node:child_process").execFileSync("git", ["show", `${rev}:${f}`],
+      { encoding: "utf8", maxBuffer: 1 << 26, stdio: ["ignore", "pipe", "ignore"] })); } catch { return undefined; } };
+    const current = {}, baseline = {};
+    for (const f of process.argv.slice(2).filter(m.isProduction)) {
+      current[f] = git(process.argv[1], f); baseline[f] = git(m.BASE, f);
+      if (current[f] === undefined) delete current[f];
+    }
+    try { m.checkSizeRatchet(current, baseline); console.log("size ratchet: ok"); } catch (e) { console.log(e.message); }
+  })' "$T" $SHARED
+  ```
+  Anything but `size ratchet: ok` fails the gate later: treat it like a conflict and STOP.
 
 ## Step 3 — Decision gate
 - **CLEAN** (no conflicts AND no overlap AND the tag descends from the last synced release)

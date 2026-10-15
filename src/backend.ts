@@ -57,7 +57,6 @@ import type { SheetExport, SheetInput, SheetScope } from "./sheet/staticExport";
 import { isPublishedExport, publishedBackend } from "./publishedBackend";
 
 import { nativeTineLinks, type NativeTineLinks } from "./nativeTineLinks";
-import { installGitCommands, type GitBackend } from "./gitBackend"; // FORK
 
 /** Typed result of `trashAsset`: `referenced` = another reference remains, file kept. */
 export type TrashAssetOutcome = "trashed" | "referenced";
@@ -142,7 +141,7 @@ export async function clipboardImageToPng(img: ClipboardImage): Promise<Uint8Arr
   return encoded.byteLength <= ASSET_INGRESS_MAX_BYTES ? new Uint8Array(encoded) : null;
 }
 
-export interface Backend extends GitBackend { // FORK: + git integration, src/gitBackend.ts
+export interface Backend {
   graphBindingGeneration(): number;
   inspectGraphAccess(path: string): Promise<GraphAccessInspection>;
   approveExternalAssets(graphRoot: string, assetsPath: string): Promise<void>;
@@ -1484,8 +1483,6 @@ class TauriBackend implements Backend {
     return this.call<void>("set_smooth_scroll", { value });
   }
 }
-interface TauriBackend extends GitBackend {} // FORK: its git commands come from:
-installGitCommands(TauriBackend.prototype); // FORK: git integration
 
 let _backend: Backend | null = null;
 

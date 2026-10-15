@@ -1,10 +1,13 @@
-// FORK: the git integration's slice of the `Backend` contract (issue #33), kept
-// out of src/backend.ts. Upstream caps a production file at 1,500 lines
-// (src/ogEnforcement.test.ts) and backend.ts sits just under it, so the fork's
-// whole footprint there is four lines: an import, `Backend extends GitBackend`,
-// the matching `interface TauriBackend extends GitBackend {}` merge, and the
-// `installGitCommands(TauriBackend.prototype)` call below. The command
-// names match `src-tauri/src/git.rs`.
+// FORK: the git integration's native commands (issue #33), reached through
+// `gitBackend()` rather than upstream's `Backend`. Upstream caps a production
+// file at 1,500 lines (src/ogEnforcement.test.ts) and since v0.7.2 its own
+// backend.ts sits exactly at that cap, so the fork keeps no lines there (nor in
+// mock.ts or publishedBackend.ts). Callers still run every command under
+// `readOwned`/`writeOwned` (I-20), though that guard only scans `backend()`.
+// The command names match `src-tauri/src/git.rs`.
+
+import { backend, isTauri } from "./backend";
+import { isPublishedExport } from "./publishedBackend";
 
 /** Repo status for the git integration's status line / topbar badge. */
 export interface GitStatus {
@@ -51,29 +54,40 @@ export interface GitBackend {
   gitForcePull(): Promise<GitResult>;
 }
 
-type GitCommandHost = { call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> };
+let instance: GitBackend | null = null;
 
-/** Give the native backend class the seven git commands. Each goes through the
- *  class's own `call`, so it keeps upstream's IPC diagnostics (none is in the
- *  ordered write lane, so a slow push never holds a save back); `git.rs` ignores
- *  the binding generation `call` adds. */
-export function installGitCommands(proto: object): void {
-  const methods: { [K in keyof GitBackend]: (this: GitCommandHost, ...args: Parameters<GitBackend[K]>) => ReturnType<GitBackend[K]> } = {
-    gitStatus() { return this.call<GitStatus>("git_status"); },
-    gitInit() { return this.call<GitStatus>("git_init"); },
-    gitCommit(message) { return this.call<GitResult>("git_commit", { message }); },
-    gitPush() { return this.call<GitResult>("git_push"); },
-    gitPull() { return this.call<GitResult>("git_pull"); },
-    gitForcePush() { return this.call<GitResult>("git_force_push"); },
-    gitForcePull() { return this.call<GitResult>("git_force_pull"); },
-  };
-  Object.assign(proto, methods);
+/** The git commands for this window: native in the app, a simulated repo in the
+ *  browser mock. A published export is a baked snapshot with no working tree, so
+ *  there it is the published backend itself, which refuses (read-only) every
+ *  method it does not answer, gitStatus included. */
+export function gitBackend(): GitBackend {
+  if (isTauri()) return (instance ??= nativeGitCommands());
+  if (isPublishedExport()) return backend() as unknown as GitBackend;
+  return (instance ??= mockGitCommands());
 }
 
-/** The browser mock's git (`npm run dev`), spread into `mockBackend()`. A tiny
- *  simulated repo so the "mine (extras)" Git UI is exercisable without a real
- *  one: commit clears the dirty count, push clears "ahead", pull is a no-op. */
-export function mockGitCommands(): GitBackend {
+/** Plain IPC: no command here is in upstream's ordered write lane, so a slow
+ *  push never holds a save back, and `git.rs` finds the graph from the window. */
+function nativeGitCommands(): GitBackend {
+  const call = async <T>(cmd: string, args?: Record<string, unknown>): Promise<T> => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke<T>(cmd, args);
+  };
+  return {
+    gitStatus: () => call<GitStatus>("git_status"),
+    gitInit: () => call<GitStatus>("git_init"),
+    gitCommit: (message) => call<GitResult>("git_commit", { message }),
+    gitPush: () => call<GitResult>("git_push"),
+    gitPull: () => call<GitResult>("git_pull"),
+    gitForcePush: () => call<GitResult>("git_force_push"),
+    gitForcePull: () => call<GitResult>("git_force_pull"),
+  };
+}
+
+/** The browser mock's git (`npm run dev`). A tiny simulated repo so the
+ *  "mine (extras)" Git UI is exercisable without a real one: commit clears the
+ *  dirty count, push clears "ahead", pull is a no-op. */
+function mockGitCommands(): GitBackend {
   const repo = { is_repo: true, branch: "main", dirty: 2, ahead: 1, behind: 0, last: "a1b2c3d edits" };
   const status = async (): Promise<GitStatus> => ({
     is_repo: repo.is_repo,
