@@ -1,0 +1,1 @@
+First-run fixes: after you grant All files access, Tine continues straight to the folder picker. On phones the sidebar starts closed instead of covering your journal, and query headers stay readable instead of wrapping letter by letter.

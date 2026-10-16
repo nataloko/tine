@@ -7103,8 +7103,19 @@ img.emoji {
   color: var(--text-secondary);
   margin-bottom: 6px;
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: center;
+}
+/* Phone width: the title keeps whole words and the view switcher wraps below it
+   as a unit, instead of the row squeezing the title to one letter per line. */
+.query-header .query-title {
+  word-break: normal;
+  overflow-wrap: break-word;
+}
+.query-header .query-export-action {
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .query-collapse {
@@ -7127,6 +7138,7 @@ img.emoji {
 
 .query-view-switcher {
   margin-left: auto;
+  flex-shrink: 0;
   display: inline-flex;
   border: 1px solid var(--border-color);
   border-radius: 5px;
@@ -7141,6 +7153,7 @@ img.emoji {
   background: transparent;
   color: var(--text-secondary);
   cursor: pointer;
+  white-space: nowrap;
 }
 .query-view-switcher button:first-child {
   border-left: 0;
