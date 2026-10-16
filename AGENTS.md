@@ -138,7 +138,7 @@ The surfaces:
     `it.skip`/`it.skip.each` (stable payload refusal on the install check, the
     GH #343 failed-install report, and the whole exit-gate block except its App
     source scan). Skipped rather than deleted so upstream's edits to them keep
-    merging; expect `45 passed | 11 skipped` for `src/update.test.ts` (v0.7.2).
+    merging; expect `45 passed | 11 skipped` for `src/update.test.ts` (v0.7.4).
 - Full highlight.js: `src/render/body.tsx` lazy-loads `highlight.js` (every
   language) where upstream loads `highlight.js/lib/common`.
 - Fork CSS: `src/styles/mine.css`, imported last from `src/main.tsx`. 0.7 has no
@@ -257,7 +257,7 @@ nix-shell -p cargo rustc gcc pkg-config \
 nix-shell -p cargo rustc gcc pkg-config webkitgtk_4_1 gtk3 librsvg glib cairo pango gdk-pixbuf atk libsoup_3 openssl --run 'cargo check -p tine'
 ```
 
-At v0.7.2 `npm test` is exactly the two Vitest passes plus `test:e2e-harness`
+At v0.7.4 `npm test` is exactly the two Vitest passes plus `test:e2e-harness`
 and `test:github`; run them as above. This host has **4 cores**, and Vitest's default worker count
 starves the timing-sensitive suites, so `--maxWorkers=2 --testTimeout=30000` is
 the real signal; a failure that survives it is a real failure. A single guard
@@ -291,12 +291,12 @@ fork's `updateMode()` reads no browser hint at all, so there is no
 the fork's "available upstream" wording. `src/repositoryPaths.test.ts` (GH #579)
 rejects absolute machine paths in tracked files, this one included.
 
-At v0.7.2 the frontend reported `3082 passed | 13 skipped` (unit pass, ~5 min) and
-`2524 passed | 3 skipped` (render pass, ~12 min), and the Rust core gate `2000 passed,
+At v0.7.4 the frontend reported `3083 passed | 13 skipped` (unit pass, ~5 min) and
+`2528 passed | 3 skipped` (render pass, ~12 min), and the Rust core gate `2000 passed,
 1 failed, 9 ignored` in ~30 min (the one red is `i22_macro_fanout` below; the
 checkpoint digest passes under `TMPDIR=/tmp`). The fork's `crates/`, `Cargo.toml` and
 `Cargo.lock` delta against upstream is EMPTY
-(`git diff --stat v0.7.2 mine -- crates Cargo.toml Cargo.lock`), so no core
+(`git diff --stat v0.7.4 mine -- crates Cargo.toml Cargo.lock`), so no core
 test result can be a fork regression; re-run that diff before investigating
 one. Both known reds are this host:
 
