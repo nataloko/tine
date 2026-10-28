@@ -1,0 +1,1 @@
+Bug fixes: Linux no longer opens a blank window with older NVIDIA drivers; a new page opened in the right sidebar can be edited; clicking a hidden cloze reveals it; Expand and Collapse work in embeds; a Windows save race is fixed.
