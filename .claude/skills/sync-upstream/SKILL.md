@@ -29,8 +29,10 @@ when there's something to decide.
     interact silently, so every one upstream touched must be read. Currently ~20 files, from
     the obvious (`Block.tsx`, `Settings.tsx`, `update.ts`, `app.css`) to easily-forgotten ones
     (`AboutTab.tsx`, `ui.ts`, `App.tsx`, `main.tsx`,
-    `settingsSearch.ts`, `src/document/save/engine.ts`, `scripts/lib/og-enforcement.mjs`,
-    `src-tauri/src/lib.rs`, `tauri.conf.json`).
+    `settingsSearch.ts`, `src/document/host/wiring.ts`, `scripts/lib/og-enforcement.mjs`,
+    `src-tauri/src/lib.rs`, `src-tauri/src/command_surface.rs`, `tauri.conf.json`, and the
+    localization files `src/i18n/literals-baseline.json`, `src/i18n/messages.gen.ts` and
+    `src/i18n/locales/zh-CN/.source-hashes.json`; see `AGENTS.md` for how each is re-derived).
   - **Fork-only** — upstream has never seen these, so they can never conflict:
     `src/bulletThreading.ts`, `src/git.ts`(+test), `src/gitBackend.ts`, `src/gitSaves.ts`,
     `src/components/ExtrasTab.tsx`, `src/components/block/*`, `src/styles/mine.css`,
@@ -94,7 +96,7 @@ SHARED=$(git diff --name-only "$BASE" mine -- src/ src-tauri/ \
 git diff --stat "$BASE" "$TAG" -- $SHARED
 
 # Did upstream reimplement a fork feature? Any hit here needs reading in full:
-git diff "$BASE" "$TAG" | grep -inE 'bulletThread|thread-svg|loadHljs|calcSource|enteredCalc|notePublished|updateMode|downloadAndInstall|createUpdaterArtifacts|updater.*endpoints|"extras"|gitStatus'
+git diff "$BASE" "$TAG" | grep -inE 'bulletThread|bullet threading|thread-svg|--thread-color|loadHljs|calcSource|enteredCalc|notePublication|c\.published\(|updateMode|downloadAndInstall|createUpdaterArtifacts|updater.*endpoints|"extras"|gitStatus|KNOWN_COMMANDS'
 ```
 Then judge three things:
 - **Conflicts:** does `merge-tree` list any conflicted files?
@@ -110,6 +112,9 @@ Then judge three things:
   reached `mine` unnoticed by every mechanical check.
 - **Dep/pin check:** did `package.json` / `Cargo.*` change (→ reinstall)? did the lsdoc pin
   (`crates/tine-core/Cargo.toml`) or `src/render/wasm/` change (→ `npm run build:wasm` + wasm-pin)?
+  Did `@tauri-apps/cli` change version in `package-lock.json` (→ re-vendor
+  `src-tauri/nsis/installer.nsi` at the matching `tauri-cli-v*` tag; see `AGENTS.md`)? No local
+  gate builds the NSIS installer, so a stale template only fails in the Windows build.
 - **Size check:** upstream's 1,500-line cap (`src/ogEnforcement.test.ts`) can break on a
   merge that git reports clean, when upstream fills a file the fork also adds lines to.
   v0.7.2 did exactly that to `src/backend.ts` (upstream 1,500 + fork 3), so the fork moved
@@ -155,6 +160,9 @@ nix-shell -p cargo rustc gcc pkg-config \
   --run 'TMPDIR=/tmp cargo test --no-fail-fast -p tine-core -p tine-store -p tine-graph-features'
 # (TMPDIR=/tmp: a checkpoint golden-digest test fails under nix-shell's own TMPDIR.)
 npm run build
+# Upstream's "App crate tests" step (0.8+; needs the build above and the WebKit/GTK libs):
+nix-shell -p cargo rustc gcc pkg-config webkitgtk_4_1 gtk3 librsvg glib cairo pango gdk-pixbuf atk libsoup_3 openssl \
+  --run 'cargo test --no-fail-fast -p tine --lib'
 ```
 Any gate failure → **STOP and report** (this is where upstream changes to shared files like
 `facets.ts`/`store.ts`/`model.rs` surface a semantic break). Sanity-check the merge kept both
@@ -178,8 +186,9 @@ version, `createUpdaterArtifacts: false`, upstream's stable endpoint, the fork's
 > Fork **backend** changes: the core `cargo test` compiles ONLY the core crates, NOT `src-tauri/`
 > (the `tine` app crate). So if an upstream refactor forces a change to a fork `src-tauri/src/*.rs`
 > (e.g. `git.rs` when upstream reshaped `AppState`), a compile break there is invisible to the gates
-> above and only surfaces in the GitHub build. Catch it locally with a `cargo check` on the app crate
-> (needs the WebKit/GTK dev libs the AppImage build uses):
+> above and only surfaces in the GitHub build. Since 0.8 the app crate test step above compiles it
+> (and checks `command_surface.rs` lists the fork's git commands); without the WebKit/GTK libs, at
+> least run
 > `nix-shell -p cargo rustc gcc pkg-config webkitgtk_4_1 gtk3 librsvg glib cairo pango gdk-pixbuf atk libsoup_3 openssl --run 'cargo check -p tine'`
 
 ## Step 5 — Push + build
