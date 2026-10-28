@@ -5,6 +5,11 @@ import { installUpdateForTest, setUpdateExitGuard } from "../update";
 import { setToasts } from "../toasts";
 import { Toasts } from "./Toasts";
 
+// FORK: this build is notification-only (see src/update.ts): `updateMode()` is
+// "manual", so `installUpdateForTest()` opens the releases page and the macOS
+// installer these cases drive is unreachable. Skipped, not deleted, so
+// upstream's edits keep merging.
+
 const native = vi.hoisted(() => ({
   install: vi.fn(async () => {}),
   openExternal: vi.fn(async () => {}),
@@ -46,7 +51,7 @@ function mount() {
   return host;
 }
 
-it.each(["accepted", "rejected"] as const)("GH #405: installed macOS update shows Restart and respects a fresh %s save guard", async (answer) => {
+it.skip.each(["accepted", "rejected"] as const)("GH #405: installed macOS update shows Restart and respects a fresh %s save guard", async (answer) => { // FORK: no install
   const host = mount();
   const prepare = vi.fn<() => Promise<"accepted" | "rejected">>(async () => "accepted");
   const reset = vi.fn();
@@ -66,7 +71,7 @@ it.each(["accepted", "rejected"] as const)("GH #405: installed macOS update show
   else expect(native.relaunch).not.toHaveBeenCalled();
 });
 
-it("GH #405: rollback failure visibly names the previous bundle and offers Download manually", async () => {
+it.skip("GH #405: rollback failure visibly names the previous bundle and offers Download manually", async () => { // FORK: no install
   const host = mount();
   setUpdateExitGuard({ prepare: async () => "accepted", reset: vi.fn() });
   native.install.mockRejectedValueOnce(new Error("failed to install the update and to restore the previous app, which was left at /Applications/private.app"));
