@@ -49,12 +49,13 @@ export function threadClassList(id: string): Record<string, boolean> {
   };
 }
 
-/** The per-depth rainbow colour, handed to CSS as an inline `--thread-color`.
- *  Accent mode leaves it unset so the stroke falls back to `var(--accent)`. */
+/** The per-depth rainbow colour, handed to CSS as an inline `--mine-thread-color`.
+ *  Accent mode leaves it unset so the stroke falls back to `var(--accent)`. Not
+ *  `--thread-color`: upstream's thread-lines plugin sets that one on the same row. */
 export function threadStyle(id: string): JSX.CSSProperties | undefined {
   const role = threadRole(id);
   if (!role || threadColorMode() === "accent") return undefined;
-  return { "--thread-color": THREAD_PALETTE[(role.elbow ?? role.spine ?? 0) % THREAD_PALETTE.length] };
+  return { "--mine-thread-color": THREAD_PALETTE[(role.elbow ?? role.spine ?? 0) % THREAD_PALETTE.length] };
 }
 
 /** The stroke itself: an SVG child of the relative `.ls-block`, so it reflows and
