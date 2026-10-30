@@ -1849,7 +1849,10 @@ impl Store {
                         ));
                     }
                 } else if ty.is_file() {
-                    match entry.metadata() {
+                    let Some(meta) = crate::scan_recheck::listed_metadata(&entry, &path) else {
+                        continue;
+                    };
+                    match meta {
                         Ok(meta) => {
                             if let Ok(id) = store.file_id(area, &rel) {
                                 out.files.push(FileEntry {
@@ -5449,6 +5452,61 @@ mod rev5_tests {
                 .collect::<Vec<_>>(),
             vec!["Unreadable.md", "nested"]
         );
+        assert!(listing.files.is_empty());
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Martin 10/27: a journal a sync tool was replacing (old version moved
+    /// away, new one moved in) was reported "No such file or directory" while
+    /// it existed and loaded. A listed file that vanishes before its metadata
+    /// read is gone or being replaced, never unreadable.
+    #[test]
+    fn scan_treats_a_file_vanishing_mid_scan_as_gone_or_replaced() {
+        let root = std::env::temp_dir().join(format!(
+            "tine-scan-vanish-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("journals")).unwrap();
+        fs::write(root.join("journals/2026_10_26.md"), b"- day\n").unwrap();
+        let store = Store::open(&root, Default::default()).unwrap().0;
+
+        // Replaced: gone at the first look, back at the second.
+        let parked = root.join("journals-parked.md");
+        let (away, back) = (parked.clone(), parked.clone());
+        crate::scan_recheck::SCAN_HOOKS.with(|hooks| {
+            *hooks.borrow_mut() = (
+                Some(Box::new(move |path: &Path| {
+                    fs::rename(path, &away).unwrap()
+                })),
+                Some(Box::new(move |path: &Path| {
+                    fs::rename(&back, path).unwrap()
+                })),
+            );
+        });
+        let listing = store.scan_area(Area::Journals, None).unwrap();
+        assert!(listing.unreadable.is_empty(), "{:?}", listing.unreadable);
+        assert_eq!(
+            listing
+                .files
+                .iter()
+                .map(|f| f.rel.as_str())
+                .collect::<Vec<_>>(),
+            ["2026_10_26.md"]
+        );
+
+        // Removed: gone at both looks.
+        crate::scan_recheck::SCAN_HOOKS.with(|hooks| {
+            *hooks.borrow_mut() = (
+                Some(Box::new(|path: &Path| fs::remove_file(path).unwrap())),
+                None,
+            );
+        });
+        let listing = store.scan_area(Area::Journals, None).unwrap();
+        crate::scan_recheck::SCAN_HOOKS.with(|hooks| *hooks.borrow_mut() = (None, None));
+        assert!(listing.unreadable.is_empty(), "{:?}", listing.unreadable);
         assert!(listing.files.is_empty());
         drop(store);
         fs::remove_dir_all(root).unwrap();

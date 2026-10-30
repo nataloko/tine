@@ -8,6 +8,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-10-29
+
+Bug fixes for Tine 0.8.1: block references picked from the `((` search, Journals on a first launch and while editing, and a page file a sync tool is replacing.
+
+### Fixed
+
+- Picking a block in the `((` or `{{embed ((` block search no longer writes a short temporary id such as `((bmvsgco1s-11))` when the block had no `id::` yet: Tine now gives the block a proper UUID, as Logseq does, so the reference keeps working in Logseq and after restarting Tine. A block that already has an id keeps it (GH #798).
+- A first launch with a default journal template no longer sometimes opens Journals as "Couldn't open this page: Journal feed read failed" while today's template page is still being saved; Journals shows as soon as that save ends (GH #671, E2E-BASE-4).
+- Scrolling the Journals feed keeps loading older days while you are editing a journal day. After some graph-wide changes (for example a sync bringing in many files) the feed could stop at its first three days until you clicked outside the journals (UI-JOURNAL-FEED-PAGING-WHILE-EDITING).
+- A page file that a sync tool is replacing while Tine lists the folder is no longer reported as "couldn't be read" (REG-SCAN-VANISHED-ENTRY).
+
 ## [0.8.1] - 2026-10-27
 
 Bug fixes for Tine 0.8.0: a blank window on Linux with older NVIDIA drivers, a new page in the right sidebar, cloze reveal, Expand and Collapse in embeds, and a Windows save race.
@@ -7006,7 +7017,8 @@ takes over your graph.
 - macOS and Windows installers are currently **unsigned** — on macOS right-click →
   Open; on Windows choose *More info → Run anyway*.
 
-[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/martinkoutecky/tine/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/martinkoutecky/tine/compare/v0.8.0...v0.8.1
 [0.6.98]: https://github.com/martinkoutecky/tine/compare/v0.6.97...v0.6.98
 [0.6.90]: https://github.com/martinkoutecky/tine/compare/v0.6.5...v0.6.90
