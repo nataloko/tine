@@ -8,6 +8,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-10-31
+
+Fixes for Tine 0.8.3: the Microsoft Store package, scrolling past a block embed, and sync apps missing edits on Android shared storage.
+
+### Changed
+
+- Microsoft Store package: needs Windows 11, and only Tine's own three data folders (`%APPDATA%\page.tine.Tine`, `%LOCALAPPDATA%\page.tine.Tine`, `%LOCALAPPDATA%\tine-owners`) are shared with other installs and kept after uninstall; all other app data stays private to the Store package. Windows 10 users install from GitHub.
+
+### Fixed
+
+- Scrolling a long page with an expanded block embed no longer makes the page jump (#810). Scrolling back up past an embed made everything below it jump up by the height of the embed's rows, and jump back when the embed's rows appeared; the embed now keeps the height it had when it scrolled out of view.
+- On Android shared storage, a page saved again now gets a new modification time each time, so Syncthing and other sync apps notice edits that keep the file the same size (before, the page kept its first version's time on devices with the newer storage mode) (#811).
+
+## [0.8.3] - 2026-10-30
+
+### Fixed
+
+- A page with both unsaved edits that could not be saved (it changed on disk) and a sync conflict copy can be resolved again (#800). Its "Two versions of this page arrived" panel used to hide the review of the unsaved edits, and its Apply only said "Resolve this page’s save conflict first". The page now shows the review of the unsaved edits first, noting that the copy comes next, and then the copy's comparison; every version is kept until it is applied. Resolving the unsaved edits also no longer makes the page fail to display ("This page could not be displayed") or show the file as it was before the review, and keeping both versions of a block no longer shows one of the two twice in place of the other (whose next save could have lost it).
+- Choosing a whole side in conflict review now includes its page properties, avoiding an unexplained `io:InvalidInput` failure. A sync copy removed since review leaves the page unchanged and clears the stale conflict; other resolution failures explain what needs attention (CONFLICT-INVALIDINPUT).
+
 ## [0.8.2] - 2026-10-29
 
 Bug fixes for Tine 0.8.1: block references picked from the `((` search, Journals on a first launch and while editing, and a page file a sync tool is replacing.

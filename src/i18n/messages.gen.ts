@@ -272,6 +272,7 @@ export interface MessageArgs {
   "conflict-overview-sync-conflict-copies": {};
   "conflict-overview-unsaved-drafts": {};
   "conflict-overview-version-control-merge-markers": {};
+  "conflict-resolution-another-version-waits": {};
   "conflict-resolution-applied": { "page": string | number; "source": string | number };
   "conflict-resolution-applied-the-resolution-to-but-it-is-not": { "page_name": string | number };
   "conflict-resolution-apply-all-suggested": {};
@@ -283,6 +284,7 @@ export interface MessageArgs {
   "conflict-resolution-both-merge": {};
   "conflict-resolution-choosing-below-folds-the-other-file-into-this": {};
   "conflict-resolution-conflict-unavailable": {};
+  "conflict-resolution-copy-gone": {};
   "conflict-resolution-couldn-t-do-that": { "error": string | number };
   "conflict-resolution-couldn-t-read-this-conflict": { "error": string | number };
   "conflict-resolution-couldn-t-resolve-it": { "error": string | number };

@@ -17,7 +17,7 @@ use tine_core::doc::{self, Document};
 use tine_core::model::{
     decode_page_name, sync_conflict_base, Format, PageDto, PageKind, SyncConflict,
 };
-use tine_core::projection::{assign_doc_runtime_ids, block_to_dto};
+use tine_core::projection::{assign_doc_runtime_ids_unique, block_to_dto};
 use tine_core::sync_diff::{self, SyncConflictDiff};
 use tine_store::{Area, FileId, FileRev, Input, PageHost, PageId, SaveBase, Store};
 
@@ -34,6 +34,23 @@ fn changed(what: &str) -> io::Error {
         io::ErrorKind::AlreadyExists,
         format!("{what} changed on disk"),
     )
+}
+
+/// Confirmed absence of the copy before a write started. Kept distinct from
+/// a missing winner (or a late cleanup failure) across the IPC boundary.
+#[derive(Debug)]
+pub struct ConflictCopyGone;
+
+impl std::fmt::Display for ConflictCopyGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the conflict copy is no longer on disk")
+    }
+}
+
+impl std::error::Error for ConflictCopyGone {}
+
+fn copy_gone() -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, ConflictCopyGone)
 }
 
 pub(crate) fn id(store: &Store, rel: &str) -> io::Result<FileId> {
@@ -608,7 +625,9 @@ pub(crate) fn merge_refused(refusal: sync_diff::MergeRefused) -> io::Error {
 }
 
 pub(crate) fn dto(store: &Store, id: &PageId, mut doc: Document) -> PageDto {
-    assign_doc_runtime_ids(&mut doc.roots, id.as_str());
+    // A merge keeps the draft's live keys beside freshly parsed blocks: never
+    // hand the window two blocks under one key (GH #800).
+    assign_doc_runtime_ids_unique(&mut doc.roots, id.as_str());
     let config = store.config();
     let stem = id
         .as_str()
@@ -836,8 +855,26 @@ fn folded(
     bases: &[String],
     pre_choice: &str,
 ) -> io::Result<Folded> {
-    let (mine, win_rev) = read_text(store, win)?;
-    let (theirs, conf_rev) = read_text(store, conf)?;
+    // Read the copy first: its confirmed absence settles a stale review even
+    // when the winner has since changed. No operation has been planned yet.
+    let (theirs, conf_rev) = read_text(store, conf).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            if sync_copy_winner(conf.as_str()).as_deref() == Some(win.as_str()) {
+                copy_gone()
+            } else {
+                changed("conflict copy")
+            }
+        } else {
+            error
+        }
+    })?;
+    let (mine, win_rev) = read_text(store, win).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            changed("winner")
+        } else {
+            error
+        }
+    })?;
     if String::from(win_rev.clone()) != base_rev {
         return Err(changed("winner"));
     }
@@ -925,12 +962,7 @@ pub fn trash_sync_conflict(
         let max = Some(tine_store::PARSE_INPUT_MAX_BYTES);
         let rev = match store.read(&conf, max) {
             Ok((_, rev)) => rev,
-            Err(tine_store::StoreError::NotFound) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "no such conflict file",
-                ))
-            }
+            Err(tine_store::StoreError::NotFound) => return Err(copy_gone()),
             Err(error) => return Err(crate::store_error(error)),
         };
         trash_copy(store, &conf, rev)
