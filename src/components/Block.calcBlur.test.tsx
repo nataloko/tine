@@ -90,7 +90,7 @@ describe("calc block persistence on blur", () => {
       const outs = [...root.querySelectorAll(".calc-results .calc-out")].map((n) => n.textContent);
       expect(outs).toContain("2");
       // The textarea flipped to the fence-stripped expression buffer.
-      expect((root.querySelector("textarea") as HTMLTextAreaElement).value).toBe("1 + 1");
+      expect(editorIn(root).value()).toBe("1 + 1");
     } finally {
       dispose();
     }

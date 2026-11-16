@@ -48,9 +48,16 @@ jobs:
             libayatana-appindicator3-dev patchelf \
             build-essential curl wget file libssl-dev libxdo-dev
 
+      # Since 0.9 `npm run build` first builds the PDF decoder, which needs exactly
+      # Emscripten 4.0.20 (upstream's release.yml pins the same action and version).
+      - uses: emscripten-core/setup-emsdk@6ab9eb1bda2574c4ddb79809fc9247783eaf9021 # v14
+        with:
+          version: 4.0.20
+
+      # 0.9's package.json requires Node 22.13+ (pdf.js 5).
       - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - uses: dtolnay/rust-toolchain@stable

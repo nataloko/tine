@@ -55,10 +55,10 @@
   "bundle": {
     "active": true,
     "targets": ["appimage", "deb", "rpm", "nsis", "app", "dmg"],
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "macOS": { "infoPlist": "Info.plist" },
     "iOS": { "infoPlist": "Info.plist", "minimumSystemVersion": "15.4" },
-    "windows": { "nsis": { "installerHooks": "tine-url-hooks.nsh" } },
+    "windows": { "nsis": { "installerHooks": "tine-url-hooks.nsh", "template": "nsis/installer.nsi" } },
     "android": {
       "versionCode": 9000
     },
