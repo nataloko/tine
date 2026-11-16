@@ -2173,3 +2173,15 @@ test = "src-tauri/src/owner/git_mobile_tests.rs#a_lock_replaced_between_check_an
 oracle = false
 note = "D-20261029-GSL: explicit click only, under RUN_LOCK, on the guard-checked index.lock and same-gitdir aside path. Recheck regular empty stale lock and offered times; rename aside, verify the moved token, then delete. A changed replacement is hard-linked back without replacing another lock; failed restoration preserves the named aside file. Crash may leave an aside file; no graph/index/ref write. Frozen third-party holders, clock skew and native check-to-call limits are documented in storage-contract I-8."
 mutations = "fs::hard_link=1, fs::remove_file=2, fs::rename=1"
+
+# FORK: nataloko/tine's system-git integration (fork ADR mine/0002). Kept last so
+# upstream's new rows merge without conflict.
+[[site]]
+file = "src-tauri/src/git.rs"
+fn = "init_in"
+domain = "graph"
+guard = "unguarded:A-MUTATION-CONTAINMENT"
+test = "crates/tine-store/tests/i01_write_protocol_census.rs#every_content_mutation_has_a_reviewed_owner"
+oracle = false
+note = "FORK (nataloko/tine, fork ADR mine/0002): the fork's system-git init (Settings, mine (extras)) writes a default .gitignore into the graph root once, only when none exists, right after git init. Plain fs::write, no containment check or atomic save; never touches page files. Census existence evidence only."
+mutations = "fs::write=1"
