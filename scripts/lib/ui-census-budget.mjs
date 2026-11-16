@@ -39,7 +39,8 @@ export const SURFACES = Object.freeze({
   "angle.menu": { env: "desktop", budget: 16, what: "`<` block-menu rows", source: "src/editor/autocomplete.ts ADVANCED_BLOCK_COMMANDS" },
 
   // --- Settings ---------------------------------------------------------------
-  "settings.tabs": { env: "desktop", budget: 10, what: "Settings tabs", source: "Settings nav items (components/Settings.tsx TABS, plugins tab included)" },
+  // FORK: 10 + the fork's "mine (extras)" tab (docs/ui-census-budget.md, Raised budgets).
+  "settings.tabs": { env: "desktop", budget: 11, what: "Settings tabs", source: "Settings nav items (components/Settings.tsx TABS, plugins tab included)" },
   "settings.appearance.open": settingsOpen("appearance", 29),
   "settings.appearance.advanced": settingsAdvanced("appearance", 14),
   "settings.editor.open": settingsOpen("editor", 9),

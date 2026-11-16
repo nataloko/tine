@@ -102,3 +102,6 @@ journey (`scripts/e2e-*.mjs`), not here.
   menu rows `menu.block.plain` 15→17, `block.full` 19→21, `block.multi` 14→16 and the mobile twins likewise (Copy block
   ref, Copy block embed and Copy link left the Copy as submenu, net +2 rows each); `block.full.nested` 6→3 (Copy as left
   the block menu; the page menu keeps its Copy as). Approved by Martin 2026-10-19 (D-20261019-UC1, option a: all three top-level, as in OG).
+- FORK (nataloko/tine, 2026-11-16, at the v0.9.0 sync): `settings.tabs` 10→11 for the fork's
+  **mine (extras)** tab (bullet threading and the fork's git integration). Kept at the end of
+  this list so upstream's new lines, added at the top, merge without conflict.
