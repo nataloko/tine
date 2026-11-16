@@ -5,6 +5,7 @@
 import { Show, onMount, type JSX } from "solid-js";
 import { backend } from "../backend";
 import { bindingOwner, readOwned } from "../owned";
+import { t } from "../i18n";
 import type { GitStatus } from "../gitBackend";
 import {
   threadingEnabled,
@@ -162,7 +163,7 @@ function GitSection(): JSX.Element {
       `Force push ${branch} to the remote?\n\n` +
         `This overwrites the remote branch with your local one, permanently ` +
         `discarding any commits on the remote you don’t have. It can’t be undone.`,
-      "Force push",
+      { title: "Force push", okLabel: "Force push", cancelLabel: t("confirm-cancel") },
     ));
     if (confirmed.kind === "stale" || !confirmed.value) return;
     await forcePushNow();
@@ -174,7 +175,7 @@ function GitSection(): JSX.Element {
       `Force pull ${branch} from the remote?\n\n` +
         `This discards every local commit and every uncommitted change to tracked ` +
         `files, resetting this graph to exactly match the remote. It can’t be undone.`,
-      "Force pull",
+      { title: "Force pull", okLabel: "Force pull", cancelLabel: t("confirm-cancel") },
     ));
     if (confirmed.kind === "stale" || !confirmed.value) return;
     await forcePullNow();

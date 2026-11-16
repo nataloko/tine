@@ -5,7 +5,7 @@
 //
 // Shape:
 //   • Commit rides every landed save (`savedRev`, src/gitSaves.ts) and every
-//     `dataRev` bump (a delete, an external reload), on a long ~60s idle debounce
+//     change-key flush (a create, delete, external reload), on a long ~60s idle debounce
 //     so it never commits mid-keystroke. It also commits on app close (after the
 //     close gate saved everything) and on demand.
 //   • Push timing is configurable: on close (default) / on every idle commit /
@@ -24,7 +24,7 @@ import { backend } from "./backend";
 import { gitBackend, type GitResult, type GitStatus } from "./gitBackend";
 import { graphScopedSignal } from "./binding";
 import { dbg } from "./debug";
-import { dataRev } from "./graphSession";
+import { onChangeKeysFlushed } from "./changeKeys";
 import { bindingOwner, graphOwner, ownedWhen, readOwned, writeOwned } from "./owned";
 import { preferenceReadCurrent, preferenceRevision, seedPreference, writePreference } from "./preferenceWrites";
 import { pushToast } from "./toasts";
@@ -183,13 +183,13 @@ async function autoCommit(): Promise<void> {
   if (r?.ok && mode() === "on-idle") await runPush(true);
 }
 
-// Every landed save and every `dataRev` bump (re)arms the idle debounce.
-// `on(..., {defer:true})` so it tracks ONLY those two (not `enabled`) and never
+// Every landed save and every change-key flush (re)arms the idle debounce.
+// `on(..., {defer:true})` so it tracks ONLY `savedRev` (not `enabled`) and never
 // fires on initial run — created once, app-lifetime.
 createRoot(() =>
   createEffect(
     on(
-      [savedRev, dataRev],
+      savedRev,
       () => {
         if (enabled()) scheduleAutoCommit();
       },
@@ -197,6 +197,13 @@ createRoot(() =>
     )
   )
 );
+// Since 0.9 `dataRev` is private to changeKeys (src/dataRevision.ratchet.test.ts)
+// and bumps only on a full refresh. Every former bump (creates, deletes, external
+// reloads, landed saves) now flushes the change keys, full or keyed, so the
+// flush hook is the same signal. App-lifetime, like the effect above.
+onChangeKeysFlushed(() => {
+  if (enabled()) scheduleAutoCommit();
+});
 
 // --- Lifecycle + manual actions ---------------------------------------------
 

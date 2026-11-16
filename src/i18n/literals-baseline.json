@@ -57,6 +57,8 @@
 "src/components/ExtrasTab.tsx\tjsx-text\tGitSection\tRefresh",
 "src/components/ExtrasTab.tsx\tjsx-text\tGitSection\talready installed on your machine and its existing credential setup; nothing is bundled and no passwords are stored. Off by default.",
 "src/components/ExtrasTab.tsx\tjsx-text\tGitSection\tgit",
+"src/components/ExtrasTab.tsx\tprop:title\tconfirmed\tForce pull",
+"src/components/ExtrasTab.tsx\tprop:title\tconfirmed\tForce push",
 "src/components/ExtrasTab.tsx\tui-flow\tGitSection\tManual",
 "src/components/ExtrasTab.tsx\tui-flow\tGitSection\tOn close",
 "src/components/ExtrasTab.tsx\tui-flow\tGitSection\tOn every save",
