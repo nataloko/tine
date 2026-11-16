@@ -53,7 +53,14 @@ instead of re-parsing.
 
 ## Install
 
-Grab a prebuilt installer from the **[Releases](https://github.com/martinkoutecky/tine/releases)**
+<p>
+  <a href="https://apps.apple.com/us/app/tineoutline/id6804403687"><img src="website/img/badge-app-store.svg" alt="Download on the App Store" height="40"></a>
+  <a href="https://play.google.com/store/apps/details?id=page.tine.app"><img src="website/img/badge-google-play.png" alt="Get it on Google Play" height="58"></a>
+  <a href="https://apps.microsoft.com/detail/9NCZ9VKJ1TXJ"><img src="website/img/badge-microsoft-store.svg" alt="Get it from Microsoft" height="40"></a>
+  <a href="https://f-droid.org/packages/page.tine.app/"><img src="website/img/badge-f-droid.png" alt="Get it on F-Droid" height="58"></a>
+</p>
+
+Or grab a prebuilt installer from the **[Releases](https://github.com/martinkoutecky/tine/releases)**
 page. macOS builds are signed and notarized; Windows builds aren't code-signed yet, so Windows may
 warn the first time — here's how to get past it:
 
@@ -67,17 +74,29 @@ warn the first time — here's how to get past it:
   and drag Tine into Applications. If Tine
   **keeps asking to access your Documents folder on every launch**, see the
   [workaround](#macos-repeated-documents-permission-prompt) below.
-- **Windows** — run the **`.exe`** installer; if SmartScreen appears, click **More info → Run
+- **Windows** — install from the **[Microsoft Store](https://apps.microsoft.com/detail/9NCZ9VKJ1TXJ)**
+  (it appears as *TineOutline*), which keeps it updated, or run the **`.exe`** installer; if SmartScreen appears, click **More info → Run
   anyway**. Prefer no installer? Grab the portable **`Tine_*_x64-portable.zip`**, unzip, and run
   `Tine.exe` — it needs the WebView2 runtime, which is preinstalled on Windows 10/11. The portable
   Tine keeps its settings and WebView2 data in the `tine-data` folder next to `Tine.exe`, not in
   AppData, so it runs from a USB drive; to update it, quit Tine and unzip the new version into the
   same folder.
-- **Android** — install from **[F-Droid](https://f-droid.org/packages/page.tine.app/)** for automatic
-  updates, or take the signed **`Tine_*_android-arm64.apk`** from Releases.
-- **iPhone and iPad** — Tine is in public beta on **[TestFlight](https://testflight.apple.com/join/rpGGpTVW)**:
-  install Apple's TestFlight app, open the link, and install Tine (it appears as *TineOutline*).
-  Graphs live in **On My iPhone → TineOutline** or **iCloud Drive → TineOutline**.
+- **Android** — install from **[Google Play](https://play.google.com/store/apps/details?id=page.tine.app)**
+  or **[F-Droid](https://f-droid.org/packages/page.tine.app/)** for automatic updates, or take the
+  signed **`Tine_*_android-arm64.apk`** from Releases.
+- **iPhone and iPad** — install Tine from the **[App Store](https://apps.apple.com/us/app/tineoutline/id6804403687)** (it appears as
+  *TineOutline*). Graphs live in **On My iPhone → TineOutline** or **iCloud Drive → TineOutline**.
+
+**Test the Betas.** Beta testers are welcome and genuinely help: Betas get the fixes first, and what
+you notice shapes the next stable release. *Tine Beta* is a separate app that installs next to Tine,
+so you can keep both.
+- **iPhone and iPad** — install Apple's TestFlight app, then open
+  **[the Tine Beta link](https://testflight.apple.com/join/f2HQgJGn)**.
+- **Desktop and Android** — take the newest pre-release from
+  **[Releases](https://github.com/martinkoutecky/tine/releases)**; on desktop it updates itself to
+  each new Beta.
+
+Report what you find in [Issues](https://github.com/martinkoutecky/tine/issues).
 
 **Updates.** On desktop, Tine tells you when a new version is out and installs it in place when
 you click **Install update**: this covers the AppImage, `.deb`, `.rpm`, macOS app and Windows
@@ -222,6 +241,33 @@ samples/             Demo graph used by tests/screenshots
 
 ## Build & run
 
+Use Node.js 22.13 or newer (pdf.js 5 requires Node 22).
+The PDF image decoder also requires Emscripten **4.0.20**. `npm run build:pdf-decoder`
+compiles pinned, vendored OpenJPEG sources with standard SIMD, without network
+access. Builds and tests reuse the verified result until its inputs change. See
+[`vendor/pdfjs-openjpeg/README.md`](vendor/pdfjs-openjpeg/README.md) for provenance
+and the offline Flatpak setup.
+
+### PDF decoder SDK
+
+Emscripten's SDK manager, `emsdk`, comes from its own repository and installs into
+any directory you choose. It does not need root, and the install takes about 2 GB
+of disk (on Windows, use `emsdk.bat` and `emsdk_env.bat`):
+
+```bash
+git clone https://github.com/emscripten-core/emsdk.git ~/.local/share/emsdk
+cd ~/.local/share/emsdk
+./emsdk install 4.0.20
+./emsdk activate 4.0.20
+source ./emsdk_env.sh        # sets EMSDK for this shell
+```
+
+The build finds the SDK through `EMSDK`, or through `TINE_PDFJS_EMSDK`, which names
+the SDK's `upstream/` directory instead. Set one of them in every shell that builds
+Tine. If you use a separate toolchain directory (`TINE_TOOLCHAIN`, or a sibling
+`.toolchain/` that contains `cargo/bin/rustup`), `source scripts/env.sh` also sets
+`EMSDK` when the SDK is installed at `emsdk/` inside it and `EMSDK` isn't set yet.
+
 ```bash
 source scripts/env.sh        # toolchain env (CARGO_HOME/RUSTUP_HOME, lib paths)
 npm install                  # first time
@@ -233,6 +279,15 @@ npx tauri build --no-bundle
 # Run it against your graph:
 TINE_GRAPH=/path/to/your/graph ./target/release/tine
 ```
+
+### Packaging Tine for a distribution
+
+A package manager updates its own packages, and its store is often read-only, so the in-app
+updater can never work there. Build with `TINE_PACKAGED_BY` set to your distribution's name, for
+example `TINE_PACKAGED_BY=Nixpkgs npx tauri build --no-bundle`. The variable is read at compile
+time (an empty or unset value changes nothing). With it set, that build never contacts the update
+feed, shows no update notification and offers no installer, and Settings → **About** says "This
+copy of Tine is packaged by Nixpkgs. Update it there." It applies on every desktop target.
 
 ### Release checklist
 
@@ -329,7 +384,7 @@ compatibility; see [the user overview](https://tine.page/plugins.html) and
 
 **Mobile:** Tine has a **native Android build** (Tauri v2) as of 0.4.0 — it opens and edits your real
 Logseq graph on the phone over your own sync, alongside the Logseq mobile app. **iOS** (iPhone and
-iPad) is in public beta on [TestFlight](https://testflight.apple.com/join/rpGGpTVW).
+iPad) is on the [App Store](https://apps.apple.com/us/app/tineoutline/id6804403687).
 
 **Under discussion, not promised:** built-in git integration.
 
