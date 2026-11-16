@@ -30,9 +30,11 @@ when there's something to decide.
     the obvious (`Block.tsx`, `Settings.tsx`, `update.ts`, `app.css`) to easily-forgotten ones
     (`AboutTab.tsx`, `ui.ts`, `App.tsx`, `main.tsx`,
     `settingsSearch.ts`, `src/document/host/wiring.ts`, `scripts/lib/og-enforcement.mjs`,
-    `src-tauri/src/lib.rs`, `src-tauri/src/command_surface.rs`, `tauri.conf.json`, and the
+    `src-tauri/src/lib.rs`, `src-tauri/src/command_surface.rs`, `tauri.conf.json`, the
     localization files `src/i18n/literals-baseline.json`, `src/i18n/messages.gen.ts` and
-    `src/i18n/locales/zh-CN/.source-hashes.json`; see `AGENTS.md` for how each is re-derived).
+    `src/i18n/locales/zh-CN/.source-hashes.json`, and since 0.9 the guard pins
+    `crates/tine-store/tests/write_sites.toml`, `scripts/lib/ui-census-budget.mjs` and
+    `src/fixtures/release-icon-config.json`; see `AGENTS.md` for how each is re-derived).
   - **Fork-only** — upstream has never seen these, so they can never conflict:
     `src/bulletThreading.ts`, `src/git.ts`(+test), `src/gitBackend.ts`, `src/gitSaves.ts`,
     `src/components/ExtrasTab.tsx`, `src/components/block/*`, `src/styles/mine.css`,
@@ -91,12 +93,23 @@ comm -12 <(git diff --name-only "$BASE" mine | sort) <(git diff --name-only "$BA
 # DERIVED, never hand-listed: every file the fork edits that also exists upstream. `$BASE` is
 # the last upstream state `mine` was synced to, so `$BASE..mine` is exactly the fork's own work.
 # NOT a subset of the line above — it catches surfaces `comm` misses, so run both:
-SHARED=$(git diff --name-only "$BASE" mine -- src/ src-tauri/ \
+SHARED=$(git diff --name-only "$BASE" mine -- src/ src-tauri/ crates/ scripts/ \
   | while read -r f; do git cat-file -e "$TAG:$f" 2>/dev/null && echo "$f"; done)
 git diff --stat "$BASE" "$TAG" -- $SHARED
 
 # Did upstream reimplement a fork feature? Any hit here needs reading in full:
-git diff "$BASE" "$TAG" | grep -inE 'bulletThread|bullet threading|thread-svg|--thread-color|loadHljs|calcSource|enteredCalc|notePublication|c\.published\(|updateMode|downloadAndInstall|createUpdaterArtifacts|updater.*endpoints|"extras"|gitStatus|KNOWN_COMMANDS'
+git diff "$BASE" "$TAG" | grep -inE 'bulletThread|bullet threading|thread-svg|--thread-color|loadHljs|calcSource|enteredCalc|notePublication|c\.published\(|updateMode|downloadAndInstall|createUpdaterArtifacts|updater.*endpoints|"extras"|gitStatus|KNOWN_COMMANDS|dataRev|onChangeKeysFlushed'
+
+# Upstream's own git feature (ADR 0078, since 0.9) is a KNOWN overlap that the fork keeps
+# its own version of ONLY because upstream's lacks SSH (see AGENTS.md, Git integration).
+# Every sync, check for parity: what upstream changed in it, and whether SSH, ssh-agent or
+# the system credential helper appeared. Report the result at the Step 3 gate even when
+# nothing changed ("upstream git: still HTTPS-token only"); once it reaches parity, ask the
+# maintainer about retiring the fork's.
+git log --oneline "$BASE".."$TAG" -- src-tauri/src/owner/git_* src-tauri/src/git_settings.rs \
+  src-tauri/src/git_setup.rs docs/adr/0078-git-autocommit-and-sync.md src/components/GitAutocommitSetting.tsx
+git diff "$BASE" "$TAG" -- src-tauri/src/owner/git_sync* docs/adr/0078-git-autocommit-and-sync.md \
+  | grep -inE '^\+.*(ssh|credential.helper|ssh-agent|libssh|known_hosts)' | head -20
 ```
 Then judge three things:
 - **Conflicts:** does `merge-tree` list any conflicted files?
@@ -154,7 +167,7 @@ source scripts/env.sh
 npm install                                  # if package.json changed
 node scripts/check-wasm-pin.mjs
 npx tsc --noEmit
-npm test
+npm test   # on this host run its parts as AGENTS.md lists them (decoder SDK, gcc, worker cap)
 # Upstream's Rust gate is whatever ci.yml's "Rust core tests" step runs. At v0.7.0:
 nix-shell -p cargo rustc gcc pkg-config \
   --run 'TMPDIR=/tmp cargo test --no-fail-fast -p tine-core -p tine-store -p tine-graph-features'

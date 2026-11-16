@@ -57,15 +57,17 @@ constrain the fork are in `src/ogEnforcement.test.ts`, driven by
   not exceed 1,500 lines, and a file already over that at the frozen baseline
   `2d0349368` may not grow past its baseline count. Fork code therefore lives in
   fork-only files, with only a few hook lines in upstream files. The tight ones
-  at v0.8.1: `src/ui.ts` sits exactly at its baseline (1,533, of which the fork's
-  `SettingsTabId` comment is one line), so the fork can add no more lines there;
-  `src/components/Block.tsx` is 3,407 of its 3,411. `src/backend.ts` fell to 931
+  at v0.9.0: `src/ui.ts` is 1,526 of its 1,533 baseline (the fork's
+  `SettingsTabId` comment is one line of that); `src/components/Block.tsx` is
+  3,407 of its 3,411. `src/backend.ts` fell to 931
   lines in 0.8, but the fork still keeps none there (see Git integration).
   Before a sync, count every shared surface near the cap with `lines()` from
   `scripts/lib/og-enforcement.mjs`; Git merges an overflow without a conflict.
 - **Writer sites.** Every low-level file write per file is counted. The fork
   pins `src-tauri/src/git.rs` (one `fs::write`, the default `.gitignore`) with a
-  `FORK:` row in `APPROVED_WRITER_SITES`. Any new write in `git.rs` must update it.
+  `FORK:` row in `APPROVED_WRITER_SITES`. Since 0.9 the Rust I-1 census pins the
+  same write a second time (see the 0.9 guards below). Any new write in `git.rs`
+  must update both.
 
 0.8 added a localization ratchet (tine#107), which the fork meets as follows
 (decided 2026-10-28):
@@ -73,7 +75,7 @@ constrain the fork are in `src/ogEnforcement.test.ts`, driven by
 - **Literal English.** `src/i18n/literals.test.ts` (`scripts/i18n-literals.mjs`)
   fails on interface English outside the catalog unless its site is listed in
   `src/i18n/literals-baseline.json`. The fork's own strings (`ExtrasTab.tsx`,
-  `git.ts`; 83 sites at v0.8.1) are listed there rather than translated: one
+  `git.ts`; 85 sites at v0.9.0) are listed there rather than translated: one
   line per site, inserted in sorted position. Do NOT rebuild the file with
   `node scripts/i18n-literals.mjs --update`: its writer lays out upstream's
   `{"site", "reason"}` entries differently from upstream's committed file, so
@@ -126,8 +128,24 @@ The surfaces:
     `src/git.ts` never parses the detail text. Since 0.8,
     `src-tauri/src/command_surface.rs` must list every registered command
     (`KNOWN_COMMANDS`, sorted, sized), checked by an app crate test
-    (`cargo test -p tine --lib`), so it carries the seven git names under one
-    `FORK:` comment.
+    (`cargo test -p tine --lib`), so it carries the seven git names. Since 0.9
+    upstream has its own `git_*` commands, so the fork's rows sit sorted among
+    them, each with a trailing `// FORK`, under one `FORK:` comment (array size
+    257 at v0.9.0: upstream's 250 + 7).
+  - Upstream's own git feature (ADR 0078/0079, new in 0.9: Settings → Graph →
+    Git, `src-tauri/src/owner/git_*.rs`, libgit2) overlaps this one. Decided at
+    the v0.9.0 sync (2026-11-16): keep the fork's as the live path, because the
+    maintainer syncs over SSH and upstream's refuses `ssh://` remotes
+    (`transport_tests.rs`, `unsupported_remote_configs_are_refused_without_contacting_them`)
+    and only takes an HTTPS token, never the system credential helper or
+    ssh-agent. Upstream's also lacks the topbar badge, the manual Commit/Push/Pull
+    and force buttons, and page names in commit messages. Upstream's is off by
+    default; never turn both on for one graph (they would race on
+    `.git/index.lock`, and the fork's system-git pull writes files outside
+    upstream's guarded pull path). **Every sync, re-check upstream's git feature
+    for parity** (SSH or system credentials first, then manual push/pull and a
+    status display); once it matches, retire the fork's per the adopt-upstream
+    rule. The `sync-upstream` skill's Step 2 greps for it.
   - `src/gitBackend.ts` owns the frontend contract: `GitStatus`, `GitResult`, the
     `GitBackend` interface, and `gitBackend()`, which `src/git.ts` calls instead
     of `backend()`. In the app it invokes the seven commands directly (dynamic
@@ -146,10 +164,17 @@ The surfaces:
     them on disk; the fork chains one `.then` there calling `noteSavedForGit()`
     per page (`c.nameOfKey(key) ?? key`), plus its import. Page creates and
     renames bypass `notePublication`, so their names miss the commit message,
-    but they still re-arm the debounce through `dataRev`. `src/git.ts` re-arms the
-    60s idle debounce on `savedRev` and on `dataRev` (`src/graphSession.ts`;
-    since 0.8 bumped again after landed saves, plus creates, deletes and external
-    reloads), and names the commit's pages from `drainSavedPages()`.
+    but they still re-arm the debounce through the change-key flush. `src/git.ts`
+    re-arms the 60s idle debounce on `savedRev` and on `onChangeKeysFlushed`
+    (`src/changeKeys.ts`), and names the commit's pages from `drainSavedPages()`.
+    Until 0.9 it watched `dataRev`; 0.9 made that counter private
+    (`src/dataRevision.ratchet.test.ts` bans every reader) and bumps it only on a
+    full refresh. Every former bump (landed saves, creates, deletes, external
+    reloads) now runs `flushChangeKeys`, full or keyed, so the flush hook is the
+    same signal.
+  - `ExtrasTab.tsx`'s force-op confirms pass upstream's `ConfirmOptions` (0.9
+    labelled every native confirm: `title`, `okLabel`, `cancelLabel` with
+    upstream's `confirm-cancel` message).
   - `src/App.tsx`: imports, `initGit()` on mount, the topbar badge beside
     `TopbarOverflowMenu`, and the commit-on-close inside the close handler,
     after `safeClose.prepare()` accepts (the disk is current there).
@@ -194,8 +219,8 @@ The surfaces:
     whole exit-gate block except its App source scan, and since v0.8.1 the GH
     #719 r1 in-place install, GH #405's three macOS install tests, and the
     install action's fresh-check fallback). Skipped rather than deleted so
-    upstream's edits to them keep merging; expect `49 passed | 21 skipped` for
-    `src/update.test.ts` (v0.8.1).
+    upstream's edits to them keep merging; expect `55 passed | 21 skipped` for
+    `src/update.test.ts` (v0.9.0).
   - `src/components/Toasts.macUpdate.test.tsx` (new in 0.8, render pass): a
     header note and all three GH #405 macOS install cases skipped, since
     `installUpdateForTest()` never reaches the installer here.
@@ -316,9 +341,12 @@ Run these gates before shipping (the Rust line is whatever upstream's `ci.yml`
 ```bash
 node scripts/check-wasm-pin.mjs
 npx tsc --noEmit
+npm run build:pdf-decoder   # needs Emscripten 4.0.20 when its inputs change; see below
+npm run check:branch-names
+npm run test:compare
 npx vitest run --maxWorkers=2 --testTimeout=30000
 npx vitest run --config vitest.render.config.ts --maxWorkers=2 --testTimeout=30000
-npm run test:e2e-harness
+nix-shell -p gcc --run 'npm run test:e2e-harness'   # compiles a C helper (cc)
 npm run test:github
 npm run build
 nix-shell -p cargo rustc gcc pkg-config \
@@ -331,12 +359,22 @@ The last line is upstream's "App crate tests" `ci.yml` step, new in 0.8 (it
 runs after `npm run build`, which it needs). It is the only gate that compiles
 and tests the fork's `git.rs` and its `command_surface.rs` rows.
 
-At v0.8.1 `npm test` is exactly the two Vitest passes plus `test:e2e-harness`
-and `test:github`; run them as above. This host has **4 cores**, and Vitest's default worker count
+At v0.9.0 `npm test` is `build:pdf-decoder`, `check:branch-names`, `test:compare`,
+the two Vitest passes, `test:e2e-harness` and `test:github`; run them as above. This host has **4 cores**, and Vitest's default worker count
 starves the timing-sensitive suites, so `--maxWorkers=2 --testTimeout=30000` is
 the real signal; a failure that survives it is a real failure. A single guard
 file run on its own still needs `--testTimeout=30000`: 0.7's whole-repo scans
 (`graphScopedState`, `lateLanding`) exceed Vitest's 5s default here.
+
+`build:pdf-decoder` (new in 0.9) compiles pdf.js's OpenJPEG decoder to wasm with
+exactly Emscripten 4.0.20 and caches the result in `target/pdfjs-openjpeg` with a
+receipt hash, so later runs need no SDK until the decoder's inputs change.
+nixpkgs ships a different Emscripten, so the SDK is emsdk's, installed in
+`../.toolchain/emsdk` (`./emsdk install 4.0.20 && ./emsdk activate 4.0.20`; the
+mount gets wiped, see below). Its prebuilt binaries run on NixOS only under
+`steam-run`, and the agent's sandbox refuses to run them, so the maintainer runs:
+`NIXPKGS_ALLOW_UNFREE=1 env -u NIX_PATH nix shell --impure nixpkgs#steam-run -c steam-run env EMSDK=$PWD/../.toolchain/emsdk npm run build:pdf-decoder`.
+The GitHub build gets the SDK from `setup-emsdk` in `personal-build.yml`.
 
 0.7's source-scanning safety guards apply to fork code like any other code, and
 the fork follows them rather than pinning exemptions:
@@ -367,15 +405,45 @@ verbatim again since v0.8.1: 0.8's `update.ts` calls `browserPlatform(` itself
 went. `src/repositoryPaths.test.ts` (GH #579) rejects absolute machine paths in
 tracked files, this one included.
 
-At v0.8.1 the frontend reported `3664 passed | 23 skipped` (unit pass, ~7 min) and
-`3517 passed | 6 skipped` (render pass, ~16 min), the Rust core gate `2637 passed,
-1 failed, 14 ignored` in ~31 min with the cache cold after a toolchain bump (the one
-red is `i22_macro_fanout` below; the checkpoint digest passes under `TMPDIR=/tmp`),
-and the app crate tests `470 passed, 3 ignored` (~9 min with their compile). The
-fork's `crates/`, `Cargo.toml` and `Cargo.lock` delta against upstream is EMPTY
-(`git diff --stat v0.8.1 mine -- crates Cargo.toml Cargo.lock`), so no core
-test result can be a fork regression; re-run that diff before investigating
-one. Both known reds are this host:
+0.9 added or widened five guards that fork code meets with small edits
+(2026-11-16):
+
+- `src/appIcons.guard.test.ts` compares the release config derived from
+  `tauri.conf.json` byte for byte with `src/fixtures/release-icon-config.json`.
+  That fixture carries the fork's `createUpdaterArtifacts: false` and NSIS
+  `template` (JSON has no comments, so this note is its `FORK:` marker). On a
+  sync conflict take upstream's fixture and re-apply those two values.
+- `src/dialogActions.guard.test.ts` (D-20261018-UI1) flags every `*-actions`
+  row not built from `<DialogActions>`. ExtrasTab's `git-actions` rows hold
+  independent buttons, not confirm/cancel, so they have a `FORK:` row in its
+  `NOT_A_CONFIRM_ROW`.
+- `src/tests/editorDriver.guard.test.ts` lets no block-editor test touch a
+  textarea directly. The fork's calc-latch case in `Block.calcBlur.test.tsx`
+  reads the editor through `editorIn(root).value()`.
+- `src/uiCensus.budget.test.tsx` caps the number of Settings tabs. The fork's
+  tab raises `settings.tabs` from 10 to 11 in `scripts/lib/ui-census-budget.mjs`
+  (`FORK:` comment), recorded last in "Raised budgets" in
+  `docs/ui-census-budget.md`.
+- `crates/tine-store/tests/i01_write_protocol_census.rs` (I-1, in the Rust core
+  gate) now scans all of `src-tauri/src`, not a fixed file list, and every
+  function there that writes files needs a reviewed row in
+  `crates/tine-store/tests/write_sites.toml`. The fork's `git.rs` `init_in` (the
+  default `.gitignore`) has a `# FORK:` row appended last, under upstream's
+  existing `unguarded:A-MUTATION-CONTAINMENT` assumption. A new or changed write
+  in `git.rs` fails it until the row's `mutations` count matches. On a sync
+  conflict take upstream's file and re-append the fork's row.
+
+At v0.9.0 the frontend reported `4558 passed | 24 skipped` (unit pass, ~8 min) and
+`5111 passed | 6 skipped` (render pass, ~26 min), the Rust core gate `3191 passed,
+1 failed, 31 ignored` in ~38 min (the one red is `i22_macro_fanout` below; the
+checkpoint digest passes under `TMPDIR=/tmp`; the I-1 census failed in that run
+and passed after the fork's ledger row), and the app crate tests `956 passed,
+1 failed, 10 ignored` (~16 min with their compile; the red is a load timeout,
+below). The fork's `crates/`, `Cargo.toml` and `Cargo.lock` delta against
+upstream is one appended row in `crates/tine-store/tests/write_sites.toml`
+(`git diff --stat v0.9.0 mine -- crates Cargo.toml Cargo.lock`), so no core
+test result other than the I-1 census can be a fork regression; re-run that
+diff before investigating one. The known reds are this host:
 
 - `tine-store` `store::checkpoint::checkpoint_tests::the_golden_body_is_pinned_to_format`
   hashes a checkpoint body after replacing the temp root path with a same-length
@@ -385,6 +453,12 @@ one. Both known reds are this host:
   `self_embedding_fan_out_is_cut_with_a_visible_marker` asserts a 24^4 embed
   fan-out prints in under 60s. It takes ~77-90s here in a debug build, alone or not.
   A speed bound on a weak CPU; expect it to stay red.
+- Load timeouts in a full run, each passing alone (seen at v0.9.0): the app
+  crate's `owner::owner_tests::a_write_request_larger_than_one_mebibyte_is_answered`
+  ("no answer from the page host in time"; 15s alone), Vitest's
+  `src/memoryLifecycle.test.ts` L10-01 (23s alone against the 30s limit) and
+  `src/components/Page.windowing.test.tsx` GH #745. Re-run the one test or file
+  alone with the CPU idle before investigating.
 
 The 0.6 line's nextest contract script, its cargo-nextest 0.9.143 pin and its
 triaged timing reds (`the_registry_build_is_measured_and_bounded`,
