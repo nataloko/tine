@@ -8,6 +8,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versions use
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-11-19
+
+### Fixed
+
+- Mouse Back and Forward buttons work again in Windows graph windows and move one page per press (#948).
+- Quick share links are offered in every build of Tine, including the Flatpak
+  and builds from source. They used to show "Coming soon" in any build made
+  outside Tine's release workflow. A release is now refused instead while
+  tine.page cannot open its links (reported by Dieterbe in discussion #968;
+  REG-QS-ATTEST-STORES-09).
+- On Windows, a graph on a file system without file IDs (a WSL share such as `\\wsl.localhost`, a FAT32 or exFAT drive, a Samba share) can be saved again; since 0.9.0 every save failed with "The request is not supported (os error 50)" (reported by redstreet in #973; REG-973-WINDOWS-NO-FILE-ID).
+- Moving or reindenting a block carries its children's indentation with it, including multiline bodies and drawers ([discussion #960](https://github.com/martinkoutecky/tine/discussions/960)).
+- Distribution packagers can build the PDF decoder with their own Emscripten installation using `TINE_PDFJS_EMCC` (#187, #976).
+
+### Security
+
+- DOMPurify is updated to 3.4.18 and seroval to 1.6.12, which close published
+  advisories. Tine used none of the affected DOMPurify modes, so no known
+  exploit applied (reported by Dieterbe in #982).
+
 ## [0.9.0] - 2026-11-16
 
 Tine 0.9.0 makes the 0.9 Beta line stable. It is Tine Beta 0.9.0-beta.14 (the
@@ -7517,7 +7537,8 @@ takes over your graph.
 - macOS and Windows installers are currently **unsigned** — on macOS right-click →
   Open; on Windows choose *More info → Run anyway*.
 
-[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.9.0-beta.1...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/martinkoutecky/tine/compare/v0.9.0...v0.9.1
 [0.9.0-beta.1]: https://github.com/martinkoutecky/tine/compare/v0.8.2...v0.9.0-beta.1
 [0.8.2]: https://github.com/martinkoutecky/tine/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/martinkoutecky/tine/compare/v0.8.0...v0.8.1
