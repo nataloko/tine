@@ -359,7 +359,7 @@ The last line is upstream's "App crate tests" `ci.yml` step, new in 0.8 (it
 runs after `npm run build`, which it needs). It is the only gate that compiles
 and tests the fork's `git.rs` and its `command_surface.rs` rows.
 
-At v0.9.0 `npm test` is `build:pdf-decoder`, `check:branch-names`, `test:compare`,
+At v0.9.1 `npm test` is the PDF decoder build (`build-pdfjs-openjpeg.mjs --full-build`), `check:branch-names`, `test:compare`,
 the two Vitest passes, `test:e2e-harness` and `test:github`; run them as above. This host has **4 cores**, and Vitest's default worker count
 starves the timing-sensitive suites, so `--maxWorkers=2 --testTimeout=30000` is
 the real signal; a failure that survives it is a real failure. A single guard
@@ -369,6 +369,8 @@ file run on its own still needs `--testTimeout=30000`: 0.7's whole-repo scans
 `build:pdf-decoder` (new in 0.9) compiles pdf.js's OpenJPEG decoder to wasm with
 exactly Emscripten 4.0.20 and caches the result in `target/pdfjs-openjpeg` with a
 receipt hash, so later runs need no SDK until the decoder's inputs change.
+The build script itself is one of those inputs, so any upstream edit to
+`scripts/build-pdfjs-openjpeg.mjs` needs the SDK run below (seen at v0.9.1).
 nixpkgs ships a different Emscripten, so the SDK is emsdk's, installed in
 `../.toolchain/emsdk` (`./emsdk install 4.0.20 && ./emsdk activate 4.0.20`; the
 mount gets wiped, see below). Its prebuilt binaries run on NixOS only under
@@ -433,15 +435,15 @@ tracked files, this one included.
   in `git.rs` fails it until the row's `mutations` count matches. On a sync
   conflict take upstream's file and re-append the fork's row.
 
-At v0.9.0 the frontend reported `4558 passed | 24 skipped` (unit pass, ~8 min) and
-`5111 passed | 6 skipped` (render pass, ~26 min), the Rust core gate `3191 passed,
+At v0.9.1 the frontend reported `4588 passed | 24 skipped` (unit pass, ~8 min) and
+`5111 passed | 6 skipped` (render pass, ~25 min), the Rust core gate `3200 passed,
 1 failed, 31 ignored` in ~38 min (the one red is `i22_macro_fanout` below; the
-checkpoint digest passes under `TMPDIR=/tmp`; the I-1 census failed in that run
-and passed after the fork's ledger row), and the app crate tests `956 passed,
-1 failed, 10 ignored` (~16 min with their compile; the red is a load timeout,
-below). The fork's `crates/`, `Cargo.toml` and `Cargo.lock` delta against
+checkpoint digest passes under `TMPDIR=/tmp`; the I-1 census passes with the
+fork's ledger row), and the app crate tests `959 passed, 0 failed, 10 ignored`
+(~16 min with their compile; at v0.9.0 one load timeout, below, was red). The
+fork's `crates/`, `Cargo.toml` and `Cargo.lock` delta against
 upstream is one appended row in `crates/tine-store/tests/write_sites.toml`
-(`git diff --stat v0.9.0 mine -- crates Cargo.toml Cargo.lock`), so no core
+(`git diff --stat v0.9.1 mine -- crates Cargo.toml Cargo.lock`), so no core
 test result other than the I-1 census can be a fork regression; re-run that
 diff before investigating one. The known reds are this host:
 
